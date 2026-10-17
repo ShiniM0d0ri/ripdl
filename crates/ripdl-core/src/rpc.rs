@@ -16,7 +16,7 @@ pub struct Request {
 
 /// Commands the daemon understands. Frontends (CLI, GUI, extension host)
 /// all speak this, so new commands land once here and everywhere benefits.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Add {

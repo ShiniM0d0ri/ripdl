@@ -81,11 +81,34 @@ enum Cmd {
     Rm { id: String },
     /// Stop the daemon.
     Stop,
+    /// Register this binary as the browser's native messaging host
+    /// (`ripdl host` mode triggers when Chrome passes an extension origin).
+    RegisterHost {
+        /// Extension id from chrome://extensions -> Developer mode -> ID.
+        #[arg(long)]
+        ext_id: String,
+        /// Native host name (reverse dotted name; org.ripdl.host).
+        #[arg(long, default_value = "org.ripdl.host")]
+        host: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+
+    // Chrome native messaging launches us as `ripdl.exe chrome-extension://<id>/`
+    // before clap would see one; stdio is the protocol, nothing else may write.
+    if std::env::args().nth(1).unwrap_or_default().starts_with("chrome-extension://") {
+        match ripdl_core::bridge::serve(ripdl_core::bridge::BridgeConfig::default()) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("native host loop failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let cli = Cli::parse();
 
     match cli.cmd {
@@ -143,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
             let headers = collect_headers(&header, referer, cookie, user_agent)?;
             rpc(Command::Add { url, dest_dir: dest, headers }).await
         }
+        Cmd::RegisterHost { ext_id, host } => register_host(&ext_id, &host),
         Cmd::Ls => rpc(Command::List).await,
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
@@ -259,6 +283,70 @@ fn parse_header(s: &str) -> anyhow::Result<(String, String)> {
         bail!("empty header value in '{s}'");
     }
     Ok((k.to_string(), v.to_string()))
+}
+
+/// Write the native-messaging manifest and point the browser's registry keys
+/// at it (HKCU, so no admin window ever appears).
+fn register_host(ext_id: &str, host: &str) -> anyhow::Result<()> {
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.')
+    {
+        bail!("host name must be lower-case [a-z0-9.], got '{host}'");
+    }
+    if ext_id.is_empty() {
+        bail!("extension id missing (see chrome://extensions -> Developer mode -> ID)");
+    }
+
+    let exe = std::env::current_exe().context("need our absolute path for the manifest")?;
+    let manifest_path = ripdl_core::bridge::manifest_path(host)?;
+    if let Some(parent) = manifest_path.parent() {
+        std::fs::create_dir_all(parent).context("create manifest directory")?;
+    }
+    let manifest = serde_json::json!({
+        "name": host,
+        "description": "ripdl browser bridge",
+        "path": exe.display().to_string(),
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{ext_id}/")],
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .context("write manifest json")?;
+
+    #[cfg(windows)]
+    {
+        // Chrome and Edge keep per-user native-host entries under HKCU; the
+        // default value of the key is the path to our manifest.
+        for (browser, subkey) in [
+            ("Chrome", r"Software\Google\Chrome\NativeMessagingHosts"),
+            ("Edge", r"Software\Microsoft\Edge\NativeMessagingHosts"),
+        ] {
+            let key = format!(r"HKCU\{subkey}\{host}");
+            let out = std::process::Command::new("reg")
+                .args(["add", &key, "/ve", "/d", &manifest_path.display().to_string(), "/f"])
+                .output()
+                .context("failed to run reg (registry registration)")?;
+            if !out.status.success() {
+                bail!(
+                    "reg add failed for {browser}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        }
+        println!("registered for Chrome and Edge (HKCU, per-user)");
+    }
+    #[cfg(not(windows))]
+    {
+        println!(
+            "manifest written: {}\nplace/symlink it inside your browser's NativeMessagingHosts directory (e.g. ~/.config/google-chrome/NativeMessagingHosts/,{0})",
+            manifest_path.display()
+        );
+    }
+
+    println!("host manifest: {}", manifest_path.display());
+    println!("next: load the extension unpacked (chrome://extensions -> Developer mode -> Load unpacked), then reload it after every `cargo build`");
+    Ok(())
 }
 
 /// Parse a human speed cap like `500k`, `2.5m`, `1g`, or plain bytes/sec.

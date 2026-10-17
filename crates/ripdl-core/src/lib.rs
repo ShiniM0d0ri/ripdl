@@ -4,6 +4,7 @@
 //! native-messaging host) all sit on top of this crate, so new features land
 //! once here and every frontend gets them.
 
+pub mod bridge;
 pub mod categories;
 pub mod engine;
 pub mod error;

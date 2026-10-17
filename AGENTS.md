@@ -74,10 +74,11 @@ P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
 persistent queue, buffered writes, shared speed limiter, header/auth/cookie
 pass-through, Content-Disposition naming, duplicate-URL idempotency. 21 tests
 pass offline (`cargo test --workspace`).
-In progress: P4 browser integration — FDM Chrome-extension REA research done
-(entry 1 in docs/rea-findings.md: watch→cancel→handoff capture, JSON-stdio
-native host contract, cookie harvest + net-header feed = the reject list).
-research/ artifacts gitignored. Next: our MV3 WebExtension (ext/ dir) + native
-messaging host as a stdio↔RPC bridge inside the existing ripdl single binary
-(argv[1] prefixed chrome-extension:// switches mode).
+In progress: P4 browser integration — REA research done (entry 1 in
+docs/rea-findings.md); first code landed: `ripdl_core::bridge` native
+messaging host (u32-LE + JSON stdio framing -> daemon line RPC, spawns
+ripdl-daemon when absent, in-band error replies = browser fallback),
+`ripdl register-host` (manifest + HKCU keys for Chrome/Edge), MV3 extension
+skeleton `ext/` (context-menu handoff + onDeterminingFilename capture, no
+content scripts/cookie harvest). Tests: 27 pass offline.
 Backlog: scheduler, named pipe transport, daemon config file.

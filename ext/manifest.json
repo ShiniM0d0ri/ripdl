@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "ripdl",
+  "version": "0.1.0",
+  "description": "Send downloads to ripdl - the free, ad-free download manager.",
+  "minimum_chrome_version": "88",
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "storage",
+    "contextMenus",
+    "webRequest"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "ripdl"
+  }
+}
