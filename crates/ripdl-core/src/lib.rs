@@ -8,8 +8,11 @@ pub mod categories;
 pub mod engine;
 pub mod error;
 pub mod queue;
+pub mod rpc;
 pub mod task;
+pub mod util;
 
 pub use engine::{Engine, EngineConfig};
 pub use error::{Error, Result};
 pub use task::TaskState;
+pub use util::atomic_write_json;

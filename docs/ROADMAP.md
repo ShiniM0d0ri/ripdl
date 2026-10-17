@@ -23,10 +23,10 @@ Guiding rules:
 
 ## P1 - daemon + persistence
 
-- [ ] `ripdl daemon`: long-running process owning the queue
-- [ ] Local RPC (JSON over named pipe / unix socket): add, status, pause,
-      resume, remove, set-speed
-- [ ] Queue persistence (JSON sidecar first; SQLite only if it earns it)
+- [x] `ripdl-daemon`: long-running process owning the queue (TCP localhost RPC v1)
+- [x] Local RPC (newline-delimited JSON over TCP): add, ls, pause, resume, rm, stop
+- [x] Queue persistence (`%LOCALAPPDATA%\ripdl\queue.json`, atomic writes)
+- [ ] Named pipe / unix socket transport (replace TCP)
 - [ ] Speed limiting (token-bucket)
 - [ ] Scheduler (start/stop at times; off-peak windows)
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ripdl-core", "crates/ripdl-cli"]
+members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +21,7 @@ bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+dirs = "6"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 anyhow = "1"

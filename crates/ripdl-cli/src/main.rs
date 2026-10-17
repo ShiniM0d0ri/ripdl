@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
+use ripdl_core::rpc::{Command, Reply, Request, Response, DEFAULT_PORT};
 use ripdl_core::{Engine, EngineConfig};
 
 #[derive(Parser)]
@@ -21,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Download a URL now (multi-segment, resumable).
+    /// Download a URL now, bypassing the daemon (multi-segment, resumable).
     Download {
         url: String,
         /// Output directory (default: current directory).
@@ -33,6 +35,23 @@ enum Cmd {
     },
     /// Show what the engine plans for a URL (size, ranges, filename).
     Info { url: String },
+    /// Queue a URL with the running daemon.
+    Add {
+        url: String,
+        /// Output directory (default: your downloads folder).
+        #[arg(short, long)]
+        dest: Option<PathBuf>,
+    },
+    /// List tasks known to the daemon.
+    Ls,
+    /// Pause a running task.
+    Pause { id: String },
+    /// Resume a paused or failed task.
+    Resume { id: String },
+    /// Remove a task from the queue.
+    Rm { id: String },
+    /// Stop the daemon.
+    Stop,
 }
 
 #[tokio::main]
@@ -48,10 +67,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let engine = Arc::new(Engine::new(cfg)?);
 
-            let info = engine
-                .plan(&url)
-                .await
-                .context("failed to probe url")?;
+            let info = engine.plan(&url).await.context("failed to probe url")?;
 
             println!("target:   {url}");
             println!("filename: {}", info.filename);
@@ -90,7 +106,67 @@ async fn main() -> anyhow::Result<()> {
             println!("{info:#?}");
             Ok(())
         }
+        Cmd::Add { url, dest } => rpc(Command::Add { url, dest_dir: dest }).await,
+        Cmd::Ls => rpc(Command::List).await,
+        Cmd::Pause { id } => rpc(Command::Pause { id }).await,
+        Cmd::Resume { id } => rpc(Command::Resume { id }).await,
+        Cmd::Rm { id } => rpc(Command::Remove { id }).await,
+        Cmd::Stop => rpc(Command::Shutdown).await,
     }
+}
+
+/// One-shot RPC client: connect, send, print the reply.
+async fn rpc(cmd: Command) -> anyhow::Result<()> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", DEFAULT_PORT))
+        .await
+        .context("daemon not running (start it with: ripdl-daemon)")?;
+
+    let req = Request { id: 1, cmd };
+    let mut line = serde_json::to_string(&req).context("encode request")?;
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await?;
+
+    let mut lines = BufReader::new(stream).lines();
+    let resp_line = lines
+        .next_line()
+        .await?
+        .context("daemon closed the connection without a reply")?;
+    let resp: Response = serde_json::from_str(&resp_line).context("bad reply from daemon")?;
+
+    match resp.reply {
+        Reply::Ok => println!("ok"),
+        Reply::Added { id } => println!("queued: {id}"),
+        Reply::Error { message } => bail!("{message}"),
+        Reply::Tasks { tasks } => {
+            println!("{:<38} {:<10} {:>16} {:>12}", "ID", "STATE", "PROGRESS", "SPEED");
+            for t in tasks {
+                let progress = match t.total {
+                    Some(total) => format!(
+                        "{}/{} ({:.0}%)",
+                        humans(t.downloaded),
+                        humans(total),
+                        t.downloaded as f64 / total as f64 * 100.0
+                    ),
+                    None => humans(t.downloaded),
+                };
+                let speed = t
+                    .speed_bps
+                    .map(|s| format!("{}/s", humans(s as u64)))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<38} {:<10} {:>16} {:>12}",
+                    t.id,
+                    format!("{:?}", t.state).to_lowercase(),
+                    progress,
+                    speed
+                );
+                if let Some(err) = t.error {
+                    println!("  error: {err}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn humans(n: u64) -> String {

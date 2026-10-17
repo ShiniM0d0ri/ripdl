@@ -3,7 +3,7 @@ pub mod retry;
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -113,6 +113,7 @@ impl Engine {
         let cells: Arc<Mutex<Vec<SegmentState>>> = Arc::new(Mutex::new(segments.clone()));
         let downloaded = Arc::new(AtomicU64::new(segments.iter().map(|s| s.done).sum()));
         let active = Arc::new(AtomicU64::new(segments.len() as u64));
+        let finished = Arc::new(AtomicBool::new(false));
 
         // Spawn one task per segment; each writes at its own file offset.
         let mut handles = Vec::with_capacity(segments.len());
@@ -147,11 +148,12 @@ impl Engine {
             segments: Vec::new(),
         };
 
-        // Reporter: emits progress and flushes the sidecar while running.
-        let reporter = {
+        // Fire-and-forget: this loop exits itself after the final snapshot.
+        let _reporter = {
             let cells = cells.clone();
             let downloaded = downloaded.clone();
             let active = active.clone();
+            let finished = finished.clone();
             let state_path = state_path.clone();
             let meta_task = meta.clone();
             let mut on_progress = on_progress;
@@ -159,7 +161,15 @@ impl Engine {
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
                 loop {
                     tick.tick().await;
-                    if active.load(Ordering::SeqCst) == 0 {
+                    let drained = active.load(Ordering::SeqCst) == 0;
+                    if drained || finished.load(Ordering::SeqCst) {
+                        // Final snapshot with the true final byte count (no
+                        // sidecar write here: the caller owns the last state).
+                        on_progress(Progress {
+                            id: meta_task.id.clone(),
+                            downloaded: downloaded.load(Ordering::Relaxed),
+                            total: meta_task.total,
+                        });
                         break;
                     }
                     let segments = cells.lock().expect("state cells").clone();
@@ -179,7 +189,8 @@ impl Engine {
         };
 
         let results = futures::future::join_all(handles).await;
-        reporter.abort();
+        // Un-park the reporter so it emits the final snapshot and exits.
+        finished.store(true, Ordering::SeqCst);
 
         // Pick the most meaningful error (real failures over Cancelled).
         let mut first_err: Option<Error> = None;

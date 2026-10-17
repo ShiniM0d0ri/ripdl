@@ -16,4 +16,5 @@ tokio-util = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }

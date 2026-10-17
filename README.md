@@ -21,9 +21,9 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | Per-segment retry + backoff | ✅ core |
 | Cancellation | ✅ core |
 | CLI (`ripdl download`, `ripdl info`) | ✅ |
-| Queue with concurrency limits | ✅ core (in-memory) |
+| Queue with concurrency limits | ✅ core + daemon-persisted |
 | Auto-categorization by file type | ✅ core |
-| Daemon + RPC | 🚧 P1 |
+| Daemon + RPC (TCP localhost) | ✅ v1 |
 | Tauri GUI | 🚧 P2 |
 | Torrent (via `librqbit`) | 🚧 P3 |
 | Browser extension + native host | 🚧 P4 |
