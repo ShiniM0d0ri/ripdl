@@ -35,6 +35,12 @@ struct TaskRecord {
     /// Resolved output file once a tool produced one (completion-time).
     #[serde(default)]
     dest_file: Option<PathBuf>,
+    /// Final byte counters, kept so boot-restored records still show a
+    /// size/percent in the UI after a daemon restart.
+    #[serde(default)]
+    downloaded: u64,
+    #[serde(default)]
+    total: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,6 +381,8 @@ impl Daemon {
             start_at,
             kind,
             dest_file: None,
+            downloaded: 0,
+            total: None,
         };
         {
             let mut records = self.records.lock().unwrap();
@@ -396,7 +404,7 @@ impl Daemon {
             .map(|r| {
                  let (downloaded, total, speed_bps, percent) = match progress.get(&r.id) {
                     Some(t) => (t.last.downloaded, t.last.total, t.speed, t.last.percent),
-                    None => (0, None, None, None),
+                    None => (r.downloaded, r.total, None, r.total.map(|t| 100.0)),
                 };
                 TaskInfo {
                     id: r.id.clone(),
@@ -625,7 +633,7 @@ impl Daemon {
     }
 
     /// Terminal success with the produced file, remembered for the
-    /// "open file" / "delete files" flows.
+    /// "open file" / "delete files" flows (and byte counters for the UI).
     fn set_completed(&self, id: &str, file: Option<PathBuf>) {
         {
             let mut records = self.records.lock().unwrap();
@@ -634,6 +642,12 @@ impl Daemon {
                     r.state = TaskState::Completed;
                     r.error = None;
                     r.dest_file = file;
+                    if let Some(f) = &r.dest_file {
+                        if let Ok(meta) = std::fs::metadata(f) {
+                            r.downloaded = meta.len();
+                            r.total = Some(meta.len());
+                        }
+                    }
                 }
                 None => return, // removed meanwhile: never resurrect it
             }
@@ -773,6 +787,8 @@ mod tests {
             start_at: None,
             kind: TaskKind::Http,
             dest_file: None,
+            downloaded: 0,
+            total: None,
         }
     }
 
@@ -868,6 +884,8 @@ mod tests {
             start_at: None,
             kind: TaskKind::Http,
             dest_file: Some(out.clone()),
+            downloaded: 4,
+            total: Some(4),
         };
         let deleted = delete_artifacts(&rec);
 
@@ -895,6 +913,8 @@ mod tests {
             start_at: None,
             kind: TaskKind::Http,
             dest_file: None,
+            downloaded: 0,
+            total: None,
         };
         assert!(delete_artifacts(&rec).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);

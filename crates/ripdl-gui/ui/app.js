@@ -58,7 +58,7 @@ function categoryOf(name) {
 }
 
 function urlName(url) {
-    let base = splitPath(url).pop() || url;
+    let base = splitPath(url.split(/[?#]/)[0]).pop() || url;
     try { base = decodeURIComponent(base); } catch (_) { /* keep raw */ }
     return base || url;
 }
@@ -70,6 +70,12 @@ function splitPath(p) {
 
 function baseName(p) {
     return splitPath(p).pop() || p;
+}
+
+// One-line error for the status cell (full text in the tooltip).
+function shortError(e) {
+    const m = String(e).replace(/^.*error: /, "");
+    return m.length > 26 ? m.slice(0, 25) + "…" : m;
 }
 
 function humans(bytes) {
@@ -145,7 +151,9 @@ function render() {
         const prog = pct == null
             ? `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:0%"></div></div>`
             : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${pct.toFixed(0)}%</span>`;
-        const size = t.percent != null
+        const size = t.state === "completed"
+            ? humans(t.total || t.downloaded)
+            : t.percent != null
             ? (t.total ? humans(t.total) : "?")
             : t.total ? `${humans(t.downloaded)} / ${humans(t.total)}` : humans(t.downloaded);
         const eta = etaOf(t) || "-";
@@ -157,7 +165,7 @@ function render() {
             <div class="fname-cell"><span class="ficon">${STATE_ICON[state] || "&#128230;"}</span><span title="${escapeHtml(name)}">${escapeHtml(name)}</span></div>
             <div class="fdir" title="${escapeHtml(dir)}">${escapeHtml(dir)}</div>
           </td>
-          <td class="st-${state}">${state}</td>
+          <td class="st-${state}" title="${t.error ? escapeHtml(t.error) : ""}">${state}${t.error ? '<div class="st-err">' + escapeHtml(shortError(t.error)) + '</div>' : ""}</td>
           <td>${size}</td>
           <td class="prog-cell">${prog}</td>
           <td>${eta}</td>

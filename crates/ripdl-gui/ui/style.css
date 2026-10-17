@@ -80,21 +80,22 @@ body {
 #task-table tbody tr:hover { background: #eaf2fa; }
 #task-table tbody tr.selected { background: #d6e7f7; }
 
-.col-name { width: 34%; }
-.col-status { width: 12%; }
-.col-size { width: 12%; }
-.col-prog { width: 22%; }
-.col-eta { width: 10%; }
-.col-speed { width: 10%; }
-.col-act { width: 74px; text-align: right; }
+.col-name { width: 32%; }
+.col-status { width: 11%; }
+.col-size { width: 13%; }
+.col-prog { width: 20%; }
+.col-eta { width: 9%; }
+.col-speed { width: 9%; }
+.col-act { width: 104px; text-align: right; }
 .row-btn {
     border: 1px solid #c9ced4; border-radius: 3px; background: #fff;
-    cursor: pointer; font: 12px "Segoe UI", sans-serif; color: #39424c;
-    padding: 1px 5px; margin-left: 4px; opacity: 0;
+    cursor: pointer; font-size: 12px; color: #39424c;
+    padding: 0 4px; margin-left: 3px; opacity: 0;
 }
 tr:hover .row-btn { opacity: 1; }
 .row-btn:hover { background: #e8f0f8; border-color: #9fb8d0; }
 .actions { white-space: nowrap; }
+td.col-act { text-overflow: clip; overflow: visible; }
 
 .fname-cell { display: flex; align-items: center; gap: 6px; }
 .ficon { width: 16px; text-align: center; flex: none; }
@@ -118,6 +119,7 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
 .st-queued { color: #5b6770; }
 .st-paused { color: #8a94a0; }
 .st-failed { color: #c23b3b; font-weight: 600; }
+.st-err { color: #b02a2a; font-weight: 400; font-size: 11px; max-width: 150px; white-space: normal; line-height: 1.15; }
 .st-timed { color: #9a7d3c; font-weight: 600; }
 
 /* Status bar */

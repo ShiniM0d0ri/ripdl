@@ -7,6 +7,9 @@ pub enum Error {
     #[error("invalid url: {0}")]
     InvalidUrl(String),
 
+    #[error("server error: {0}")]
+    Server(String),
+
     #[error("network error: {0}")]
     Http(#[from] reqwest::Error),
 

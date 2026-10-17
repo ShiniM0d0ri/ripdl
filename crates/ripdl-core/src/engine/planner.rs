@@ -33,7 +33,7 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
 
     let status = resp.status();
     if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
-        return Err(Error::InvalidUrl(format!("server returned {status}")));
+        return Err(Error::Server(format!("server returned {status}")));
     }
 
     let accept_ranges = resp
