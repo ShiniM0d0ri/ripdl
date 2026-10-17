@@ -14,8 +14,8 @@ pub enum TaskState {
     Cancelled,
 }
 
-/// The tool that performs the task: plain HTTP range requests, or the
-/// `yt-dlp` sidecar for video/stream pages.
+/// The tool that performs the task: plain HTTP range requests, the
+/// `yt-dlp` sidecar for video/stream pages, or the local torrent engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -23,6 +23,8 @@ pub enum TaskKind {
     Http,
     /// Video/stream page handled by the yt-dlp sidecar (hunt mode).
     Video,
+    /// BitTorrent payload (magnet / .torrent) via the torrent engine.
+    Torrent,
 }
 
 /// Persisted progress for one byte-range segment.
@@ -61,6 +63,10 @@ pub struct Progress {
     /// front (video tasks: parsed from yt-dlp's progress line).
     #[serde(default)]
     pub percent: Option<f64>,
+    /// Bytes per second, sampled by tools that can estimate it (HTTP
+    /// segments and torrent swarms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_bps: Option<f64>,
 }
 
 impl Default for Progress {
@@ -70,6 +76,7 @@ impl Default for Progress {
             downloaded: 0,
             total: None,
             percent: None,
+            speed_bps: None,
         }
     }
 }

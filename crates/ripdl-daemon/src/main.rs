@@ -66,6 +66,10 @@ struct Daemon {
     records: Mutex<Vec<TaskRecord>>,
     progress: Mutex<HashMap<String, ProgressTrack>>,
     runtime: Mutex<HashMap<String, TaskRuntime>>,
+    /// Single torrent session across all torrent tasks; created on first
+    /// torrent use (binds DHT/listener only when actually needed). Async
+    /// mutex: creation awaits inside the locked section.
+    torrents: tokio::sync::Mutex<Option<Arc<ripdl_core::torrent::TorrentSession>>>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
 }
@@ -139,6 +143,7 @@ impl Daemon {
             records: Mutex::new(records),
             progress: Mutex::new(HashMap::new()),
             runtime: Mutex::new(HashMap::new()),
+            torrents: tokio::sync::Mutex::new(None),
             shutdown: tokio::sync::Notify::new(),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         })
@@ -404,7 +409,7 @@ impl Daemon {
             .map(|r| {
                  let (downloaded, total, speed_bps, percent) = match progress.get(&r.id) {
                     Some(t) => (t.last.downloaded, t.last.total, t.speed, t.last.percent),
-                    None => (r.downloaded, r.total, None, r.total.map(|t| 100.0)),
+                    None => (r.downloaded, r.total, None, r.total.map(|_| 100.0)),
                 };
                 TaskInfo {
                     id: r.id.clone(),
@@ -560,9 +565,9 @@ impl Daemon {
             let on_progress = move |p| on_progress_this.on_progress(&on_progress_id, p);
 
             // Route by tool: HTTP gets the multi-segment engine, video gets
-            // the yt-dlp sidecar. Both feed the same progress stream and
-            // the same pause/cancel semantics; both hand back the produced
-            // file (for "open file"/"delete files" and clean removal).
+            // the yt-dlp sidecar, torrents share one session. All feed the
+            // same progress stream and the same pause/cancel semantics; all
+            // hand back the produced file/folder (for "open"/"delete").
             let result = match rec.kind {
                 TaskKind::Video => {
                     let cfg = ripdl_core::hunt::HuntConfig {
@@ -575,6 +580,45 @@ impl Daemon {
                     ripdl_core::hunt::download(cfg, &token, on_progress)
                         .await
                         .map(|out| out.file)
+                }
+                TaskKind::Torrent => {
+                    // One session for the whole daemon, created on demand
+                    // rooted at the download default (DHT/listener bind once).
+                    let session = {
+                        let mut guard = this.torrents.lock().await;
+                        if guard.is_none() {
+                            let root = this
+                                .config
+                                .default_download_dir
+                                .clone()
+                                .or_else(default_download_dir)
+                                .unwrap_or_else(|| PathBuf::from("."));
+                            match ripdl_core::torrent::TorrentSession::new(root).await {
+                                Ok(s) => *guard = Some(Arc::new(s)),
+                                Err(e) => {
+                                    drop(guard);
+                                    this.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
+                                    return;
+                                }
+                            }
+                        }
+                        Arc::clone(guard.as_ref().unwrap())
+                    };
+                    let cfg = ripdl_core::torrent::TorrentConfig {
+                        id: rec.id.clone(),
+                        payload: rec.url.clone(),
+                        dest_dir: rec.dest_dir.clone().unwrap_or_else(|| {
+                            this.config
+                                .default_download_dir
+                                .clone()
+                                .or_else(default_download_dir)
+                                .unwrap_or_else(|| PathBuf::from("."))
+                        }),
+                        only_files: None,
+                    };
+                    ripdl_core::torrent::download(&session, &cfg, &token, on_progress)
+                        .await
+                        .map(|out| Some(out.root))
                 }
                 TaskKind::Http => {
                     // Per-task engine: daemon policy (config.json) sets the
@@ -634,6 +678,29 @@ impl Daemon {
 
     /// Terminal success with the produced file, remembered for the
     /// "open file" / "delete files" flows (and byte counters for the UI).
+    /// Size of a path on disk: files measure directly, directories sum
+    /// their contents recursively. None for absent paths (torrent roots are
+    /// folders, so plain `metadata.len()` would report 0).
+    fn disk_size(p: &std::path::Path) -> Option<u64> {
+        let meta = std::fs::metadata(p).ok()?;
+        if !meta.is_dir() {
+            return Some(meta.len());
+        }
+        let mut total = 0u64;
+        let mut stack = vec![p.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                match std::fs::metadata(entry.path()) {
+                    Ok(m) if m.is_dir() => stack.push(entry.path()),
+                    Ok(m) => total += m.len(),
+                    Err(_) => {}
+                }
+            }
+        }
+        Some(total)
+    }
+
     fn set_completed(&self, id: &str, file: Option<PathBuf>) {
         {
             let mut records = self.records.lock().unwrap();
@@ -641,11 +708,16 @@ impl Daemon {
                 Some(r) => {
                     r.state = TaskState::Completed;
                     r.error = None;
-                    r.dest_file = file;
+                    r.dest_file = file.clone();
                     if let Some(f) = &r.dest_file {
-                        if let Ok(meta) = std::fs::metadata(f) {
-                            r.downloaded = meta.len();
-                            r.total = Some(meta.len());
+                        // Torrent roots are directories: metadata.len() is 0
+                        // there, so sum the tree. Files measure as before.
+                        if let Some(n) = Self::disk_size(f) {
+                            r.downloaded = n;
+                            r.total = Some(n);
+                        } else if let Some(t) = self.progress.lock().unwrap().get(id) {
+                            r.downloaded = t.last.downloaded;
+                            r.total = t.last.total;
                         }
                     }
                 }
@@ -712,10 +784,18 @@ fn delete_artifacts(rec: &TaskRecord) -> Vec<PathBuf> {
         }
     };
     if let Some(f) = &rec.dest_file {
-        remove_file(f, &mut deleted);
-        let mut sidecar = f.as_os_str().to_os_string();
-        sidecar.push(".ripdl.json");
-        remove_file(std::path::Path::new(&sidecar), &mut deleted);
+        // Torrent roots are directories (multi-file layout); HTTP/video are
+        // plain files. Sidecar logic only applies to files.
+        if f.is_dir() {
+            if std::fs::remove_dir_all(f).is_ok() {
+                deleted.push(f.to_path_buf());
+            }
+        } else {
+            remove_file(f, &mut deleted);
+            let mut sidecar = f.as_os_str().to_os_string();
+            sidecar.push(".ripdl.json");
+            remove_file(std::path::Path::new(&sidecar), &mut deleted);
+        }
     }
     if let Some(dir) = &rec.dest_dir {
         if let Ok(entries) = std::fs::read_dir(dir) {

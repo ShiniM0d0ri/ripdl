@@ -16,3 +16,5 @@ futures = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+anyhow = "1"
+librqbit = { version = "9", default-features = false, features = ["default-tls"] }

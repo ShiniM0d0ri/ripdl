@@ -106,12 +106,17 @@ async fn add_task(url: String, category: Option<String>, dest_dir: Option<String
         }
     };
     let _ = tokio::fs::create_dir_all(&dest).await;
+    let kind = if ripdl_core::torrent::looks_like_torrent_payload(&url) {
+        TaskKind::Torrent
+    } else {
+        TaskKind::Http
+    };
     match rpc(Command::Add {
         url,
         dest_dir: Some(dest),
         headers: Default::default(),
         start_at: None,
-        kind: TaskKind::Http,
+        kind,
     })
     .await?
     {

@@ -12,6 +12,7 @@ pub mod hunt;
 pub mod queue;
 pub mod rpc;
 pub mod task;
+pub mod torrent;
 pub mod transport;
 pub mod util;
 

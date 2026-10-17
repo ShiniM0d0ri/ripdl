@@ -69,33 +69,38 @@ Guiding rules:
 Plan (single UI, kind-routed backend, exact same queue/pause/resume semantics):
 
 M3.1 - core engine (`ripdl-core::torrent`):
-- [ ] Dep: `librqbit = { version = "9", default-features = false }` (own the
-      session inside the daemon process; no rqbit HTTP dashboard)
-- [ ] Payload detection: `magnet:` URI | info-hash | `.torrent` URL (fetch
-      through our engine first) | local `.torrent` path (bytes sniff `d4:info`)
-- [ ] `SessionHandle`: one `librqbit::Session` (DHT on, persistence under
-      `%LOCALAPPDATA%\ripdl\torrents\`), per-task add with `AddTorrentOptions`
-      (`output_folder`, `only_files: Option<Vec<usize>>`)
-- [ ] Progress sampling task: per-torrent stats → the same `Progress`
-      stream HTTP uses (downloaded/total/%/speed) + phase labels:
-      fetching metadata → verifying → downloading → seeding
-- [ ] Pause = `handle.pause()`, resume = `handle.resume()`, cancel token
-      unchanged; completion = all wanted files downloaded+verified
-- [ ] `TaskKind::Torrent`; boot-resume re-adds unfinished torrents from the
-      session's persisted state; completed torrents stay records-only (no
-      silent re-seeding)
+- [x] Dep: `librqbit = { version = "9", default-features = false,
+      features = ["default-tls"] }` (own the session inside the daemon
+      process; no rqbit HTTP dashboard)
+- [x] Payload detection: `magnet:` URI | local `.torrent` path | `.torrent`
+      URL (fetched by us via reqwest so the display name is known up front;
+      bencode sniff `d<digit>:`, `looks_like_torrent_payload`)
+- [x] `TorrentSession`: one `librqbit::Session` (DHT on, explicit ephemeral
+      ports + no rqbit-side persistence - our queue records own state),
+      per-task add with `AddTorrentOptions` (`output_folder`, `only_files`)
+- [x] Per-task-owned artifact root: `<dest>/<display name>` via the
+      torrent name (metainfo or magnet `dn=`), always set as the absolute
+      `output_folder` (rqbit takes folder-or-subfolder, never both; without
+      it files spill straight into the dest root)
+- [x] Progress sampling: per-torrent stats → the same `Progress` stream
+      HTTP uses (downloaded/total/speed; phase kept internal for now)
+- [x] Pause = rqbit pause through the cancel token (piece state survives
+      on disk), resume = re-ensure + unpause; completion = `finished`
+- [x] `TaskKind::Torrent`; boot-resume re-adds unfinished torrents from the
+      queue record (fresh session re-verifies existing data); completed
+      torrents stay records-only (no silent re-seeding)
 
 M3.2 - daemon + CLI:
-- [ ] Runner dispatch: torrent branch mirrors the HTTP branch (one runner per
-      task, same queue, same speed-cap plumbing where librqbit exposes limits)
-- [ ] `TorrentRecord` extras: info-hash, name, file list snapshot,
-      `dest_file` = the torrent's root folder; `delete_files` removes the
-      whole folder via `remove_dir_all` (per-task, never the dest root)
+- [x] Runner dispatch: torrent branch mirrors the HTTP branch (one runner per
+      task, same queue, same progress/cancel semantics; shared session behind
+      an async-mutex lazily created on first torrent)
+- [x] `dest_file` = the torrent's root folder; `delete_files` removes the
+      whole folder via `remove_dir_all` (per-task root, never the dest
+      root); completed torrent size = recursive folder sum
 - [ ] RPC `TorrentDetails { id }` → `{ name, info_hash, size, files
       [{index,name,size,wanted}], peers [{addr,client,flags,down,up,progress}],
       trackers }`
-- [ ] CLI: `add` auto-detects torrent payloads; `details <id>` dumps
-      files/peers/trackers
+- [x] CLI: `add` auto-detects torrent payloads (+ explicit `--torrent`)
 
 M3.3 - GUI merge (HTTP + torrent in one grid):
 - [ ] Row model: kind-specific status labels (metadata/verifying/seeding),
@@ -110,10 +115,14 @@ M3.3 - GUI merge (HTTP + torrent in one grid):
 - [ ] Sidebar adds "Torrents" (kind filter, not extension)
 
 M3.4 - tests / verification:
-- [ ] Offline integration: in-proc seeder ↔ leecher over localhost with a
-      generated .torrent (librqbit can both create and add)
-- [ ] Unit: payload detection, only_files mapping, .torrent bytes → file list
-- [ ] Live: real-world legal torrent; pause/resume across daemon restart
+- [x] Offline integration: in-proc seeder ↔ leecher over localhost with a
+      generated .torrent - byte-identical payload, live progress, timeouts
+- [x] Unit: payload detection heuristics, magnet dn decode/sanitization,
+      metainfo name extraction, http fetch routed through resolve_payload
+- [x] Live: real-world legal torrent (Sintel): 8 MiB/s swarm fill,
+      mid-flight pause/resume at 61%, correct folder + counters completed,
+      `rm --files` wipes the task-owned folder
+- [ ] Pause/resume across daemon restart (boot-resume re-verify path)
 - [ ] Clean-room check: behavior parity notes only, no copying from
       qBittorrent/FDM code or assets; findings → docs/rea-findings.md
 

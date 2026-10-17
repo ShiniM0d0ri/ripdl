@@ -99,15 +99,20 @@ IDM-style task manager over daemon RPC (`list_tasks`/`add_task`/pause/
 resume/remove commands, static frontend embedded at build time, no bundler;
 auto-spawns the daemon like the bridge). P4 extension stays live; hunt
 offers from the popup are the remaining P4 thread.
-43 tests pass offline (`cargo test --workspace`).
+50 tests pass offline (`cargo test --workspace`), including an in-proc
+seeder↔leecher torrent round-trip.
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
 with native browse, per-row location display, open file/folder via Explorer
 `/select`, `remove_task(delete_files)` with sidecar-aware disk cleanup,
 `rm --files` CLI flag, GUI render-on-change, spawn rate limit in the bridge);
 remaining P2: settings panel (daemon config) + tray.
-P3 torrent plan drafted (see ROADMAP); UI status cells now use icons and hover
-shows the full error + an actionable hint.
+P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
+librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
+(ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root
+folder, same Progress stream + pause/resume/cancel as HTTP, CLI auto-detect
+(`--torrent`), GUI add auto-routes torrents; M3.3 Details RPC/peers/files is
+the remaining P3 thread. Daemon counters now sum torrent folder trees.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
-still speaks TCP), video/stream hunt mode, per-task quota polish,
+still speaks TCP), per-task quota polish,
 `rm` sidecar cleanup, global daemon speed cap.

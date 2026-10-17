@@ -10,6 +10,9 @@ pub enum Error {
     #[error("server error: {0}")]
     Server(String),
 
+    /// Upstream library failure (librqbit etc. report via anyhow).
+    #[error("{0:#}")]
+    Anyhow(#[from] anyhow::Error),
     #[error("network error: {0}")]
     Http(#[from] reqwest::Error),
 

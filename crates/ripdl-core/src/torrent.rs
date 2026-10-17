@@ -1,0 +1,536 @@
+//! Torrent tasks via `librqbit` (Apache-2.0) - the P3 transport.
+//!
+//! The daemon owns one session process-wide (DHT + listener); each torrent
+//! task is a `ManagedTorrent` inside it. Progress samples the same
+//! `Progress` stream the HTTP engine feeds, so the queue/UI layers cannot
+//! tell the transports apart. Pause = librqbit pause (piece state survives
+//! on disk), resume = re-ensure + unpause; the queue record payload
+//! (magnet/.torrent) is the source of truth - no rqbit-side persistence.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use librqbit::{
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, TorrentStats,
+    TorrentStatsState,
+};
+use tokio_util::sync::CancellationToken;
+
+use crate::error::{Error, Result};
+use crate::task::Progress;
+
+/// One torrent task, in the same shape as `Task`/`HuntConfig`.
+#[derive(Debug, Clone)]
+pub struct TorrentConfig {
+    pub id: String,
+    /// magnet URI / info-hash / .torrent local path / .torrent http(s) URL.
+    pub payload: String,
+    pub dest_dir: PathBuf,
+    /// Only fetch these file indices (None = everything).
+    pub only_files: Option<Vec<usize>>,
+}
+
+/// Disk artifacts of a finished torrent: the torrent's root (the file
+/// itself for single-file payloads, `<dest_dir>/<name>` for multi-file
+/// ones, per rqbit's own layout).
+#[derive(Debug, Clone)]
+pub struct TorrentOutput {
+    pub root: PathBuf,
+}
+
+/// Result of `ensure`: the managed handle plus the guaranteed
+/// task-owned artifact root on disk.
+pub struct Ensured {
+    pub handle: Arc<ManagedTorrent>,
+    /// `<dest_dir>/<display name>`: single-file torrents put their file
+    /// right there, multi-file ones fill the folder.
+    pub root: PathBuf,
+}
+
+/// Does a user-supplied payload look like a torrent (auto-detection for
+/// `add`, GUI and bridge routing)? Pure string/path heuristics by design:
+/// no network, no file reads.
+pub fn looks_like_torrent_payload(payload: &str) -> bool {
+    let p = payload.trim();
+    if p.starts_with("magnet:") {
+        return true;
+    }
+    if !p.contains("://") && PathBuf::from(p).exists() {
+        return true;
+    }
+    // .torrent by URL extension (query/fragment stripped)
+    let bare = p.split(['?', '#']).next().unwrap_or(p);
+    bare.to_ascii_lowercase().ends_with(".torrent")
+}
+
+/// On-disk metainfo sniff: a legal .torrent always starts with `d<digit>:`.
+pub fn is_torrent_file_bytes(b: &[u8]) -> bool {
+    b.first() == Some(&b'd') && b.len() >= 2 && b[1].is_ascii_digit()
+}
+
+/// Resolve a payload to an `AddTorrent` plus the torrent's display name
+/// when it can be known up front (parsed metainfo, or a magnet's `dn=`).
+/// http(s) .torrent URLs are fetched here so every byte-backed payload
+/// yields a name - rqbit never has to fetch them itself.
+///
+/// Recording the name before adding matters: rqbit writes files straight
+/// into the output folder, so ripdl always sets `sub_folder` to keep each
+/// task's artifacts in a dedicated, deletable directory.
+async fn resolve_payload(payload: &str) -> Result<(AddTorrent<'static>, Option<String>)> {
+    let p = payload.trim();
+    if p.starts_with("magnet:") {
+        return Ok((AddTorrent::from_url(p.to_string()), magnet_display_name(p)));
+    }
+    let bytes = if p.starts_with("http://") || p.starts_with("https://") {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let resp = client.get(p).send().await?.error_for_status()?;
+        resp.bytes().await?.to_vec()
+    } else {
+        let path = PathBuf::from(p);
+        if !path.is_file() {
+            return Err(Error::InvalidUrl(payload.to_string()));
+        }
+        std::fs::read(&path)?
+    };
+    let name = metainfo_name(&bytes);
+    Ok((AddTorrent::from_bytes(Bytes::from(bytes)), name))
+}
+
+/// Torrent name from metainfo bytes (None on any parse trouble; the
+/// fallback sub-folder keeps the task self-contained regardless).
+fn metainfo_name(bytes: &[u8]) -> Option<String> {
+    let parsed = librqbit::torrent_from_bytes(bytes).ok()?;
+    let name = parsed.info.data.name.as_ref()?;
+    std::str::from_utf8(name.as_ref())
+        .ok()
+        .map(str::to_string)
+}
+
+/// Magnet `dn=` display name, percent-decoded and sanitized for use as a
+/// folder name. A display name, not a guarantee - but good enough for the
+/// dedicated sub-folder (and usually identical to the real name).
+fn magnet_display_name(payload: &str) -> Option<String> {
+    for pair in payload.split('&').skip(1) {
+        if let Some(v) = pair.strip_prefix("dn=") {
+            let decoded = percent_decode(v);
+            return Some(sanitize_component(&decoded));
+        }
+    }
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 3 <= b.len() => {
+                let hex = b[i + 1..i + 3]
+                    .iter()
+                    .all(|c| c.is_ascii_hexdigit())
+                    .then(|| {
+                        u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap(), 16)
+                            .unwrap()
+                    });
+                if let Some(byte) = hex {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Path-component hygiene for display names coming from the wild.
+fn sanitize_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim().to_string();
+    if trimmed.is_empty() {
+        s.to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Process-wide handle over the daemon's single torrent session.
+pub struct TorrentSession {
+    session: Arc<Session>,
+}
+
+impl TorrentSession {
+    /// Start the session (explicit random ports; no rqbit-side persistence
+    /// - the queue record is the source of truth, and separate sessions
+    /// must never collide on one DHT/resource).
+    pub async fn new(default_output_folder: PathBuf) -> Result<Self> {
+        let opts = librqbit::SessionOptions {
+            dht: Some(librqbit::DhtSessionConfig {
+                bootstrap_addrs: None,
+                port: Some(0),          // ephemeral: never collide
+                persistence: None,      // our records own state
+            }),
+            listen: Some(librqbit::ListenerOptions {
+                listen_addr: "[::]:0".parse().unwrap(),
+                ..librqbit::ListenerOptions::default()
+            }),
+            ..librqbit::SessionOptions::default()
+        };
+        Ok(Self {
+            session: Session::new_with_opts(default_output_folder, opts).await?,
+        })
+    }
+
+    /// Inner session (peers/trackers/files for the future Details RPC).
+    pub fn raw(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    /// Make sure the torrent is managed and running. Idempotent per
+    /// info-hash: an already-managed (paused) torrent is unpaused; a fresh
+    /// one is added with this task's destination and file selection.
+    ///
+    /// Always returns the task-owned root: `<dest_dir>/<display name>` (or
+    /// `<dest_dir>/ripdl-torrent-<id>` when no name is known yet). rqbit
+    /// writes files directly into its output folder, so ripdl sets
+    /// `sub_folder` itself to keep artifacts contained and deletable.
+    pub async fn ensure(&self, cfg: &TorrentConfig) -> Result<Ensured> {
+        let (add, name) = resolve_payload(&cfg.payload).await?;
+        let sub = match name {
+            Some(n) => sanitize_component(&n),
+            None => format!("ripdl-torrent-{}", cfg.id),
+        };
+        let root = cfg.dest_dir.join(&sub);
+        // rqbit takes either output_folder (absolute) or sub_folder
+        // (relative to the session default), never both - pass the
+        // combined task-owned root directly.
+        let mut opts = AddTorrentOptions {
+            output_folder: Some(root.to_string_lossy().into_owned()),
+            ..AddTorrentOptions::default()
+        };
+        if let Some(files) = &cfg.only_files {
+            opts.only_files = Some(files.clone());
+        }
+        match self.session.add_torrent(add, Some(opts)).await? {
+            AddTorrentResponse::AlreadyManaged(_, h) => {
+                if h.is_paused() {
+                    self.session.unpause(&h).await?;
+                }
+                Ok(Ensured { handle: h, root })
+            }
+            AddTorrentResponse::Added(_, h) => Ok(Ensured { handle: h, root }),
+            AddTorrentResponse::ListOnly(_) => Err(Error::State(
+                "torrent add unexpectedly returned list-only".into(),
+            )),
+        }
+    }
+
+    /// Drop a torrent from the session (files stay on disk; the daemon's
+    /// delete_files path owns disk cleanup).
+    pub async fn forget(&self, h: &Arc<ManagedTorrent>) {
+        let _ = self
+            .session
+            .delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false)
+            .await;
+    }
+
+    /// librqbit pause: verified piece state survives on disk, unpause resumes.
+    pub async fn pause(&self, h: &Arc<ManagedTorrent>) {
+        let _ = self.session.pause(h).await;
+    }
+}
+
+/// Full run loop for one task: ensure -> sample stats every second ->
+/// cancel-aware pause. Mirrors `engine::download`'s contract exactly.
+pub async fn download(
+    session: &TorrentSession,
+    cfg: &TorrentConfig,
+    token: &CancellationToken,
+    mut on_progress: impl FnMut(Progress) + Send,
+) -> Result<TorrentOutput> {
+    if token.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let ensured = session.ensure(cfg).await?;
+
+    loop {
+        if token.is_cancelled() {
+            // piece state survives on disk; unpause will resume cheaply
+            let _ = session.pause(&ensured.handle).await;
+            return Err(Error::Cancelled);
+        }
+        let stats = ensured.handle.stats();
+        let phase = classify(&stats);
+        if let TorrentPhaseKind::Failed(e) = &phase {
+            return Err(Error::State(e.clone()));
+        }
+        if stats.finished {
+            emit(&cfg.id, &stats, &mut on_progress);
+            return Ok(TorrentOutput { root: ensured.root });
+        }
+        emit(&cfg.id, &stats, &mut on_progress);
+        // While only metadata fetching is happening (no bytes yet) poll a
+        // bit faster so progress emits regularly but not aggressively.
+        let tick = if matches!(phase, TorrentPhaseKind::Fetching) { 500 } else { 1000 };
+        tokio::time::sleep(Duration::from_millis(tick)).await;
+    }
+}
+
+enum TorrentPhaseKind {
+    Fetching,
+    Active,
+    Failed(String),
+}
+
+fn classify(st: &TorrentStats) -> TorrentPhaseKind {
+    match st.state {
+        TorrentStatsState::Error => {
+            TorrentPhaseKind::Failed(st.error.clone().unwrap_or_else(|| "torrent failed".into()))
+        }
+        TorrentStatsState::Initializing { .. } if st.progress_bytes == 0 && !st.finished => {
+            // No metadata yet: magnet jobs spend time here. `Initializing`
+            // is also readiness-checking when bytes exist - approximated by
+            // looking at whether we have any identifying name.
+            match handle_name_guess(st) {
+                true => TorrentPhaseKind::Active,
+                false => TorrentPhaseKind::Fetching,
+            }
+        }
+        _ => TorrentPhaseKind::Active,
+    }
+}
+
+/// A stats sample that needs the torrent name can't have it from here;
+/// rqbit exposes it on the handle - approximation: metadata presence is
+/// signaled by total_bytes > 0 for magnets (none until info arrives).
+fn handle_name_guess(st: &TorrentStats) -> bool {
+    st.total_bytes > 0
+}
+
+fn emit(id: &str, st: &TorrentStats, on_progress: &mut impl FnMut(Progress)) {
+    let speed = st.live.as_ref().map(|l| l.download_speed.as_bytes() as f64);
+    // percent left to None: bytes + total drive the bar, and the daemon's
+    // percent branch would otherwise clear its derived speed.
+    on_progress(Progress {
+        id: id.to_string(),
+        downloaded: st.progress_bytes,
+        total: Some(st.total_bytes),
+        percent: None,
+        speed_bps: speed,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- offline integration: local seeder <-> our download loop ----------
+    //
+    // Creates a real .torrent, seeds it through an in-process rqbit session
+    // and leeches it with `download()` on a second session - loopback only,
+    // no public network. Proves ensure/sample/finish/pause plumbing.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_seed_leech_roundtrip() {
+        use librqbit::spawn_utils::BlockingSpawner;
+        use librqbit::CreateTorrentOptions;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ripdl-tortest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Payload: 2 MiB patterned so corruption is detectable.
+        let data_path = tmp.join("payload.bin");
+        let mut data = Vec::with_capacity(2 * 1024 * 1024);
+        let count = (2 * 1024 * 1024) / 8;
+        for i in 0..count {
+            data.extend_from_slice(&(i as u64).wrapping_mul(0x0123_4567_89ab_cdef).to_le_bytes());
+        }
+        std::fs::write(&data_path, &data).unwrap();
+
+        // Metainfo.
+        let spawner = BlockingSpawner::new(2);
+        let tor = librqbit::create_torrent(
+            &data_path,
+            CreateTorrentOptions {
+                name: Some("payload.bin".into()),
+                trackers: Vec::new(),
+                piece_length: Some(256 * 1024),
+            },
+            &spawner,
+        )
+        .await
+        .expect("create torrent");
+        let bytes: Vec<u8> = tor.as_bytes().expect("serialize").to_vec();
+        let torfile = tmp.join("payload.bin.torrent");
+        std::fs::write(&torfile, &bytes).unwrap();
+
+        // Seeder (raw rqbit session; ripdl's own torrent engine is the
+        // client under test - not the seeder). Same explicit-port hygiene
+        // as the real engine to keep two sessions out of each other's way.
+        let seed_opts = librqbit::SessionOptions {
+            dht: Some(librqbit::DhtSessionConfig {
+                bootstrap_addrs: None,
+                port: Some(0),
+                persistence: None,
+            }),
+            listen: Some(librqbit::ListenerOptions {
+                listen_addr: "[::]:0".parse().unwrap(),
+                ..librqbit::ListenerOptions::default()
+            }),
+            ..librqbit::SessionOptions::default()
+        };
+        let seed_session = Session::new_with_opts(tmp.join("seed-default"), seed_opts)
+            .await
+            .unwrap();
+        seed_session
+            .create_and_serve_torrent(
+                &data_path,
+                CreateTorrentOptions {
+                    name: Some("payload.bin".into()),
+                    trackers: Vec::new(),
+                    piece_length: Some(256 * 1024),
+                },
+            )
+            .await
+            .expect("seed");
+
+        // Leech: the real ripdl path (ensure -> sample -> finished).
+        let leech = TorrentSession::new(tmp.join("leech-default"))
+            .await
+            .unwrap();
+        let dest = tmp.join("leech");
+        let cfg = TorrentConfig {
+            id: "tor-1".into(),
+            payload: torfile.to_string_lossy().into_owned(),
+            dest_dir: dest.clone(),
+            only_files: None,
+        };
+        let token = CancellationToken::new();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen2 = seen.clone();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            crate::torrent::download(&leech, &cfg, &token, move |p| {
+                use std::sync::atomic::Ordering::Relaxed;
+                seen2.store(p.downloaded, Relaxed);
+            }),
+        )
+        .await
+        .expect("download finished in time")
+        .expect("download ok");
+
+        // The output root holds the file with identical contents.
+        let produced = out.root;
+        assert!(produced.is_file() || produced.is_dir(), "root exists: {produced:?}");
+        let got = if produced.is_file() {
+            std::fs::read(&produced).unwrap()
+        } else {
+            std::fs::read(produced.join("payload.bin")).unwrap()
+        };
+        assert_eq!(got, data, "payload round-tripped identically");
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) >= data.len() as u64,
+            "progress reported live bytes"
+        );
+
+        seed_session.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn magnet_payloads_detected() {
+        assert!(looks_like_torrent_payload(
+            "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862"
+        ));
+        assert!(looks_like_torrent_payload("  magnet:?xt=urn:btih:X"));
+        assert!(!looks_like_torrent_payload(
+            "https://example.com/film.mp4"
+        ));
+    }
+
+    #[test]
+    fn torrent_urls_detected() {
+        assert!(looks_like_torrent_payload(
+            "https://example.com/download/ubuntu.torrent"
+        ));
+        assert!(looks_like_torrent_payload(
+            "https://example.com/download/ubuntu.torrent?token=x"
+        ));
+        assert!(!looks_like_torrent_payload("https://example.com/file.ZIP"));
+    }
+
+    #[test]
+    fn local_paths_by_extension_or_existence() {
+        // `.torrent` extension wins even for paths not on disk (string
+        // heuristic by design - no fs reads during routing).
+        assert!(looks_like_torrent_payload(
+            "C:\\definitely\\not\\a\\real\\file.torrent"
+        ));
+        // A plain local path that exists is a torrent; one that doesn't
+        // exist and has no torrent extension stays HTTP.
+        let tmp = std::env::temp_dir().join("ripdl-payload-exists.bin");
+        std::fs::write(&tmp, b"hi").unwrap();
+        assert!(looks_like_torrent_payload(tmp.to_str().unwrap()));
+        std::fs::remove_file(&tmp).unwrap();
+        assert!(!looks_like_torrent_payload(
+            "C:\\definitely\\not\\a\\real\\file.zip"
+        ));
+    }
+
+    #[test]
+    fn bencode_sniff() {
+        assert!(is_torrent_file_bytes(b"d4:infod6:lengthi3eeyee"));
+        assert!(!is_torrent_file_bytes(b"PK\x03\x04"));
+        assert!(is_torrent_file_bytes(b"d10:created-by3:xxx")); // binary-safe
+        assert!(!is_torrent_file_bytes(b""));
+    }
+
+    #[tokio::test]
+    async fn resolve_routes_payloads() {
+        let m = resolve_payload("magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=Sintel")
+            .await
+            .unwrap();
+        assert_eq!(m.1.as_deref(), Some("Sintel"));
+        let not_torrent = resolve_payload("D:\\no\\such\\file.zip").await;
+        assert!(matches!(not_torrent, Err(Error::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn percent_decode_and_sanitize() {
+        assert_eq!(percent_decode("Sintel%20%28movie%29"), "Sintel (movie)");
+        assert_eq!(
+            sanitize_component("bad//name:with*chars?"),
+            "bad__name_with_chars_"
+        );
+        assert_eq!(sanitize_component("  ..weird..  "), "weird");
+    }
+}

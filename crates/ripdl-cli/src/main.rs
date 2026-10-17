@@ -55,7 +55,6 @@ enum Cmd {
     /// Queue a URL with the running daemon.
     Add {
         url: String,
-        /// Output directory (default: your downloads folder).
         #[arg(short, long)]
         dest: Option<PathBuf>,
         /// Extra request header `Name: value`; repeatable.
@@ -81,6 +80,10 @@ enum Cmd {
         /// the daemon's config.json.
         #[arg(long = "video")]
         video: bool,
+        /// Torrent mode: magnets, local .torrent files and .torrent URLs
+        /// are auto-detected; this flag forces it otherwise.
+        #[arg(long = "torrent")]
+        torrent: bool,
     },
     /// List tasks known to the daemon.
     Ls,
@@ -178,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{info:#?}");
             Ok(())
         }
-        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video } => {
+        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video, torrent } => {
             let start_at = match (&after, &at) {
                 (Some(_), Some(_)) => bail!("use --after or --at, not both"),
                 (Some(delay), None) => Some(now_unix() + parse_after(delay)? as i64),
@@ -188,6 +191,10 @@ async fn main() -> anyhow::Result<()> {
             let headers = collect_headers(&header, referer, cookie, user_agent)?;
             let kind = if video {
                 ripdl_core::task::TaskKind::Video
+            } else if torrent
+                || ripdl_core::torrent::looks_like_torrent_payload(&url)
+            {
+                ripdl_core::task::TaskKind::Torrent
             } else {
                 ripdl_core::task::TaskKind::Http
             };

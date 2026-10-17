@@ -201,6 +201,7 @@ impl Engine {
                             downloaded: downloaded.load(Ordering::Relaxed),
                             total: meta_task.total,
                             percent: None,
+                            speed_bps: None,
                         });
                         break;
                     }
@@ -216,6 +217,7 @@ impl Engine {
                         downloaded: downloaded_now,
                         total: file.total,
                         percent: None,
+                        speed_bps: None,
                     });
                 }
             })
