@@ -94,6 +94,11 @@ max_segments, min_segment_size, max_speed_bytes, default_download_dir),
 hunt mode (video/stream tasks via the `yt-dlp` sidecar: `add --video`,
 `ytdlp_path` config key, percent-based progress, pause = kill sidecar,
 resume = re-invoke which continues `.part` files).
+GUI: `ripdl-gui` (Tauri 2 shell, `crates/ripdl-gui` + static `ui/`):
+IDM-style task manager over daemon RPC (`list_tasks`/`add_task`/pause/
+resume/remove commands, static frontend embedded at build time, no bundler;
+auto-spawns the daemon like the bridge). P4 extension stays live; hunt
+offers from the popup are the remaining P4 thread.
 41 tests pass offline (`cargo test --workspace`).
 In progress: P4 browser integration — REA research done; bridge +
 `register-host` + MV3 extension landed and capture verified live twice

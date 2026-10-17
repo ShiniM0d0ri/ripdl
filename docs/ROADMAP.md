@@ -52,8 +52,10 @@ Guiding rules:
 
 ## P2 - GUI (Tauri)
 
-- [ ] Task list: progress, speed, per-task pause/resume/cancel
-- [ ] Add-URL dialog + paste/clipboard monitor
+- [x] Task list: progress, speed, per-task pause/resume/cancel (`ripdl-gui`,
+      IDM-style: toolbar, category sidebar, grid with inline progress bars,
+      context menu, status bar; auto-spawns the daemon on first poll)
+- [x] Add-URL dialog (`add_task` command + URL/category form)
 - [ ] Settings: category folders, segment count, concurrency
 - [ ] System tray + minimize-to-tray
 

@@ -1,0 +1,176 @@
+/* IDM-style skin: light chrome, dense grid, sidebar categories. */
+* { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+html, body { height: 100%; }
+body {
+    font: 12.5px/1.4 "Segoe UI", sans-serif;
+    color: #1b2229;
+    background: #f4f5f7;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.hidden { display: none !important; }
+
+/* Menu bar */
+#menubar {
+    background: linear-gradient(#fdfdfd, #f1f1f1);
+    border-bottom: 1px solid #d9dcdf;
+    padding: 3px 8px;
+    display: flex;
+    gap: 4px;
+}
+#menubar span { padding: 3px 10px; border-radius: 3px; cursor: default; }
+#menubar span:hover { background: #e8ebef; }
+
+/* Toolbar */
+#toolbar {
+    background: linear-gradient(#f6f7f8, #e9ebee);
+    border-bottom: 1px solid #d0d5db;
+    padding: 6px 8px;
+    display: flex;
+    gap: 4px;
+}
+.tb-btn {
+    display: flex; flex-direction: column; align-items: center;
+    gap: 2px; padding: 5px 14px 3px;
+    background: transparent; border: 1px solid transparent; border-radius: 4px;
+    cursor: pointer;
+    font: inherit; color: inherit;
+}
+.tb-btn:hover { background: #ffffffcc; border-color: #c9ced4; }
+.tb-btn:active { background: #dee3e8; }
+.tb-ico { font-size: 17px; line-height: 1; }
+.tb-ico.green { color: #1a8f3c; }
+.tb-ico.blue { color: #1f6fb0; }
+.tb-ico.amber { color: #b0681f; }
+.tb-ico.gray { color: #5b6770; }
+
+/* Body layout */
+#body { flex: 1; display: flex; min-height: 0; }
+
+#sidebar {
+    width: 170px;
+    background: #eef0f3;
+    border-right: 1px solid #d9dcdf;
+    padding: 8px 0;
+    overflow-y: auto;
+}
+.side-title { font-weight: 600; padding: 2px 12px 6px; color: #39424c; }
+.side-item { padding: 4px 12px; display: flex; gap: 7px; cursor: default; white-space: nowrap; }
+.side-item:hover { background: #e2e6ea; }
+.side-item.active { background: linear-gradient(#dce9f4, #cfe0f0); font-weight: 600; }
+.side-item .count { margin-left: auto; color: #66727c; font-size: 11px; }
+
+#main { flex: 1; overflow: auto; background: #fff; }
+
+/* Task table */
+#task-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+#task-table th {
+    text-align: left; font-weight: 600; color: #39424c;
+    background: linear-gradient(#f8f9fa, #eceef0);
+    border-bottom: 1px solid #d0d5db; border-right: 1px solid #e4e7ea;
+    padding: 5px 8px; position: sticky; top: 0; z-index: 1;
+}
+#task-table td {
+    padding: 4px 8px; border-bottom: 1px solid #eef0f2; border-right: 1px solid #f4f5f6;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#task-table tbody tr:nth-child(even) { background: #fafbfc; }
+#task-table tbody tr:hover { background: #eaf2fa; }
+#task-table tbody tr.selected { background: #d6e7f7; }
+
+.col-name { width: 34%; }
+.col-status { width: 12%; }
+.col-size { width: 12%; }
+.col-prog { width: 22%; }
+.col-eta { width: 10%; }
+.col-speed { width: 10%; }
+.col-act { width: 74px; text-align: right; }
+.row-btn {
+    border: 1px solid #c9ced4; border-radius: 3px; background: #fff;
+    cursor: pointer; font: 12px "Segoe UI", sans-serif; color: #39424c;
+    padding: 1px 5px; margin-left: 4px; opacity: 0;
+}
+tr:hover .row-btn { opacity: 1; }
+.row-btn:hover { background: #e8f0f8; border-color: #9fb8d0; }
+.actions { white-space: nowrap; }
+
+.fname-cell { display: flex; align-items: center; gap: 6px; }
+.ficon { width: 16px; text-align: center; flex: none; }
+
+/* Progress bar in cells */
+.prog-track { background: #e6e9ec; border: 1px solid #cfd4d9; border-radius: 2px; height: 14px; width: 100%; }
+.prog-fill { height: 100%; background: linear-gradient(#7cc47c, #35a235); width: 0%; }
+.prog-fill.failed { background: linear-gradient(#e08585, #c23b3b); }
+.prog-fill.paused { background: linear-gradient(#cfd4db, #a9b1b9); }
+.prog-label { position: absolute; left: 6px; }
+.prog-cell { position: relative; padding-right: 4px; }
+td.prog-cell .pct { margin-left: 6px; color: #45505a; }
+
+/* States */
+.st-completed { color: #1a7f37; font-weight: 600; }
+.st-running { color: #1f6fb0; font-weight: 600; }
+.st-queued { color: #5b6770; }
+.st-paused { color: #8a94a0; }
+.st-failed { color: #c23b3b; font-weight: 600; }
+.st-timed { color: #9a7d3c; font-weight: 600; }
+
+/* Status bar */
+#statusbar {
+    background: linear-gradient(#f6f7f8, #e9ebee);
+    border-top: 1px solid #d0d5db;
+    padding: 3px 10px;
+    display: flex; align-items: center;
+}
+.st-pill { padding: 1px 10px; border-radius: 8px; font-size: 11.5px; }
+.st-on { background: #d8efdc; color: #1a7f37; }
+.st-off { background: #f4dede; color: #b02a2a; }
+.st-gap { margin-left: 16px; color: #45505a; }
+
+/* Empty hint */
+#empty-hint { text-align: center; color: #8a94a0; padding: 34px 20px; }
+#empty-hint.hidden { display: none; }
+
+/* Dialog */
+#dlg-backdrop {
+    position: fixed; inset: 0; background: #0006;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 90px; z-index: 50;
+}
+#dlg {
+    background: #fbfcfd;
+    border: 1px solid #b9c1c9; border-radius: 6px;
+    box-shadow: 0 14px 40px #0004;
+    width: 520px; padding: 16px 18px;
+    display: flex; flex-direction: column; gap: 12px;
+}
+.dlg-title { font-size: 14px; font-weight: 600; color: #333c44; }
+#dlg-url {
+    width: 100%; padding: 7px 9px;
+    border: 1px solid #c3c9cf; border-radius: 4px;
+    font: 13px "Segoe UI", sans-serif; color: inherit;
+    user-select: text;
+}
+.dlg-row { display: flex; align-items: center; gap: 12px; }
+.dlg-row select { padding: 5px 8px; border: 1px solid #c3c9cf; border-radius: 4px; font: inherit; }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.dlg-actions button {
+    padding: 6px 16px; border-radius: 4px; border: 1px solid #c3c9cf;
+    background: linear-gradient(#fdfdfd, #eef0f2); cursor: pointer; font: inherit;
+}
+.dlg-actions .primary {
+    background: linear-gradient(#3f8dca, #2f6fa5); color: #fff; border-color: #2f6fa5;
+    font-weight: 600;
+}
+#dlg-err { color: #c23b3b; font-size: 12px; }
+
+/* Context menu */
+#ctx {
+    position: fixed; z-index: 60;
+    background: #fbfcfd; border: 1px solid #c3c9cf; border-radius: 4px;
+    box-shadow: 0 8px 22px #0003;
+    padding: 4px; min-width: 160px;
+}
+#ctx div { padding: 6px 14px; cursor: default; }
+#ctx div:hover { background: #e8f0f8; }

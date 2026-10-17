@@ -199,8 +199,9 @@ fn talk(config: &BridgeConfig, rpc_seq: &mut u64, cmd: &Command) -> Result<Reply
 
 /// Start the sibling `ripdl-daemon` binary from next to the running exe,
 /// detached and window-less. Best effort: failure is fine, the caller already
-/// reports "daemon unreachable" after exhausting retries.
-fn spawn_daemon_bg() -> Result<()> {
+/// reports "daemon unreachable" after exhausting retries. Shared by the
+/// native-messaging bridge and the GUI shell.
+pub fn spawn_daemon_bg() -> Result<()> {
     let exe = std::env::current_exe()?;
     let dir = exe
         .parent()
@@ -365,9 +366,16 @@ mod tests {
 
     /// Daemon down (retry loop exhausted, spawn disabled) → an `error` reply,
     /// which the extension treats as "fall back to the browser download".
+    /// Port-isolated: binds a socket, drops it, and aims there so a real
+    /// daemon on the default port can't answer (the GUI keeps one alive).
     #[test]
     fn unreachable_daemon_becomes_error_reply() {
+        // Take an ephemeral port, then vacate it: nothing listens there.
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
         let config = BridgeConfig {
+            port,
             spawn_daemon: false,
             connect_attempts: 2,
             connect_delay: Duration::from_millis(20),

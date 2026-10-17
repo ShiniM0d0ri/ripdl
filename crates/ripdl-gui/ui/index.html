@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ripdl</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="menubar">
+    <span>File</span><span>Tasks</span><span>Downloads</span><span>View</span><span>Help</span>
+  </div>
+
+  <div id="toolbar">
+    <button id="btn-add" class="tb-btn" title="Add a download (Ctrl+N)">
+      <span class="tb-ico green">&#10133;</span><span>Add URL</span>
+    </button>
+    <button id="btn-resume-all" class="tb-btn" title="Resume all paused / failed">
+      <span class="tb-ico blue">&#10148;</span><span>Resume All</span>
+    </button>
+    <button id="btn-stop-all" class="tb-btn" title="Pause all running">
+      <span class="tb-ico amber">&#9646;&#8709;</span><span>Stop All</span>
+    </button>
+    <button id="btn-clear-done" class="tb-btn" title="Remove completed tasks from the list">
+      <span class="tb-ico gray">&#10005;</span><span>Clear Done</span>
+    </button>
+  </div>
+
+  <div id="body">
+    <div id="sidebar">
+      <div class="side-title">Categories</div>
+      <div id="side-items"></div>
+    </div>
+
+    <div id="main">
+      <table id="task-table">
+        <thead>
+          <tr>
+            <th class="col-name">File Name</th>
+            <th class="col-status">Status</th>
+            <th class="col-size">Size</th>
+            <th class="col-prog">Progress</th>
+            <th class="col-eta">Time Left</th>
+            <th class="col-speed">Speed</th>
+            <th class="col-act"></th>
+          </tr>
+        </thead>
+        <tbody id="task-rows"></tbody>
+      </table>
+      <div id="empty-hint">No downloads in this view. Click <b>Add URL</b> to start one.</div>
+    </div>
+  </div>
+
+  <div id="statusbar">
+    <span id="st-conn" class="st-pill st-off">connecting&hellip;</span>
+    <span id="st-counts" class="st-gap">&mdash;</span>
+    <span id="st-speed" class="st-gap">0 B/s</span>
+  </div>
+
+  <!-- Add URL dialog -->
+  <div id="dlg-backdrop" class="hidden">
+    <div id="dlg">
+      <div class="dlg-title">Add new download</div>
+      <input id="dlg-url" type="text" placeholder="https://example.com/file.zip" autofocus />
+      <div class="dlg-row">
+        <label for="dlg-cat">Category</label>
+        <select id="dlg-cat">
+          <option value="auto" selected>Auto (by file type)</option>
+          <option value="video">Video</option>
+          <option value="music">Audio</option>
+          <option value="images">Images</option>
+          <option value="documents">Documents</option>
+          <option value="archives">Archives</option>
+          <option value="programs">Programs</option>
+          <option value="other">Other (no subfolder)</option>
+        </select>
+      </div>
+      <div class="dlg-actions">
+        <button id="dlg-cancel">Cancel</button>
+        <button id="dlg-ok" class="primary">Download</button>
+      </div>
+      <div id="dlg-err" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- Row context menu -->
+  <div id="ctx" class="hidden">
+    <div data-act="toggle">Pause / Resume</div>
+    <div data-act="remove">Remove from list</div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

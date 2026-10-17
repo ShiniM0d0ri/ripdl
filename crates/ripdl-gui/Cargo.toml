@@ -1,0 +1,22 @@
+[package]
+name = "ripdl-gui"
+description = "Desktop GUI for ripdl (Tauri shell over the daemon RPC)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ripdl-gui"
+path = "src/main.rs"
+
+[dependencies]
+ripdl-core = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+dirs = "6"
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies.tauri]
+version = "2"

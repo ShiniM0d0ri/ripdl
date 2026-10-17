@@ -140,7 +140,7 @@ pub(crate) fn filename_from_content_disposition(cd: &str) -> Option<String> {
 
 /// Decode `%XX` sequences; invalid ones are kept literally, bytes that don't
 /// form UTF-8 are replaced. (`+` is not decoded — that is form encoding.)
-fn percent_decode_lossy(v: &str) -> String {
+pub fn percent_decode_lossy(v: &str) -> String {
     let bytes = v.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

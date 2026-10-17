@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-pub use planner::PlanInfo;
+pub use planner::{percent_decode_lossy, PlanInfo};
 
 use crate::error::{Error, Result};
 use crate::task::{Progress, SegmentState, TaskState, TaskStateFile};

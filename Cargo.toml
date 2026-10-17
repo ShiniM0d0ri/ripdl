@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon"]
+members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon", "crates/ripdl-gui"]
 
 [workspace.package]
 version = "0.1.0"
