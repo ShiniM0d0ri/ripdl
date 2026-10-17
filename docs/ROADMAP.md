@@ -33,7 +33,8 @@ Guiding rules:
 - [x] Local RPC (newline-delimited JSON over TCP): add, ls, pause, resume, rm, stop
 - [x] Queue persistence (`%LOCALAPPDATA%\ripdl\queue.json`, atomic writes)
 - [ ] Named pipe / unix socket transport (replace TCP)
-- [ ] Speed limiting (token-bucket)
+- [x] Speed limiting (shared token-bucket across all segments; CLI
+      `download --max-speed 500k|2.5m|1g`)
 - [ ] Scheduler (start/stop at times; off-peak windows)
 
 ## P2 - GUI (Tauri)

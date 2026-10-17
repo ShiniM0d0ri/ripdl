@@ -441,6 +441,55 @@ async fn pause_resumes_from_sidecar() {
     );
 }
 
+/// The whole download's shared byte budget: 1 MiB at 256 KiB/s must take at
+/// least ~3s (bucket burst absorbs the first ~1s), proving one limiter gates
+/// all 8 segments together.
+#[tokio::test]
+async fn speed_limit_paces_download() {
+    let state = Arc::new(ServerState {
+        total: MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        ranges_seen: Mutex::new(Vec::new()),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let engine = Engine::new(EngineConfig {
+        max_segments: 8,
+        min_segment_size: 128 * KIB,
+        retry: RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(200),
+        },
+        max_speed: Some(256 * KIB),
+        ..EngineConfig::default()
+    })
+    .expect("engine");
+
+    let tmp = temp_dir("paced");
+    let start = std::time::Instant::now();
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download ok");
+    let elapsed = start.elapsed();
+
+    verify(&dest, MIB);
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "download escaped the limiter: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(15),
+        "limiter grossly overshoots: {elapsed:?}"
+    );
+}
+
 /// The file changed server-side between attempts: the sidecar's etag no
 /// longer matches, so the second call must plan fresh from byte 0 (with an
 /// up-to-date If-Match) and complete.

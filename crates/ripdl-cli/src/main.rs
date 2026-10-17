@@ -32,6 +32,10 @@ enum Cmd {
         /// Max parallel segments.
         #[arg(short, long)]
         segments: Option<usize>,
+        /// Global speed cap for the whole download, e.g. `500k`, `2.5m`,
+        /// `1g`, or plain bytes/sec. Minimum cap is 1k.
+        #[arg(short, long = "max-speed")]
+        max_speed: Option<String>,
     },
     /// Show what the engine plans for a URL (size, ranges, filename).
     Info { url: String },
@@ -60,10 +64,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Download { url, out, segments } => {
+        Cmd::Download { url, out, segments, max_speed } => {
             let mut cfg = EngineConfig::default();
             if let Some(n) = segments {
                 cfg.max_segments = n;
+            }
+            if let Some(s) = max_speed {
+                cfg.max_speed = Some(parse_speed(&s)?);
             }
             let engine = Arc::new(Engine::new(cfg)?);
 
@@ -181,5 +188,49 @@ fn humans(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[unit])
+    }
+}
+
+/// Parse a human speed cap like `500k`, `2.5m`, `1g`, or plain bytes/sec.
+/// Caps below 1 KiB/s are rejected as obviously accidental.
+fn parse_speed(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim().to_ascii_lowercase();
+    let cut = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let mult = match s[cut.len()..].trim() {
+        "" => 1u64,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        other => bail!("unknown speed suffix '{other}' (use k, m, or g)"),
+    };
+    let v: f64 = cut.trim().parse().context("invalid speed number")?;
+    if v < 0.0 {
+        bail!("speed cannot be negative");
+    }
+    let bps = (v * mult as f64) as u64;
+    if bps < 1024 {
+        bail!("minimum speed cap is 1k");
+    }
+    Ok(bps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_speed_caps() {
+        assert_eq!(parse_speed("500k").unwrap(), 500 * 1024);
+        assert_eq!(parse_speed("2.5m").unwrap(), (2.5 * 1024.0 * 1024.0) as u64);
+        assert_eq!(parse_speed("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_speed("1048576").unwrap(), 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_bad_speed_caps() {
+        assert!(parse_speed("900").is_err(), "below 1k floor");
+        assert!(parse_speed("500x").is_err(), "unknown suffix");
+        assert!(parse_speed("-2m").is_err(), "negative");
+        assert!(parse_speed("abc").is_err(), "not a number");
     }
 }

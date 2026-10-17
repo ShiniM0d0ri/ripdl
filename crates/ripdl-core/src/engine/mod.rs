@@ -1,3 +1,4 @@
+mod limiter;
 mod planner;
 pub mod retry;
 
@@ -30,6 +31,8 @@ pub struct EngineConfig {
     pub min_segment_size: u64,
     pub retry: retry::RetryConfig,
     pub user_agent: String,
+    /// Global bytes-per-second cap shared by all segments (None = unlimited).
+    pub max_speed: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +42,7 @@ impl Default for EngineConfig {
             min_segment_size: 1024 * 1024,
             retry: retry::RetryConfig::default(),
             user_agent: concat!("ripdl/", env!("CARGO_PKG_VERSION")).to_string(),
+            max_speed: None,
         }
     }
 }
@@ -46,6 +50,7 @@ impl Default for EngineConfig {
 pub struct Engine {
     client: reqwest::Client,
     cfg: EngineConfig,
+    limiter: std::sync::Arc<limiter::Limiter>,
 }
 
 impl Engine {
@@ -53,7 +58,8 @@ impl Engine {
         let client = reqwest::Client::builder()
             .user_agent(cfg.user_agent.clone())
             .build()?;
-        Ok(Self { client, cfg })
+        let limiter = std::sync::Arc::new(limiter::Limiter::new(cfg.max_speed));
+        Ok(Self { client, cfg, limiter })
     }
 
     /// Probe a URL and return the plan without downloading.
@@ -131,13 +137,16 @@ impl Engine {
             let token = token.clone();
             let active = active.clone();
 
-            handles.push(tokio::spawn(async move {
-                let r = run_segment(
-                    client, url, etag, seg, retry_cfg, cells, dest, downloaded, token,
-                )
-                .await;
-                active.fetch_sub(1, Ordering::SeqCst);
-                r
+            handles.push(tokio::spawn({
+                let limiter = self.limiter.clone();
+                async move {
+                    let r = run_segment(
+                        client, url, etag, seg, retry_cfg, cells, dest, downloaded, limiter, token,
+                    )
+                    .await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    r
+                }
             }));
         }
 
@@ -262,6 +271,7 @@ async fn run_segment(
     cells: Arc<Mutex<Vec<SegmentState>>>,
     dest: PathBuf,
     downloaded: Arc<AtomicU64>,
+    limiter: std::sync::Arc<limiter::Limiter>,
     token: CancellationToken,
 ) -> Result<()> {
     let mut attempt = 0u32;
@@ -286,7 +296,7 @@ async fn run_segment(
         }
 
         match segment_attempt(
-            &client, &url, etag.as_deref(), &seg, &cells, &dest, &downloaded, &token,
+            &client, &url, etag.as_deref(), &seg, &cells, &dest, &downloaded, &limiter, &token,
         )
         .await
         {
@@ -325,6 +335,7 @@ async fn segment_attempt(
     cells: &Arc<Mutex<Vec<SegmentState>>>,
     dest: &Path,
     downloaded: &Arc<AtomicU64>,
+    limiter: &limiter::Limiter,
     token: &CancellationToken,
 ) -> Result<()> {
     let mut file: Option<std::fs::File> = Some(
@@ -393,6 +404,9 @@ async fn segment_attempt(
                 None => break,
             },
         };
+
+        // Pace consumption: all segments draw from one shared budget.
+        limiter.acquire(chunk.len() as u64).await;
 
         buf.extend_from_slice(&chunk);
         if buf.len() >= SEGMENT_BUF {

@@ -28,7 +28,8 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | Tauri GUI | 🚧 P2 |
 | Torrent (via `librqbit`) | 🚧 P3 |
 | Browser extension + native host | 🚧 P4 |
-| Speed limiter, scheduler | 🚧 backlog |
+| Speed limiter | ✅ core + CLI flag |
+| Scheduler | 🚧 backlog |
 
 ## Architecture
 

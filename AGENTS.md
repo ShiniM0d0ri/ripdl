@@ -73,7 +73,8 @@ Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-17:
 P0/P1 core complete and committed (multi-segment download, resume, retry,
 daemon + RPC, persistent queue); failure-injection integration tests pass
 offline (`cargo test -p ripdl-core`; mock server with drop-injection, no-range
-mode, etag switching); segment writes are buffered (256 KiB, blocking pool).
+mode, etag switching); segment writes are buffered (256 KiB, blocking pool);
+token-bucket speed limiter shared across segments with CLI `--max-speed`.
 Daemon `add` defaults destinations to the user's Downloads folder.
-Next up: token-bucket speed limiter (last P1 item), then P4 REA research for
-browser click-capture.
+Next up: P4 REA research for browser click-capture (the killer feature), or
+scheduler (last big P1 item).
