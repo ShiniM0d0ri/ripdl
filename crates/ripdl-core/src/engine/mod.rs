@@ -93,7 +93,7 @@ impl Engine {
 
         // Prepare the destination file (truncate only when starting over).
         {
-            let mut f = if resumed {
+            let f = if resumed {
                 std::fs::OpenOptions::new().create(true).write(true).open(&dest)?
             } else {
                 std::fs::OpenOptions::new()
@@ -130,20 +130,23 @@ impl Engine {
             }));
         }
 
+        // Task metadata for the sidecar file (kept for the final writes below).
+        let meta = TaskStateFile {
+            id,
+            url: url.to_string(),
+            etag: info.etag.clone(),
+            total: info.total,
+            state: TaskState::Running,
+            segments: Vec::new(),
+        };
+
         // Reporter: emits progress and flushes the sidecar while running.
         let reporter = {
             let cells = cells.clone();
             let downloaded = downloaded.clone();
             let active = active.clone();
             let state_path = state_path.clone();
-            let meta = TaskStateFile {
-                id,
-                url: url.to_string(),
-                etag: info.etag.clone(),
-                total: info.total,
-                state: TaskState::Running,
-                segments: Vec::new(),
-            };
+            let meta_task = meta.clone();
             let mut on_progress = on_progress;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -156,7 +159,7 @@ impl Engine {
                     let downloaded_now = downloaded.load(Ordering::Relaxed);
                     let file = TaskStateFile {
                         segments,
-                        ..meta.clone()
+                        ..meta_task.clone()
                     };
                     let _ = write_sidecar(&state_path, &file);
                     on_progress(Progress {
@@ -257,13 +260,14 @@ async fn run_segment(
     let mut stream = req.send().await?.error_for_status()?.bytes_stream();
     let mut seg_done = seg.done;
 
-    while let Some(chunk) = tokio::select! {
-        _ = token.cancelled() => return Err(Error::Cancelled),
-        chunk = stream.next() => match chunk {
-            Some(c) => c?,
-            None => break,
-        },
-    } {
+    loop {
+        let chunk = tokio::select! {
+            _ = token.cancelled() => return Err(Error::Cancelled),
+            chunk = stream.next() => match chunk {
+                Some(c) => c?,
+                None => break,
+            },
+        };
         file.write_all(&chunk)?;
         seg_done += chunk.len() as u64;
         downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);

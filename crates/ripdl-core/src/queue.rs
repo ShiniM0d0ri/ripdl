@@ -43,11 +43,12 @@ impl Queue {
         let engine = self.engine.clone();
         let sem = self.sem.clone();
         let token = self.root.child_token();
+        let task_id = id.clone();
 
         tokio::spawn(async move {
             let _permit = sem.acquire().await;
             if let Err(e) = engine.download(&url, dest_dir, token, on_progress).await {
-                tracing::warn!(task = %id, error = %e, "download failed");
+                tracing::warn!(task = %task_id, error = %e, "download failed");
             }
         });
 

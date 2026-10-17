@@ -1014,6 +1014,7 @@ dependencies = [
  "indicatif",
  "ripdl-core",
  "tokio",
+ "tokio-util",
  "tracing-subscriber",
 ]
 

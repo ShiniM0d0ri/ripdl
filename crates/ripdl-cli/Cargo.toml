@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 ripdl-core = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
 anyhow = { workspace = true }
