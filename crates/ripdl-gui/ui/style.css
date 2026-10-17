@@ -80,9 +80,9 @@ body {
 #task-table tbody tr:hover { background: #eaf2fa; }
 #task-table tbody tr.selected { background: #d6e7f7; }
 
-.col-name { width: 32%; }
-.col-status { width: 11%; }
-.col-size { width: 13%; }
+.col-name { width: 29%; }
+.col-status { width: 14%; }
+.col-size { width: 12%; }
 .col-prog { width: 20%; }
 .col-eta { width: 9%; }
 .col-speed { width: 9%; }
@@ -119,6 +119,7 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
 .st-queued { color: #5b6770; }
 .st-paused { color: #8a94a0; }
 .st-failed { color: #c23b3b; font-weight: 600; }
+.st-ico { font-weight: 400; margin-right: 3px; }
 .st-err { color: #b02a2a; font-weight: 400; font-size: 11px; max-width: 150px; white-space: normal; line-height: 1.15; }
 .st-timed { color: #9a7d3c; font-weight: 600; }
 

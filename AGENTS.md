@@ -105,6 +105,8 @@ with native browse, per-row location display, open file/folder via Explorer
 `/select`, `remove_task(delete_files)` with sidecar-aware disk cleanup,
 `rm --files` CLI flag, GUI render-on-change, spawn rate limit in the bridge);
 remaining P2: settings panel (daemon config) + tray.
+P3 torrent plan drafted (see ROADMAP); UI status cells now use icons and hover
+shows the full error + an actionable hint.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), video/stream hunt mode, per-task quota polish,

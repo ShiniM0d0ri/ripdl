@@ -78,6 +78,37 @@ function shortError(e) {
     return m.length > 26 ? m.slice(0, 25) + "…" : m;
 }
 
+// Actionable hint for common failure classes, shown on hover.
+function errorHint(e) {
+    const s = String(e);
+    if (/403/.test(s)) return "403 forbidden: server refused. Try Referer / User-Agent / Cookie headers (site may block plain clients).";
+    if (/401|407/.test(s) || /auth/i.test(s)) return "Authentication required: wrong or missing credentials.";
+    if (/404|410/.test(s)) return "The file is gone from the server (404).";
+    if (/416/.test(s)) return "Bad byte range (416): server resumed state mismatched - re-download.";
+    if (/429/.test(s)) return "Rate limited (429): too many requests; retry later.";
+    if (/timeout|timed out/i.test(s)) return "Connection timed out.";
+    if (/refused/i.test(s)) return "Connection refused.";
+    if (/dns|resolve/i.test(s)) return "Could not resolve the hostname.";
+    if (/registry|engine|init/i.test(s)) return "Local engine error - see the CLI/daemon output.";
+    return "";
+}
+
+// Multi-line title for a row: full error + diagnostics.
+function detailsTitle(t) {
+    const lines = [];
+    lines.push(t.url || "");
+    if (t.dest_dir) lines.push("Location: " + t.dest_dir);
+    if (t.error) { lines.push("Error: " + t.error); const h = errorHint(t.error); if (h) lines.push(h); }
+    return lines.join("\n");
+}
+
+// Tooltip for the status cell only.
+function errorTitle(e) {
+    if (!e) return "";
+    const h = errorHint(e);
+    return h ? `${e}\n${h}` : e;
+}
+
 function humans(bytes) {
     if (bytes == null) return "?";
     const unit = ["B", "KB", "MB", "GB", "TB"];
@@ -108,8 +139,14 @@ function etaOf(t) {
 }
 
 const STATE_ICON = {
-    completed: "&#10004;", running: "&#9654;", queued: "&#9203;",
-    paused: "&#9646;&#8709;", failed: "&#10006;", cancelled: "&#10006;", timed: "&#9200;", hunt: "&#127909;",
+    completed: "✔", running: "▶", queued: "⏳",
+    paused: "⏸", failed: "✖", cancelled: "⏸", timed: "⏰", hunt: "🎬",
+    downloading: "▶", verifying: "🔍", seeding: "⇅", metadata: "🌐",
+};
+const STATUS_ICON = {
+    completed: "✅", running: "⬇", queued: "🕒", timed: "⏰",
+    paused: "⏸", failed: "❌", cancelled: "❌", hunt: "🎬",
+    downloading: "⬇", verifying: "🔍", seeding: "🌱", metadata: "🌐",
 };
 
 function renderSidebar(counts) {
@@ -161,11 +198,11 @@ function render() {
         const dir = t.dest_dir ? t.dest_dir.replace(/[\\/]+$/, "") : "";
         const cls = t.id === selectedId ? ' class="selected"' : "";
         return `<tr${cls} data-id="${t.id}">
-          <td class="name-cell" title="${escapeHtml(t.url)}\n${escapeHtml(dir)}">
+          <td class="name-cell" title="${escapeHtml(detailsTitle(t))}">
             <div class="fname-cell"><span class="ficon">${STATE_ICON[state] || "&#128230;"}</span><span title="${escapeHtml(name)}">${escapeHtml(name)}</span></div>
             <div class="fdir" title="${escapeHtml(dir)}">${escapeHtml(dir)}</div>
           </td>
-          <td class="st-${state}" title="${t.error ? escapeHtml(t.error) : ""}">${state}${t.error ? '<div class="st-err">' + escapeHtml(shortError(t.error)) + '</div>' : ""}</td>
+          <td class="st-${state}" title="${escapeHtml(errorTitle(t.error))}"><span class="st-ico">${STATUS_ICON[state] || ""}</span>${state}${t.error ? '<div class="st-err">' + escapeHtml(shortError(t.error)) + '</div>' : ""}</td>
           <td>${size}</td>
           <td class="prog-cell">${prog}</td>
           <td>${eta}</td>

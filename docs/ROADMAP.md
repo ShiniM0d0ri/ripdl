@@ -64,11 +64,58 @@ Guiding rules:
 - [ ] Settings: category folders, segment count, concurrency
 - [ ] System tray + minimize-to-tray
 
-## P3 - torrent support
+## P3 - torrent support (via librqbit, Apache-2.0 — never a GPL client)
 
-- [ ] Integrate `librqbit` (Apache-2.0) as a `Transport` behind the same task API
-- [ ] .torrent + magnet support, sequential download option
-- [ ] Unified queue view (HTTP and torrent tasks side by side)
+Plan (single UI, kind-routed backend, exact same queue/pause/resume semantics):
+
+M3.1 - core engine (`ripdl-core::torrent`):
+- [ ] Dep: `librqbit = { version = "9", default-features = false }` (own the
+      session inside the daemon process; no rqbit HTTP dashboard)
+- [ ] Payload detection: `magnet:` URI | info-hash | `.torrent` URL (fetch
+      through our engine first) | local `.torrent` path (bytes sniff `d4:info`)
+- [ ] `SessionHandle`: one `librqbit::Session` (DHT on, persistence under
+      `%LOCALAPPDATA%\ripdl\torrents\`), per-task add with `AddTorrentOptions`
+      (`output_folder`, `only_files: Option<Vec<usize>>`)
+- [ ] Progress sampling task: per-torrent stats → the same `Progress`
+      stream HTTP uses (downloaded/total/%/speed) + phase labels:
+      fetching metadata → verifying → downloading → seeding
+- [ ] Pause = `handle.pause()`, resume = `handle.resume()`, cancel token
+      unchanged; completion = all wanted files downloaded+verified
+- [ ] `TaskKind::Torrent`; boot-resume re-adds unfinished torrents from the
+      session's persisted state; completed torrents stay records-only (no
+      silent re-seeding)
+
+M3.2 - daemon + CLI:
+- [ ] Runner dispatch: torrent branch mirrors the HTTP branch (one runner per
+      task, same queue, same speed-cap plumbing where librqbit exposes limits)
+- [ ] `TorrentRecord` extras: info-hash, name, file list snapshot,
+      `dest_file` = the torrent's root folder; `delete_files` removes the
+      whole folder via `remove_dir_all` (per-task, never the dest root)
+- [ ] RPC `TorrentDetails { id }` → `{ name, info_hash, size, files
+      [{index,name,size,wanted}], peers [{addr,client,flags,down,up,progress}],
+      trackers }`
+- [ ] CLI: `add` auto-detects torrent payloads; `details <id>` dumps
+      files/peers/trackers
+
+M3.3 - GUI merge (HTTP + torrent in one grid):
+- [ ] Row model: kind-specific status labels (metadata/verifying/seeding),
+      torrent name replaces URL basename; per-file selection drives overall %?
+      (report wanted-bytes progress)
+- [ ] Details dialog (double-click / context menu): summary line + tabs
+      Files (checkbox list, Apply → `update_only_files`), Peers (addr, client,
+      flags, down/up, progress; 2s refresh), Trackers
+- [ ] Toolbar: "Add Torrent" (native file picker for .torrent);
+      Add-URL dialog auto-detects magnet/.torrent and routes to hunt-style
+      second phase for metadata fetch
+- [ ] Sidebar adds "Torrents" (kind filter, not extension)
+
+M3.4 - tests / verification:
+- [ ] Offline integration: in-proc seeder ↔ leecher over localhost with a
+      generated .torrent (librqbit can both create and add)
+- [ ] Unit: payload detection, only_files mapping, .torrent bytes → file list
+- [ ] Live: real-world legal torrent; pause/resume across daemon restart
+- [ ] Clean-room check: behavior parity notes only, no copying from
+      qBittorrent/FDM code or assets; findings → docs/rea-findings.md
 
 ## P4 - browser integration (the killer feature)
 
