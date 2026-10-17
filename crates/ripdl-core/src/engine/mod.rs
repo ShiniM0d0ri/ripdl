@@ -1,4 +1,5 @@
 mod planner;
+pub mod retry;
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ pub struct EngineConfig {
     pub max_segments: usize,
     /// Below this size, do not bother splitting into ranges.
     pub min_segment_size: u64,
+    pub retry: retry::RetryConfig,
     pub user_agent: String,
 }
 
@@ -32,6 +34,7 @@ impl Default for EngineConfig {
         Self {
             max_segments: 8,
             min_segment_size: 1024 * 1024,
+            retry: retry::RetryConfig::default(),
             user_agent: concat!("ripdl/", env!("CARGO_PKG_VERSION")).to_string(),
         }
     }
@@ -117,6 +120,7 @@ impl Engine {
             let client = self.client.clone();
             let url = url.to_string();
             let etag = info.etag.clone();
+            let retry_cfg = self.cfg.retry.clone();
             let dest = dest.clone();
             let cells = cells.clone();
             let downloaded = downloaded.clone();
@@ -124,7 +128,10 @@ impl Engine {
             let active = active.clone();
 
             handles.push(tokio::spawn(async move {
-                let r = run_segment(client, url, etag, seg, cells, dest, downloaded, token).await;
+                let r = run_segment(
+                    client, url, etag, seg, retry_cfg, cells, dest, downloaded, token,
+                )
+                .await;
                 active.fetch_sub(1, Ordering::SeqCst);
                 r
             }));
@@ -181,7 +188,8 @@ impl Engine {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     let priority = !matches!(e, Error::Cancelled);
-                    if first_err.is_none() || (priority && matches!(first_err, Some(Error::Cancelled)))
+                    if first_err.is_none()
+                        || (priority && matches!(first_err, Some(Error::Cancelled)))
                     {
                         first_err = Some(e);
                     }
@@ -192,31 +200,27 @@ impl Engine {
             }
         }
 
-        if let Some(e) = first_err {
+        let persist_paused = |cells: &Arc<Mutex<Vec<SegmentState>>>, meta: &TaskStateFile| {
             let segments = cells.lock().expect("state cells").clone();
             let _ = write_sidecar(
                 &state_path,
                 &TaskStateFile {
                     segments,
                     state: TaskState::Paused,
-                    ..meta
+                    ..meta.clone()
                 },
             );
+        };
+
+        if let Some(e) = first_err {
+            persist_paused(&cells, &meta);
             return Err(e);
         }
 
         if let Some(total) = info.total {
             let got = downloaded.load(Ordering::Relaxed);
             if got != total {
-                let segments = cells.lock().expect("state cells").clone();
-                let _ = write_sidecar(
-                    &state_path,
-                    &TaskStateFile {
-                        segments,
-                        state: TaskState::Paused,
-                        ..meta
-                    },
-                );
+                persist_paused(&cells, &meta);
                 return Err(Error::SizeMismatch {
                     expected: total,
                     actual: got,
@@ -229,23 +233,87 @@ impl Engine {
     }
 }
 
-/// Fetch one byte range (or the whole body when `end == UNBOUNDED`).
+/// Fetch one byte range (or the whole body when `end == UNBOUNDED`) with
+/// bounded retries and backoff. A retried segment continues from the byte
+/// offset already written; if the server cannot serve ranges, the stream
+/// restarts from zero.
 ///
 /// TODO(perf): move sync writes into `spawn_blocking` once we profile.
 async fn run_segment(
     client: reqwest::Client,
     url: String,
     etag: Option<String>,
-    seg: SegmentState,
+    initial: SegmentState,
+    retry_cfg: retry::RetryConfig,
     cells: Arc<Mutex<Vec<SegmentState>>>,
     dest: PathBuf,
     downloaded: Arc<AtomicU64>,
     token: CancellationToken,
 ) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new().create(true).write(true).open(&dest)?;
+    let mut attempt = 0u32;
+    loop {
+        // Re-read state: a previous attempt may have advanced it.
+        let mut seg = cells.lock().expect("state cells")[initial.index].clone();
+
+        // Server without range support: partial progress is unusable, roll
+        // back the counter and restart the stream from zero.
+        if seg.end == UNBOUNDED && seg.done > 0 {
+            let undone = seg.done;
+            downloaded.fetch_sub(undone, Ordering::Relaxed);
+            seg.done = 0;
+            cells.lock().expect("state cells")[initial.index].done = 0;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&dest)?
+                .set_len(0)?;
+            tracing::warn!(index = seg.index, "no range support; restarting stream");
+        }
+
+        match segment_attempt(
+            &client, &url, etag.as_deref(), &seg, &cells, &dest, &downloaded, &token,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
+            Err(e) if retry::is_retryable(&e) && attempt < retry_cfg.max_retries => {
+                attempt += 1;
+                let delay = retry_cfg.backoff(attempt);
+                tracing::warn!(
+                    index = seg.index,
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %e,
+                    "segment retry"
+                );
+                tokio::select! {
+                    _ = token.cancelled() => return Err(Error::Cancelled),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// One attempt at fetching a segment. Advances `cells[index].done` as bytes
+/// land so a retry (or a crash) resumes from the last written offset.
+async fn segment_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    etag: Option<&str>,
+    seg: &SegmentState,
+    cells: &Arc<Mutex<Vec<SegmentState>>>,
+    dest: &Path,
+    downloaded: &Arc<AtomicU64>,
+    token: &CancellationToken,
+) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new().create(true).write(true).open(dest)?;
     file.seek(SeekFrom::Start(seg.start + seg.done))?;
 
-    let mut req = client.get(&url);
+    let mut req = client.get(url);
     if seg.end != UNBOUNDED {
         req = req.header(
             reqwest::header::RANGE,
@@ -253,7 +321,7 @@ async fn run_segment(
         );
     }
     // Guard against the file changing underneath a resume.
-    if let Some(etag) = &etag {
+    if let Some(etag) = etag {
         req = req.header(reqwest::header::IF_MATCH, etag);
     }
 
@@ -275,7 +343,14 @@ async fn run_segment(
     }
     file.flush()?;
 
-    cells.lock().expect("state cells")[seg.index].done = seg_done;
+    // Server ended the stream early: count as a retryable transport fault.
+    if seg.end != UNBOUNDED && seg_done < seg.end + 1 - seg.start {
+        return Err(Error::ShortSegment {
+            index: seg.index,
+            expected: seg.end + 1 - seg.start,
+            got: seg_done,
+        });
+    }
     Ok(())
 }
 
@@ -284,7 +359,9 @@ async fn run_segment(
 fn plan_fresh(info: &PlanInfo, cfg: &EngineConfig) -> Vec<SegmentState> {
     match (info.accept_ranges, info.total) {
         (true, Some(total)) if total >= cfg.min_segment_size => {
-            let n = ((total / cfg.min_segment_size) as usize).min(cfg.max_segments).max(2);
+            let n = ((total / cfg.min_segment_size) as usize)
+                .min(cfg.max_segments)
+                .max(2);
             let chunk = total / n as u64;
             (0..n)
                 .map(|i| {
@@ -315,18 +392,21 @@ fn sidecar_path(dest: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Atomic sidecar write: temp file + rename, so a crash mid-write never
+/// leaves a corrupt state file behind.
 fn write_sidecar(path: &Path, file: &TaskStateFile) -> Result<()> {
     let json = serde_json::to_vec_pretty(file).map_err(|e| Error::State(e.to_string()))?;
-    // TODO: atomic write (temp + rename) before first release.
-    std::fs::write(path, json)?;
+    let tmp = path.with_extension("ripdl.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
 fn read_sidecar(path: &Path) -> Result<Option<TaskStateFile>> {
     match std::fs::read(path) {
-        Ok(bytes) => {
-            Ok(Some(serde_json::from_slice(&bytes).map_err(|e| Error::State(e.to_string()))?))
-        }
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).map_err(|e| Error::State(e.to_string()))?,
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }

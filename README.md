@@ -18,6 +18,7 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | --- | --- |
 | Multi-segment HTTP(S) acceleration | ✅ core |
 | Resume (sidecar state file) | ✅ core |
+| Per-segment retry + backoff | ✅ core |
 | Cancellation | ✅ core |
 | CLI (`ripdl download`, `ripdl info`) | ✅ |
 | Queue with concurrency limits | ✅ core (in-memory) |

@@ -19,6 +19,13 @@ pub enum Error {
     #[error("downloaded size mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
 
+    #[error("segment {index} ended early: expected {expected} bytes, got {got}")]
+    ShortSegment {
+        index: usize,
+        expected: u64,
+        got: u64,
+    },
+
     #[error("state file error: {0}")]
     State(String),
 }

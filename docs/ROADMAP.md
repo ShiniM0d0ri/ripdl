@@ -17,8 +17,8 @@ Guiding rules:
 - [x] Sidecar resume state (`<file>.ripdl.json`), etag-guarded
 - [x] Cancellation tokens (cancels propagate to all segments)
 - [x] In-memory queue + auto-categorization
-- [ ] Atomic sidecar writes
-- [ ] Retry/backoff per segment; retry on flaky connections
+- [x] Atomic sidecar writes (temp + rename)
+- [x] Retry/backoff per segment (bounded; transport errors only)
 - [ ] Integration tests against a local test HTTP server
 
 ## P1 - daemon + persistence
