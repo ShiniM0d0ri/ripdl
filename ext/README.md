@@ -31,13 +31,16 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
   and browser User-Agent so protected links still resolve). If the daemon
   disappears, captures stop interfering immediately: the browser downloads
   normally.
+- The popup controls two switches: intercept on/off, and cookie sharing.
+  Cookie sharing is an optional permission - turning it on makes the
+  BROWSER ask you; turning it off revokes the permission entirely. Cookies
+  travel only to the local daemon, only attached to the downloads you fire.
 - The daemon owns all policy. Nothing is hardcoded here by design.
 
 ## Deliberately not present (yet)
 
-- Cookie sharing (opt-in, per-site, with a visible badge state).
-- `sheets`/selection-based "download all selected links" (planned via
-  on-demand `chrome.scripting`, never via permanent content scripts).
+- Selection-based "download all selected links" (planned via on-demand
+  `chrome.scripting`, never via permanent content scripts).
 - Referer rewrite of fallback downloads once we accept a task and the
   daemon dies mid-flight (needs a declarativeNetRequest temporary rule).
 - Video/stream sniffing (a later, opt-in "hunt" mode).

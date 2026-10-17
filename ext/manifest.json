@@ -11,12 +11,14 @@
     "contextMenus",
     "webRequest"
   ],
+  "optional_permissions": ["cookies"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "ripdl"
+    "default_title": "ripdl",
+    "default_popup": "popup.html"
   }
 }

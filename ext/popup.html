@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 260px; margin: 10px; }
+    h1 { font-size: 15px; margin: 0 0 8px; }
+    .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
+    .hint { color: #666; font-size: 11px; margin-top: 8px; line-height: 1.4; }
+    #status.ok { color: #2e7d32; }
+    #status.down { color: #b06000; }
+  </style>
+</head>
+<body>
+  <h1>ripdl</h1>
+  <div class="row">
+    <span id="status" class="down">daemon: connecting…</span>
+    <button id="probe">refresh</button>
+  </div>
+  <div class="row">
+    <label for="capture">Intercept downloads</label>
+    <input type="checkbox" id="capture">
+  </div>
+  <div class="row">
+    <label for="shareCookies">Share cookies (opt-in)</label>
+    <input type="checkbox" id="shareCookies">
+  </div>
+  <div class="hint">
+    Cookies are shared only with the local ripdl daemon and only for the
+    downloads it receives from you. Turn this on for links that require
+    being logged in. ripdl never sends data anywhere except the download
+    target itself.
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
