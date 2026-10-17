@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ripdl_core::rpc::{Command, Reply, Request, Response, TaskInfo, DEFAULT_PORT};
@@ -50,6 +50,7 @@ struct ProgressTrack {
 struct Daemon {
     port: u16,
     queue_path: PathBuf,
+    config: DaemonConfig,
     records: Mutex<Vec<TaskRecord>>,
     progress: Mutex<HashMap<String, ProgressTrack>>,
     runtime: Mutex<HashMap<String, TaskRuntime>>,
@@ -57,9 +58,46 @@ struct Daemon {
     sem: Arc<tokio::sync::Semaphore>,
 }
 
+/// Daemon policy from `<data_dir>/config.json`. Every field is optional so
+/// any partial file works: absent fields fall back to built-in defaults.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DaemonConfig {
+    max_concurrent: Option<usize>,
+    max_segments: Option<usize>,
+    min_segment_size: Option<u64>,
+    max_speed_bytes: Option<u64>,
+    default_download_dir: Option<PathBuf>,
+}
+
+impl DaemonConfig {
+    /// Missing file = defaults; unreadable file = warn + defaults (never
+    /// rewritten, so a typo doesn't clobber the user's edits).
+    fn load(path: &std::path::Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, path = %path.display(), "config file unreadable; using defaults");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn max_concurrent(&self) -> usize {
+        self.max_concurrent.unwrap_or(3).max(1)
+    }
+
+    fn max_segments(&self) -> usize {
+        self.max_segments.unwrap_or(EngineConfig::default().max_segments)
+    }
+
+    fn min_segment_size(&self) -> u64 {
+        self.min_segment_size.unwrap_or(EngineConfig::default().min_segment_size)
+    }
+}
+
 impl Daemon {
-    fn new(queue_path: PathBuf) -> Result<Self> {
-        let max_concurrent = 3;
+    fn new(queue_path: PathBuf, config: DaemonConfig) -> Result<Self> {
+        let max_concurrent = config.max_concurrent();
         let records = match std::fs::read(&queue_path) {
             Ok(bytes) => serde_json::from_slice::<QueueFile>(&bytes)
                 .map(|q| q.tasks)
@@ -74,6 +112,7 @@ impl Daemon {
         Ok(Self {
             port: DEFAULT_PORT,
             queue_path,
+            config,
             records: Mutex::new(records),
             progress: Mutex::new(HashMap::new()),
             runtime: Mutex::new(HashMap::new()),
@@ -111,8 +150,14 @@ impl Daemon {
         Ok(())
     }
 
-    /// Accept loop: newline-delimited JSON request/response over TCP localhost.
+    /// Accept loops: newline-delimited JSON request/response. On Windows the
+    /// daemon also serves a named pipe (locally-isolated, port-free); clients
+    /// try the pipe first and fall back to this TCP socket.
     async fn run(self: Arc<Self>) -> Result<()> {
+        {
+            let daemon = Arc::clone(&self);
+            tokio::spawn(daemon.pipe_accept_loop());
+        }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
             .await
             .with_context(|| format!("cannot bind 127.0.0.1:{} (is the daemon already running?)", self.port))?;
@@ -146,8 +191,47 @@ impl Daemon {
         Ok(())
     }
 
-    async fn handle_conn(self: Arc<Self>, stream: TcpStream) -> Result<()> {
-        let (read, mut write) = stream.into_split();
+    #[cfg(windows)]
+    /// Named-pipe accept loop: one live instance serving, one reserved for
+    /// the next client (the tokio server-handle pattern). Failure here is
+    /// non-fatal: the TCP listener keeps serving.
+    async fn pipe_accept_loop(self: Arc<Self>) {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let first = match ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(ripdl_core::transport::PIPE_NAME)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "named pipe unavailable; serving TCP only");
+                return;
+            }
+        };
+        let mut next = Some(first);
+        loop {
+            let Some(cur) = next.take() else { return };
+            if let Err(e) = cur.connect().await {
+                tracing::warn!(error = %e, "pipe accept failed");
+                // Recycle an instance so clients don't see a hole.
+                next = ServerOptions::new().create(ripdl_core::transport::PIPE_NAME).ok();
+                continue;
+            }
+            // Reserve the next instance BEFORE serving this connection.
+            next = ServerOptions::new()
+                .create(ripdl_core::transport::PIPE_NAME)
+                .ok();
+            let daemon = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(e) = daemon.handle_conn(cur).await {
+                    tracing::debug!(error = %e, "pipe connection ended");
+                }
+            });
+        }
+    }
+
+    async fn handle_conn(self: Arc<Self>, stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin) -> Result<()> {
+        let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
 
         while let Some(line) = lines.next_line().await? {
@@ -194,7 +278,9 @@ impl Daemon {
     ) -> Response {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
-        let dest_dir = dest_dir.or_else(default_download_dir);
+        let dest_dir = dest_dir
+            .or_else(|| self.config.default_download_dir.clone())
+            .or_else(default_download_dir);
         // Idempotency: the same URL into the same destination must not
         // double-download into one file (sidecar trample = corrupt output).
         // Re-adding shares the existing task instead.
@@ -377,10 +463,14 @@ impl Daemon {
 
             this.set_state(&rec.id, TaskState::Running, None);
 
-            // Per-task engine: task headers live on the client, so both the
+            // Per-task engine: daemon policy (config.json) sets the defaults;
+            // task headers live on the client and always override. Both the
             // probe and every segment carry them.
             let engine = {
                 let cfg = EngineConfig {
+                    max_segments: this.config.max_segments(),
+                    min_segment_size: this.config.min_segment_size(),
+                    max_speed: this.config.max_speed_bytes,
                     headers: rec.headers.clone(),
                     ..EngineConfig::default()
                 };
@@ -532,6 +622,38 @@ mod tests {
         // Future schedule -> wait the remaining gap.
         assert_eq!(start_delay(&Some(now + 90)), Some(std::time::Duration::from_secs(90)));
     }
+
+    #[test]
+    fn config_missing_fields_take_defaults() {
+        let cfg: DaemonConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.max_concurrent(), 3);
+        assert_eq!(cfg.max_segments(), EngineConfig::default().max_segments);
+        assert_eq!(cfg.min_segment_size(), EngineConfig::default().min_segment_size);
+        assert_eq!(cfg.max_speed_bytes, None);
+        assert_eq!(cfg.default_download_dir, None);
+    }
+
+    #[test]
+    fn config_partial_file_applies_only_present_fields() {
+        let cfg: DaemonConfig = serde_json::from_str(r#"{"max_concurrent": 1}"#).unwrap();
+        assert_eq!(cfg.max_concurrent(), 1);
+        assert_eq!(cfg.max_segments(), EngineConfig::default().max_segments);
+
+        let cfg: DaemonConfig = serde_json::from_str(
+            r#"{"max_segments": 16, "max_speed_bytes": 250000,
+                "default_download_dir": "D:/dl"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_concurrent(), 3);
+        assert_eq!(cfg.max_segments(), 16);
+        assert_eq!(cfg.max_speed_bytes, Some(250_000));
+        assert_eq!(cfg.default_download_dir, Some(PathBuf::from("D:/dl")));
+    }
+
+    #[test]
+    fn config_garbage_is_rejected_not_panicking() {
+        assert!(serde_json::from_str::<DaemonConfig>("nope").is_err());
+    }
 }
 
 async fn real_main() -> Result<()> {
@@ -543,7 +665,8 @@ async fn real_main() -> Result<()> {
     std::fs::create_dir_all(&data_dir).context("create data directory")?;
     let queue_path = data_dir.join("queue.json");
 
-    let daemon = Arc::new(Daemon::new(queue_path).context("init daemon")?);
+    let config = DaemonConfig::load(&data_dir.join("config.json"));
+    let daemon = Arc::new(Daemon::new(queue_path, config).context("init daemon")?);
     daemon.boot_resume().context("resume queue")?;
     daemon.run().await
 }

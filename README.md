@@ -29,7 +29,7 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | CLI (`ripdl download`, `ripdl info`) | ✅ |
 | Queue with concurrency limits | ✅ core + daemon-persisted |
 | Auto-categorization by file type | ✅ core |
-| Daemon + RPC (TCP localhost) | ✅ v1 |
+| Daemon + RPC (TCP localhost + named pipe) | ✅ v1 |
 | Tauri GUI | 🚧 P2 |
 | Torrent (via `librqbit`) | 🚧 P3 |
 | Browser extension + native host | 🚧 P4 |

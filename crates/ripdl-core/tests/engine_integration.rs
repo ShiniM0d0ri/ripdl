@@ -521,6 +521,52 @@ async fn speed_limit_paces_download() {
     );
 }
 
+/// Single-stream (no ranges) downloads must obey the limiter too: 1.25 MiB
+/// through a 256 KiB/s bucket takes at least 1.25 MiB / 256 KiB/s ≈ 5s — the
+/// bucket starts empty, so no burst shortcut applies.
+#[tokio::test]
+async fn speed_limit_applies_to_single_stream() {
+    let state = Arc::new(ServerState {
+        total: MIB + 256 * KIB,
+        ranges: false,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let engine = Engine::new(EngineConfig {
+        max_speed: Some(256 * KIB),
+        ..EngineConfig::default()
+    })
+    .expect("engine");
+
+    let tmp = temp_dir("paced-single");
+    let start = std::time::Instant::now();
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download ok");
+    let elapsed = start.elapsed();
+
+    verify(&dest, MIB + 256 * KIB);
+    // Theoretical floor is exactly 5.0s; allow timer-quantization slack.
+    // A limiter escape would finish in ~1s, far below this.
+    assert!(
+        elapsed >= Duration::from_millis(4700),
+        "single stream escaped the limiter: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(20),
+        "limiter grossly overshoots: {elapsed:?}"
+    );
+}
+
 /// The file changed server-side between attempts: the sidecar's etag no
 /// longer matches, so the second call must plan fresh from byte 0 (with an
 /// up-to-date If-Match) and complete.

@@ -11,6 +11,7 @@ pub mod error;
 pub mod queue;
 pub mod rpc;
 pub mod task;
+pub mod transport;
 pub mod util;
 
 pub use engine::{Engine, EngineConfig};

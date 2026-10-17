@@ -37,7 +37,13 @@ Guiding rules:
 - [x] `ripdl-daemon`: long-running process owning the queue (TCP localhost RPC v1)
 - [x] Local RPC (newline-delimited JSON over TCP): add, ls, pause, resume, rm, stop
 - [x] Queue persistence (`%LOCALAPPDATA%\ripdl\queue.json`, atomic writes)
-- [ ] Named pipe / unix socket transport (replace TCP)
+- [x] Named pipe / unix socket transport (`\\.\pipe\ripdl-rpc` on Windows,
+      `<data_dir>/rpc.sock` elsewhere; clients try it first and fall back to
+      TCP loopback — no fixed-port conflicts, daemon keeps both listeners)
+- [x] Daemon config file (`<data_dir>/config.json`, all fields optional):
+      `max_concurrent`, `max_segments`, `min_segment_size`,
+      `max_speed_bytes`, `default_download_dir`; unreadable file = warn +
+      built-in defaults
 - [x] Speed limiting (shared token-bucket across all segments; CLI
       `download --max-speed 500k|2.5m|1g`)
 - [x] Scheduler (`add --after 1h30m` / `--at 22:30`; runner holds Queued

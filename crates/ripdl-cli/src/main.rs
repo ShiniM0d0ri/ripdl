@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use ripdl_core::rpc::{Command, Reply, Request, Response, DEFAULT_PORT};
+use ripdl_core::rpc::{Command, Reply, Request, Response};
 use ripdl_core::{Engine, EngineConfig};
 
 #[derive(Parser)]
@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// One-shot RPC client: connect, send, print the reply.
 async fn rpc(cmd: Command) -> anyhow::Result<()> {
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", DEFAULT_PORT))
+    let mut stream = ripdl_core::transport::connect_daemon()
         .await
         .context("daemon not running (start it with: ripdl-daemon)")?;
 

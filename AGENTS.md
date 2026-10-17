@@ -43,7 +43,11 @@ the single-stream path.
   NativeCommandError and mates exit code 1 even on success. Judge by output
   lines (`Finished`, `test result: ok`), not the exit code.
 - Builds: Rust 1.98 MSVC target. Workspace root is `D:\ripdl`.
-- Session daemon port: TCP 5593 (see `ripdl_core::rpc::DEFAULT_PORT`).
+- Session daemon: named pipe `\\.\pipe\ripdl-rpc` (Windows, primary) with TCP
+  5593 loopback fallback (`ripdl_core::rpc::DEFAULT_PORT`, used by bridge);
+  unix socket `<data_dir>/rpc.sock` on non-Windows. Client transport helpers
+  live in `ripdl_core.transport`. Daemon policy file:
+  `%LOCALAPPDATA%\ripdl\config.json` (all-optional fields).
 
 ## Conventions
 
@@ -73,14 +77,19 @@ Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-17:
 P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
 persistent queue, buffered writes, shared speed limiter, header/auth/cookie
 pass-through, Content-Disposition naming, duplicate-URL idempotency,
-scheduler (`--after`/`--at` with delayed runner start). 30 tests pass
-offline (`cargo test --workspace`).
+scheduler (`--after`/`--at` with delayed runner start), named pipe transport
+(pipe-first client + dual listeners; TCP kept as fallback; unix socket on
+non-Windows), daemon config file (`config.json`: max_concurrent,
+max_segments, min_segment_size, max_speed_bytes, default_download_dir).
+34 tests pass offline (`cargo test --workspace`).
 In progress: P4 browser integration — REA research done; bridge +
 `register-host` + MV3 extension landed and capture verified live twice
 (temp Chrome profile -> daemon -> file). Extension now has: SW-race matching
 (700ms + content-length + initiator), correct suggest/cancel discipline,
 popup with capture toggle and OPT-IN cookie sharing (optional permission,
 off = permission revoked entirely), selection/all-links capture via
-on-demand scripting, 256 KiB seize floor. Tests: 30 pass offline.
+on-demand scripting, 256 KiB seize floor. Tests: 34 pass offline.
 Backlog: selected-links capture polish, DNR fallback referer (may be
-unneeded: offer-first), named pipe transport, daemon config file.
+unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
+still speaks TCP), video/stream hunt mode, per-task quota polish,
+`rm` sidecar cleanup, global daemon speed cap.
