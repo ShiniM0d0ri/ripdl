@@ -74,7 +74,10 @@ P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
 persistent queue, buffered writes, shared speed limiter, header/auth/cookie
 pass-through, Content-Disposition naming, duplicate-URL idempotency. 21 tests
 pass offline (`cargo test --workspace`).
-In progress: P4 browser integration — REA research on FDM/IDM extension JS
-(research/ artifacts gitignored, findings in docs/rea-findings.md), then our
-WebExtension + Rust native messaging host.
+In progress: P4 browser integration — FDM Chrome-extension REA research done
+(entry 1 in docs/rea-findings.md: watch→cancel→handoff capture, JSON-stdio
+native host contract, cookie harvest + net-header feed = the reject list).
+research/ artifacts gitignored. Next: our MV3 WebExtension (ext/ dir) + native
+messaging host as a stdio↔RPC bridge inside the existing ripdl single binary
+(argv[1] prefixed chrome-extension:// switches mode).
 Backlog: scheduler, named pipe transport, daemon config file.

@@ -2,3 +2,5 @@
 *.ripdl.json
 node_modules/
 dist/
+
+research/
