@@ -1,6 +1,12 @@
 /target
 *.ripdl.json
+*.bak
 node_modules/
 dist/
 
 research/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -7,8 +7,8 @@ ripdl exists because the alternatives are either **paywalled** (IDM), **ad-suppo
 **CLI-only** (aria2). ripdl is the missing piece: a polished, native, offline-first
 downloader with zero telemetry and zero monetization.
 
-Built for the people who currently pirate IDM: use this instead - it is free,
-it is honest, and its source code is right here.
+Use it instead of cracking IDM - it is free, it is honest, and its source
+code is right here.
 
 ## Status
 
@@ -32,9 +32,6 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | Daemon + RPC (TCP localhost + named pipe) | ✅ v1 |
 | Tauri GUI | 🚧 P2 |
 | Torrent (via `librqbit`) | 🚧 P3 |
-| Browser extension + native host | 🚧 P4 |
-| Speed limiter | ✅ core + CLI flag |
-| Scheduler | 🚧 backlog |
 
 ## Architecture
 
@@ -69,6 +66,29 @@ ripdl download -o D:/Downloads -s 16 <url>       # custom dir + segment count
 Interrupted downloads keep a `<file>.ripdl.json` sidecar; rerun the same
 command and it resumes from where it stopped.
 
+### Daemon + background queue
+
+```sh
+ripdl-daemon                                     # queue server (auto-spawned if absent)
+ripdl add https://example.com/big-file.zip      # queue it, return immediately
+ripdl ls                                        # live progress + speeds
+ripdl add --after 6s <url>                      # schedule (also: --at 22:30)
+ripdl pause <id> | resume <id> | rm <id>
+```
+
+### Browser capture (experimental)
+
+The MV3 extension in `ext/` hands intercepted downloads to the ripdl daemon.
+Minimal setup:
+
+```sh
+ripdl register-host                              # registers the native host
+```
+
+…then load `ext/` unpacked (chrome://extensions). Privacy posture: the
+extension offers a daemon download *before* cancelling the browser item,
+never touches your history, and shares cookies only if you opt in.
+
 ## Anti-adware position
 
 The tools this replaces phone home and monetize you. For the record:
@@ -79,5 +99,5 @@ The tools this replaces phone home and monetize you. For the record:
 
 ## License
 
-MIT OR Apache-2.0 (dual-licensed, standard for Rust). License texts are added
-before the first public release.
+MIT OR Apache-2.0 (dual-licensed, standard for Rust): see
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
