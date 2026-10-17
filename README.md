@@ -10,6 +10,36 @@ downloader with zero telemetry and zero monetization.
 Use it instead of cracking IDM - it is free, it is honest, and its source
 code is right here.
 
+## Download
+
+Prebuilt binaries for **Windows x64** and **Linux x64** are attached to each
+[GitHub Release](https://github.com/ShiniM0d0ri/ripdl/releases) (tagged
+releases; latest build → latest tag).
+
+- Windows: unzip `ripdl-v*-x86_64-pc-windows-msvc.zip`, put `ripdl.exe` /
+  `ripdl-daemon.exe` on your `PATH`. The MV3 browser extension is included
+  in the same archive under `ext/`.
+- Linux: extract `ripdl-v*-x86_64-unknown-linux-gnu.tar.gz`
+  (`tar -xzf ripdl-*.tar.gz -C ~/.local/bin`).
+
+Then:
+
+```sh
+ripdl download https://example.com/big-file.zip
+```
+
+The daemon is spawned automatically on demand. No installation steps beyond
+that, no services, no telemetry.
+
+Platform note: the local RPC uses a named pipe on Windows, a unix socket
+on Linux, with TCP loopback as a fallback everywhere.
+
+Build from source instead (Rust 1.98+):
+
+```sh
+cargo build --release
+```
+
 ## Status
 
 v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
@@ -54,6 +84,10 @@ them automatically. That is the rule that keeps this codebase sane as it grows.
 cargo build --release
 cargo test
 ```
+
+Tests are fully offline and safe behind any proxy/air gap: `crates/ripdl-core/tests/`
+runs a hand-rolled mock HTTP server (drop injection, no-range mode, etag
+switching) - the suite never hits real networks.
 
 ## Usage
 

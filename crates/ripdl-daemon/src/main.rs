@@ -156,7 +156,13 @@ impl Daemon {
     async fn run(self: Arc<Self>) -> Result<()> {
         {
             let daemon = Arc::clone(&self);
+            // Windows: named pipe. Unix: domain socket. Both feed the same
+            // generic connection handler; TCP below is the universal
+            // fallback.
+            #[cfg(windows)]
             tokio::spawn(daemon.pipe_accept_loop());
+            #[cfg(not(windows))]
+            tokio::spawn(daemon.unix_accept_loop());
         }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
             .await
@@ -189,6 +195,51 @@ impl Daemon {
         let _ = self.persist(&snapshot);
         tracing::info!("ripdl daemon stopped");
         Ok(())
+    }
+
+    #[cfg(not(windows))]
+    /// Unix-socket accept loop: the kernel handles connection establishment.
+    /// A stale socket file from a crashed daemon is removed before bind.
+    /// Failure is non-fatal: TCP keeps serving.
+    async fn unix_accept_loop(self: Arc<Self>) {
+        use tokio::net::UnixListener;
+
+        let path = match ripdl_core::transport::unix_socket_path() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "unix socket path unavailable; serving TCP only");
+                return;
+            }
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "unix socket unavailable; serving TCP only");
+                return;
+            }
+        };
+        tracing::info!(path = %path.display(), "ripdl daemon listening");
+        loop {
+            tokio::select! {
+                _ = self.shutdown.notified() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _addr)) => {
+                        let daemon = Arc::clone(&self);
+                        tokio::spawn(async move {
+                            if let Err(e) = daemon.handle_conn(stream).await {
+                                tracing::debug!(error = %e, "socket connection ended");
+                            }
+                        });
+                    }
+                    Err(e) => tracing::warn!(error = %e, "accept failed"),
+                },
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(windows)]

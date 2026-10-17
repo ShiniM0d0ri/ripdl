@@ -1,0 +1,57 @@
+# Tag-push release: build both platforms, package binaries + extension,
+# attach to an auto-generated GitHub Release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            artifact: zip
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            artifact: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/ripdl.exe dist/
+          Copy-Item target/release/ripdl-daemon.exe dist/
+          Copy-Item ext dist/ext -Recurse
+          Compress-Archive -Path dist/* -DestinationPath "ripdl-${{ github.ref_name }}-${{ matrix.triple }}.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/ext
+          cp target/release/ripdl target/release/ripdl-daemon dist/
+          cp -r ext/. dist/ext/
+          tar -czf "ripdl-${{ github.ref_name }}-${{ matrix.triple }}.tar.gz" -C dist .
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ripdl-*
+          generate_release_notes: true

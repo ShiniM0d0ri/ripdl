@@ -1,0 +1,27 @@
+# Offline CI: compile + run the full test suite on both target platforms.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check (all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: Test (fully offline)
+        run: cargo test --workspace
