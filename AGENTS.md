@@ -72,14 +72,15 @@ bytes.
 Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-17:
 P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
 persistent queue, buffered writes, shared speed limiter, header/auth/cookie
-pass-through, Content-Disposition naming, duplicate-URL idempotency. 21 tests
-pass offline (`cargo test --workspace`).
+pass-through, Content-Disposition naming, duplicate-URL idempotency,
+scheduler (`--after`/`--at` with delayed runner start). 30 tests pass
+offline (`cargo test --workspace`).
 In progress: P4 browser integration — REA research done; bridge +
 `register-host` + MV3 extension landed and capture verified live twice
 (temp Chrome profile -> daemon -> file). Extension now has: SW-race matching
 (700ms + content-length + initiator), correct suggest/cancel discipline,
 popup with capture toggle and OPT-IN cookie sharing (optional permission,
-off = permission revoked entirely). Original commit: "ext hardening: SW-race
-matching, suggest discipline, opt-in cookie sharing (popup + optional
-permission)". Tests: 27 pass offline. Next: selection/all-links capture
-(on-demand scripting), DNR fallback referer, then scheduler backlog.
+off = permission revoked entirely), selection/all-links capture via
+on-demand scripting, 256 KiB seize floor. Tests: 30 pass offline.
+Backlog: selected-links capture polish, DNR fallback referer (may be
+unneeded: offer-first), named pipe transport, daemon config file.

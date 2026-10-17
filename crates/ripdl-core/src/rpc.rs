@@ -26,6 +26,10 @@ pub enum Command {
         /// Extra request headers for the engine (cookies, referer...).
         #[serde(default)]
         headers: std::collections::HashMap<String, String>,
+        /// Unix seconds when the task may start (None = immediately).
+        /// The runner holds the task Queued until then.
+        #[serde(default)]
+        start_at: Option<i64>,
     },
     List,
     Pause {
@@ -72,4 +76,7 @@ pub struct TaskInfo {
     pub speed_bps: Option<f64>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Unix seconds when the task may start (None = immediately).
+    #[serde(default)]
+    pub start_at: Option<i64>,
 }

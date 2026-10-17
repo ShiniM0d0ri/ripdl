@@ -350,6 +350,7 @@ mod tests {
                 url: "https://x/f.zip".to_string(),
                 dest_dir: None,
                 headers: Default::default(),
+                start_at: None,
             },
         )
         .unwrap();

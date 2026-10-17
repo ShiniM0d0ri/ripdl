@@ -40,7 +40,9 @@ Guiding rules:
 - [ ] Named pipe / unix socket transport (replace TCP)
 - [x] Speed limiting (shared token-bucket across all segments; CLI
       `download --max-speed 500k|2.5m|1g`)
-- [ ] Scheduler (start/stop at times; off-peak windows)
+- [x] Scheduler (`add --after 1h30m` / `--at 22:30`; runner holds Queued
+      until the wall clock honors it; cancels cleanly while waiting; start
+      times persist across daemon restarts)
 
 ## P2 - GUI (Tauri)
 

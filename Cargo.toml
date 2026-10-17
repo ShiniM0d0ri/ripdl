@@ -25,6 +25,7 @@ dirs = "6"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 anyhow = "1"
+time = { version = "0.3", features = ["local-offset"] }
 
 [profile.release]
 lto = "thin"

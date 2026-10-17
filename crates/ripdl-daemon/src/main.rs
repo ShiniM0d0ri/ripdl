@@ -26,6 +26,9 @@ struct TaskRecord {
     /// Extra engine headers (persisted so resume replays them).
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
+    /// Unix seconds when the task may start (None = immediately).
+    #[serde(default)]
+    start_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,7 +170,9 @@ impl Daemon {
 
     fn dispatch(self: &Arc<Self>, req: Request) -> Response {
         match req.cmd {
-            Command::Add { url, dest_dir, headers } => self.cmd_add(req.id, url, dest_dir, headers),
+            Command::Add { url, dest_dir, headers, start_at } => {
+                self.cmd_add(req.id, url, dest_dir, headers, start_at)
+            }
             Command::List => self.cmd_list(req.id),
             Command::Pause { id } => self.cmd_pause(req.id, &id),
             Command::Resume { id } => self.cmd_resume(req.id, &id),
@@ -185,6 +190,7 @@ impl Daemon {
         url: String,
         dest_dir: Option<PathBuf>,
         headers: std::collections::HashMap<String, String>,
+        start_at: Option<i64>,
     ) -> Response {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
@@ -209,6 +215,7 @@ impl Daemon {
             state: TaskState::Queued,
             error: None,
             headers,
+            start_at,
         };
         {
             let mut records = self.records.lock().unwrap();
@@ -241,6 +248,7 @@ impl Daemon {
                     total,
                     speed_bps,
                     error: r.error.clone(),
+                    start_at: r.start_at,
                 }
             })
             .collect();
@@ -331,6 +339,21 @@ impl Daemon {
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Scheduled start: hold Queued until the wall clock arrives.
+            // Cancel while waiting -> paused, like any queued task.
+            match start_delay(&rec.start_at) {
+                Some(delay) => {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            this.set_state(&rec.id, TaskState::Paused, None);
+                            return;
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                None => {}
+            }
+
             // Wait for a concurrency slot; pause/remove while queued bails here.
             let _permit = tokio::select! {
                 _ = token.cancelled() => {
@@ -453,6 +476,23 @@ fn duplicate_task(
         .map(|r| r.id.clone())
 }
 
+/// How long the runner must hold a task Queued before it may start.
+fn start_delay(start_at: &Option<i64>) -> Option<std::time::Duration> {
+    let start_at = (*start_at)?;
+    let now = now_unix();
+    if start_at <= now {
+        return None; // due now (or scheduled in the past): start immediately
+    }
+    Some(std::time::Duration::from_secs((start_at - now) as u64))
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +505,7 @@ mod tests {
             state: TaskState::Completed,
             error: None,
             headers: std::collections::HashMap::new(),
+            start_at: None,
         }
     }
 
@@ -479,6 +520,17 @@ mod tests {
         let records = vec![rec("a", "https://x/f.zip", Some("C:\\dl"))];
         assert!(duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\other"))).is_none());
         assert!(duplicate_task(&records, "https://x/g.zip", &Some(PathBuf::from("C:\\dl"))).is_none());
+    }
+
+    #[test]
+    fn start_delay_windows() {
+        let now = now_unix();
+        // No schedule -> start now.
+        assert_eq!(start_delay(&None), None);
+        // Past-due schedule -> start now.
+        assert_eq!(start_delay(&Some(now - 100)), None);
+        // Future schedule -> wait the remaining gap.
+        assert_eq!(start_delay(&Some(now + 90)), Some(std::time::Duration::from_secs(90)));
     }
 }
 

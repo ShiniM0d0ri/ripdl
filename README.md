@@ -24,6 +24,8 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | Content-Disposition filename (RFC 5987) | ✅ core |
 | Duplicate-URL collision guard (daemon) | ✅ daemon |
 | Failure-injection integration tests (offline) | ✅ core |
+| Scheduler (`--after` / `--at` HH:MM) | ✅ daemon + CLI |
+| Browser extension click-capture (MV3) | ✅ `ext/` + native host |
 | CLI (`ripdl download`, `ripdl info`) | ✅ |
 | Queue with concurrency limits | ✅ core + daemon-persisted |
 | Auto-categorization by file type | ✅ core |

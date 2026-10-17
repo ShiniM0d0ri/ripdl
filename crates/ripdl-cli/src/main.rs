@@ -70,6 +70,12 @@ enum Cmd {
         /// Shorthand for --header "User-Agent: <value>".
         #[arg(short = 'u', long = "user-agent")]
         user_agent: Option<String>,
+        /// Start the download after a delay, e.g. `30s`, `1h30m`, `2d`.
+        #[arg(long = "after")]
+        after: Option<String>,
+        /// Start at local wall-clock time `HH:MM` (today, or tomorrow if past).
+        #[arg(long = "at")]
+        at: Option<String>,
     },
     /// List tasks known to the daemon.
     Ls,
@@ -162,9 +168,15 @@ async fn main() -> anyhow::Result<()> {
             println!("{info:#?}");
             Ok(())
         }
-        Cmd::Add { url, dest, header, referer, cookie, user_agent } => {
+        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at } => {
+            let start_at = match (&after, &at) {
+                (Some(_), Some(_)) => bail!("use --after or --at, not both"),
+                (Some(delay), None) => Some(now_unix() + parse_after(delay)? as i64),
+                (None, Some(when)) => Some(parse_at(when)?),
+                (None, None) => None,
+            };
             let headers = collect_headers(&header, referer, cookie, user_agent)?;
-            rpc(Command::Add { url, dest_dir: dest, headers }).await
+            rpc(Command::Add { url, dest_dir: dest, headers, start_at }).await
         }
         Cmd::RegisterHost { ext_id, host } => register_host(&ext_id, &host),
         Cmd::Ls => rpc(Command::List).await,
@@ -199,7 +211,14 @@ async fn rpc(cmd: Command) -> anyhow::Result<()> {
         Reply::Error { message } => bail!("{message}"),
         Reply::Tasks { tasks } => {
             println!("{:<38} {:<10} {:>16} {:>12}", "ID", "STATE", "PROGRESS", "SPEED");
+            let now = now_unix();
             for t in tasks {
+                let mut state = format!("{:?}", t.state);
+                if let Some(start) = t.start_at {
+                    if start > now && matches!(t.state, ripdl_core::TaskState::Queued) {
+                        state = "timed".to_string();
+                    }
+                }
                 let progress = match t.total {
                     Some(total) => format!(
                         "{}/{} ({:.0}%)",
@@ -216,7 +235,7 @@ async fn rpc(cmd: Command) -> anyhow::Result<()> {
                 println!(
                     "{:<38} {:<10} {:>16} {:>12}",
                     t.id,
-                    format!("{:?}", t.state).to_lowercase(),
+                    state.to_lowercase(),
                     progress,
                     speed
                 );
@@ -242,6 +261,73 @@ fn humans(n: u64) -> String {
     } else {
         format!("{v:.1} {}", UNITS[unit])
     }
+}
+
+/// Unix seconds since the epoch (used for relative scheduling).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Parse a delay like `90s`, `30m`, `2h`, `1d`, or compounds `1h30m`, `2d12h`.
+fn parse_after(s: &str) -> anyhow::Result<u64> {
+    let mut total: u64 = 0;
+    let mut rest = s;
+    let mut parts = 0;
+    while !rest.is_empty() {
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits_end == 0 {
+            bail!("bad --after '{s}' (expected e.g. 30s, 1h30m, 2d)");
+        }
+        let n: u64 = rest[..digits_end]
+            .parse()
+            .with_context(|| format!("bad --after number in '{s}'"))?;
+        rest = &rest[digits_end..];
+        let mult = match rest.chars().next() {
+            Some('s') => 1,
+            Some('m') => 60,
+            Some('h') => 60 * 60,
+            Some('d') => 24 * 60 * 60,
+            _ => bail!("bad --after unit in '{s}' (use s/m/h/d)"),
+        };
+        rest = &rest[1..];
+        total = total
+            .checked_add(n.checked_mul(mult).context("bad --after value")?)
+            .context("bad --after value")?;
+        parts += 1;
+    }
+    if parts == 0 || total == 0 {
+        bail!("--after needs a positive delay, got '{s}'");
+    }
+    Ok(total)
+}
+
+/// Parse `HH:MM` into unix seconds of the next occurrence in local time.
+fn parse_at(s: &str) -> anyhow::Result<i64> {
+    let (h, m) = s
+        .split_once(':')
+        .with_context(|| format!("--at needs 'HH:MM', got '{s}'"))?;
+    let hour: u8 = h
+        .parse()
+        .with_context(|| format!("bad hour in '{s}'"))?;
+    let minute: u8 = m
+        .parse()
+        .with_context(|| format!("bad minute in '{s}'"))?;
+    if hour > 23 || minute > 59 {
+        bail!("--at '{s}' is not a valid clock time");
+    }
+
+    use time::OffsetDateTime;
+    let now = OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let slot = time::Time::from_hms(hour, minute, 0).expect("validated h/m");
+    let today = now.replace_time(slot);
+    let target = if today > now { today } else { today + time::Duration::days(1) };
+    Ok(target.unix_timestamp())
 }
 
 /// Merge `--header` repeats with the shorthand flags into one header map.
@@ -398,5 +484,33 @@ mod tests {
         assert!(parse_header("novalue").is_err());
         assert!(parse_header("Name:").is_err(), "empty value rejected");
         assert!(parse_header(": value").is_err(), "empty name rejected");
+    }
+
+    #[test]
+    fn parses_after_delays() {
+        assert_eq!(parse_after("90s").unwrap(), 90);
+        assert_eq!(parse_after("30m").unwrap(), 1800);
+        assert_eq!(parse_after("2h").unwrap(), 7200);
+        assert_eq!(parse_after("1d").unwrap(), 86400);
+        assert_eq!(parse_after("1h30m").unwrap(), 5400);
+        assert_eq!(parse_after("2d12h").unwrap(), 216000);
+        assert!(parse_after("").is_err());
+        assert!(parse_after("0").is_err(), "zero delay rejected");
+        assert!(parse_after("5x").is_err(), "unknown unit rejected");
+        assert!(parse_after("hm").is_err(), "missing digits rejected");
+        assert!(parse_after("30d1").is_err(), "trailing digits rejected");
+    }
+
+    #[test]
+    fn parses_at_clock_times() {
+        // Next occurrence is always strictly in the future, within 25 h.
+        let now = now_unix();
+        let when = parse_at("03:05").unwrap();
+        assert!(when > now, "next occurrence must be in the future");
+        assert!(when - now <= 25 * 3600, "at most tomorrow, got {when}");
+        assert!(parse_at("24:00").is_err());
+        assert!(parse_at("23:60").is_err());
+        assert!(parse_at("abc").is_err());
+        assert!(parse_at("1230").is_err());
     }
 }
