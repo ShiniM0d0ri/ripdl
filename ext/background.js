@@ -194,6 +194,10 @@ async function headersFor(item, rec) {
     return headers;
 }
 
+/** Until daemon-side capture policy exists: don't run off with the
+ * browser's tiny files (sub-256 KiB downloads are usually fine natively). */
+const MIN_SEIZE_BYTES = 256 * 1024;
+
 /** Match a download item to an observed request. */
 function findRecord(item, ignoreContentLength) {
     let rec = reqByUrl.get(item.finalUrl) || reqByUrl.get(item.url);
@@ -247,6 +251,10 @@ chrome.downloads.onDeterminingFilename.addListener(async (item, suggest) => {
 
 /** Offer the task to the daemon; accepted -> stop the browser's copy. */
 async function seize(item, suggest, rec) {
+    if (item.totalBytes > 0 && item.totalBytes < MIN_SEIZE_BYTES) {
+        suggest(); // below the floor: browser handles small files fine.
+        return;
+    }
     const headers = await headersFor(item, rec);
     const url = item.finalUrl || item.url;
     const resp = await send({ id: `dl-${nextId++}`, cmd: { type: "add", url, dest_dir: null, headers } });
@@ -264,9 +272,70 @@ async function seize(item, suggest, rec) {
     }
 }
 
+/* --- selection / all-links: on-demand scripting, never resident ------- */
+
+/** Injected at menu-click time; collects links absolutely. */
+function collectLinksInView(mode) {
+    const links = new Set();
+    const push = (a) => {
+        try {
+            const u = new URL(a.href, document.baseURI);
+            if (u.protocol === "http:" || u.protocol === "https:") links.add(u.href);
+        } catch {
+            // unresolvable href: skip
+        }
+    };
+    if (mode === "selection") {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount) {
+            // Selection ranges must be cloned into a scratch node to expose
+            // their anchor elements (apply-to-selection standard technique).
+            const scratch = document.createElement("div");
+            for (let i = 0; i < sel.rangeCount; ++i) {
+                scratch.appendChild(sel.getRangeAt(i).cloneContents());
+            }
+            scratch.querySelectorAll("a[href]").forEach(push);
+        }
+    } else {
+        document.querySelectorAll("a[href]").forEach(push);
+    }
+    return { links: [...links].slice(0, 100) };
+}
+
 /* --- context menu: explicit, on-demand handoff ------------------------ */
 
 chrome.contextMenus.onClicked.addListener(async (info) => {
+    if (info.menuItemId === "ripdl-selection" || info.menuItemId === "ripdl-all-links") {
+        const mode = info.menuItemId === "ripdl-selection" ? "selection" : "all";
+        if (!info.tabId) return;
+        let links = [];
+        try {
+            const [{ result }] = await chrome.scripting.executeScript({
+                target: { tabId: info.tabId },
+                func: collectLinksInView,
+                args: [mode],
+            });
+            links = (result && result.links) || [];
+        } catch {
+            // chrome:// or protected pages: scripting is refused; stay quiet.
+            setBadge("!");
+            setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
+            return;
+        }
+        if (!links.length) {
+            setBadge("0");
+            setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
+            return;
+        }
+        // Queue every link; the daemon merges same-URL tasks by idempotency.
+        await Promise.all(links.map((u) =>
+            send({ id: `sel-${nextId++}`, cmd: { type: "add", url: u, dest_dir: null, headers: {} } })
+        ));
+        setBadge(String(links.length));
+        setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
+        return;
+    }
+
     const url = info.linkUrl || info.pageUrl;
     if (!url) return;
     const resp = await send({ id: `ctx-${nextId++}`, cmd: { type: "add", url, dest_dir: null, headers: {} } });
@@ -284,6 +353,16 @@ chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({
         id: "ripdl-page",
         title: "Download this page URL with ripdl",
+        contexts: ["page"],
+    });
+    chrome.contextMenus.create({
+        id: "ripdl-selection",
+        title: "Download selected links with ripdl",
+        contexts: ["selection"],
+    });
+    chrome.contextMenus.create({
+        id: "ripdl-all-links",
+        title: "Download all page links with ripdl",
         contexts: ["page"],
     });
 });

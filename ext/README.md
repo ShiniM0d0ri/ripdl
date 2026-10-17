@@ -26,6 +26,10 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
 ## How capture works
 
 - Context menu on a link/page -> the URL is queued to the daemon.
+- Right-click over a text selection -> every link inside the selection is
+  queued; an empty-area menu offers "all page links" (capped at 100). The
+  collector is injected at click time via `chrome.scripting` - there are NO
+  resident content scripts.
 - While the daemon answers, browser-initiated downloads are intercepted in
   `downloads.onDeterminingFilename` and re-queued fast (with their Referer
   and browser User-Agent so protected links still resolve). If the daemon
@@ -39,8 +43,9 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
 
 ## Deliberately not present (yet)
 
-- Selection-based "download all selected links" (planned via on-demand
-  `chrome.scripting`, never via permanent content scripts).
-- Referer rewrite of fallback downloads once we accept a task and the
-  daemon dies mid-flight (needs a declarativeNetRequest temporary rule).
+- Referer rewrite of fallback reissues during daemon death: not needed by
+  design. ripdl offers the task to the daemon BEFORE disturbing the browser
+  download (offer-first), so the browser item is never canceled for a task
+  the daemon didn't commit to. If the daemon dies after accepting, the task
+  is resumable from the daemon side.
 - Video/stream sniffing (a later, opt-in "hunt" mode).
