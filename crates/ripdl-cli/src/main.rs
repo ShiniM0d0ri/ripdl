@@ -36,6 +36,19 @@ enum Cmd {
         /// `1g`, or plain bytes/sec. Minimum cap is 1k.
         #[arg(short, long = "max-speed")]
         max_speed: Option<String>,
+        /// Extra request header `Name: value`; repeatable. Needed for
+        /// cookies, referers, auth, and hotlink-protected links.
+        #[arg(short = 'H', long = "header")]
+        header: Vec<String>,
+        /// Shorthand for --header "Referer: <url>".
+        #[arg(long)]
+        referer: Option<String>,
+        /// Shorthand for --header "Cookie: <value>".
+        #[arg(long)]
+        cookie: Option<String>,
+        /// Shorthand for --header "User-Agent: <value>".
+        #[arg(short = 'u', long = "user-agent")]
+        user_agent: Option<String>,
     },
     /// Show what the engine plans for a URL (size, ranges, filename).
     Info { url: String },
@@ -45,6 +58,18 @@ enum Cmd {
         /// Output directory (default: your downloads folder).
         #[arg(short, long)]
         dest: Option<PathBuf>,
+        /// Extra request header `Name: value`; repeatable.
+        #[arg(short = 'H', long = "header")]
+        header: Vec<String>,
+        /// Shorthand for --header "Referer: <url>".
+        #[arg(long)]
+        referer: Option<String>,
+        /// Shorthand for --header "Cookie: <value>".
+        #[arg(long)]
+        cookie: Option<String>,
+        /// Shorthand for --header "User-Agent: <value>".
+        #[arg(short = 'u', long = "user-agent")]
+        user_agent: Option<String>,
     },
     /// List tasks known to the daemon.
     Ls,
@@ -64,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Download { url, out, segments, max_speed } => {
+        Cmd::Download { url, out, segments, max_speed, header, referer, cookie, user_agent } => {
             let mut cfg = EngineConfig::default();
             if let Some(n) = segments {
                 cfg.max_segments = n;
@@ -72,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(s) = max_speed {
                 cfg.max_speed = Some(parse_speed(&s)?);
             }
+            cfg.headers = collect_headers(&header, referer, cookie, user_agent)?;
             let engine = Arc::new(Engine::new(cfg)?);
 
             let info = engine.plan(&url).await.context("failed to probe url")?;
@@ -113,7 +139,10 @@ async fn main() -> anyhow::Result<()> {
             println!("{info:#?}");
             Ok(())
         }
-        Cmd::Add { url, dest } => rpc(Command::Add { url, dest_dir: dest }).await,
+        Cmd::Add { url, dest, header, referer, cookie, user_agent } => {
+            let headers = collect_headers(&header, referer, cookie, user_agent)?;
+            rpc(Command::Add { url, dest_dir: dest, headers }).await
+        }
         Cmd::Ls => rpc(Command::List).await,
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
@@ -191,6 +220,47 @@ fn humans(n: u64) -> String {
     }
 }
 
+/// Merge `--header` repeats with the shorthand flags into one header map.
+/// Shorthands win over an explicit same-name `--header`.
+fn collect_headers(
+    header: &[String],
+    referer: Option<String>,
+    cookie: Option<String>,
+    user_agent: Option<String>,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    for h in header {
+        let (k, v) = parse_header(h)?;
+        out.insert(k, v);
+    }
+    if let Some(r) = referer {
+        out.insert("Referer".to_string(), r);
+    }
+    if let Some(c) = cookie {
+        out.insert("Cookie".to_string(), c);
+    }
+    if let Some(ua) = user_agent {
+        out.insert("User-Agent".to_string(), ua);
+    }
+    Ok(out)
+}
+
+/// Parse one `Name: value` header string.
+fn parse_header(s: &str) -> anyhow::Result<(String, String)> {
+    let (k, v) = s
+        .split_once(':')
+        .with_context(|| format!("header '{s}' needs the form 'Name: value'"))?;
+    let k = k.trim();
+    let v = v.trim();
+    if k.is_empty() {
+        bail!("empty header name in '{s}'");
+    }
+    if v.is_empty() {
+        bail!("empty header value in '{s}'");
+    }
+    Ok((k.to_string(), v.to_string()))
+}
+
 /// Parse a human speed cap like `500k`, `2.5m`, `1g`, or plain bytes/sec.
 /// Caps below 1 KiB/s are rejected as obviously accidental.
 fn parse_speed(s: &str) -> anyhow::Result<u64> {
@@ -232,5 +302,13 @@ mod tests {
         assert!(parse_speed("500x").is_err(), "unknown suffix");
         assert!(parse_speed("-2m").is_err(), "negative");
         assert!(parse_speed("abc").is_err(), "not a number");
+    }
+
+    #[test]
+    fn parses_header_name_value() {
+        assert_eq!(parse_header("Referer: https://x.y").unwrap(), ("Referer".into(), "https://x.y".into()));
+        assert!(parse_header("novalue").is_err());
+        assert!(parse_header("Name:").is_err(), "empty value rejected");
+        assert!(parse_header(": value").is_err(), "empty name rejected");
     }
 }

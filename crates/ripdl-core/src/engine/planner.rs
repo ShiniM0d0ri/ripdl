@@ -84,16 +84,82 @@ fn total_from(resp: &reqwest::Response) -> Option<u64> {
 }
 
 fn filename_from(resp: &reqwest::Response) -> Option<String> {
-    let cd = resp.headers().get(CONTENT_DISPOSITION)?.to_str().ok()?;
-    let lower = cd.to_ascii_lowercase();
-    let idx = lower.find("filename=")?;
-    let raw = cd[idx + 9..].trim_start().trim_start_matches('"');
-    let end = raw
-        .find('"')
-        .or_else(|| raw.find(';'))
-        .unwrap_or(raw.len());
-    let name = raw[..end].trim();
-    (!name.is_empty()).then(|| name.to_string())
+    resp.headers()
+        .get(CONTENT_DISPOSITION)?
+        .to_str()
+        .ok()
+        .and_then(filename_from_content_disposition)
+}
+
+/// Parse `Content-Disposition` into a safe single path segment.
+///
+/// Handles `filename*=UTF-8''percent%20encoded` (RFC 5987; wins when
+/// present), `filename="quoted"` and bare `filename=name`. The result is
+/// reduced to its basename and rejected when empty or a dot path, so the
+/// caller's URL/`download.bin` fallbacks stay in charge.
+pub(crate) fn filename_from_content_disposition(cd: &str) -> Option<String> {
+    let mut star: Option<String> = None;
+    let mut plain: Option<String> = None;
+    for param in cd.split(';') {
+        let param = param.trim();
+        let lower = param.to_ascii_lowercase();
+        // Slicing both strings at the same offset is safe: ASCII-lowercasing
+        // preserves multibyte boundaries.
+        if let Some(rest) = lower.strip_prefix("filename*=") {
+            let raw = &param[param.len() - rest.len()..];
+            let value = match raw.split_once('\'') {
+                // charset'lang'percent-encoded
+                Some((_, after1)) => match after1.split_once('\'') {
+                    Some((_, value)) => Some(value),
+                    None => None,
+                },
+                None => None,
+            }
+            .unwrap_or(raw);
+            let decoded = percent_decode_lossy(value.trim().trim_matches('"'));
+            if !decoded.is_empty() {
+                star = Some(decoded);
+            }
+        } else if let Some(rest) = lower.strip_prefix("filename=") {
+            let raw = &param[param.len() - rest.len()..];
+            let name = raw.trim().trim_matches('"');
+            if !name.is_empty() {
+                plain = Some(name.to_string());
+            }
+        }
+    }
+
+    let chosen: String = star.or(plain)?;
+    let base = chosen
+        .split(['/', '\\'])
+        .next_back()
+        .unwrap_or("")
+        .trim();
+    (!base.is_empty() && base != "." && base != "..").then(|| base.to_string())
+}
+
+/// Decode `%XX` sequences; invalid ones are kept literally, bytes that don't
+/// form UTF-8 are replaced. (`+` is not decoded — that is form encoding.)
+fn percent_decode_lossy(v: &str) -> String {
+    let bytes = v.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(hex) = bytes.get(i + 1..i + 3) {
+                if let Some(decoded) =
+                    std::str::from_utf8(hex).ok().and_then(|s| u8::from_str_radix(s, 16).ok())
+                {
+                    out.push(decoded);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn filename_from_url(url: &reqwest::Url) -> Option<String> {
@@ -111,5 +177,54 @@ mod tests {
     fn filename_from_url_takes_last_segment() {
         let url: reqwest::Url = "https://example.com/files/big-file.zip".parse().unwrap();
         assert_eq!(filename_from_url(&url).as_deref(), Some("big-file.zip"));
+    }
+
+    #[test]
+    fn cd_plain_quoted_and_bare() {
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename=\"report.pdf\"").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename=report.html").as_deref(),
+            Some("report.html")
+        );
+    }
+
+    #[test]
+    fn cd_rfc5987_wins_and_decodes() {
+        // filename* beats plain filename; percent-encoded UTF-8 survives.
+        assert_eq!(
+            filename_from_content_disposition(
+                "attachment; filename=\"fallback.bin\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20v2.xlsx"
+            )
+            .as_deref(),
+            Some("résumé v2.xlsx")
+        );
+    }
+
+    #[test]
+    fn cd_reduces_to_safe_basename() {
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename=\"dir/evil/file.iso\"").as_deref(),
+            Some("file.iso")
+        );
+        // Traversal collapses to a harmless basename: we only ever write
+        // inside the chosen directory.
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename=\"..\\..\\evil.exe\"").as_deref(),
+            Some("evil.exe")
+        );
+        assert_eq!(filename_from_content_disposition("attachment; filename=\"\"").as_deref(), None);
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename=\".\"").as_deref(),
+            None
+        );
+        assert_eq!(
+            filename_from_content_disposition("attachment; filename=\"..\"").as_deref(),
+            None
+        );
+        // Tunneling / missing header values must not yield anything either.
+        assert_eq!(filename_from_content_disposition("attachment").as_deref(), None);
     }
 }

@@ -23,6 +23,9 @@ struct TaskRecord {
     state: TaskState,
     #[serde(default)]
     error: Option<String>,
+    /// Extra engine headers (persisted so resume replays them).
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,7 +45,6 @@ struct ProgressTrack {
 }
 
 struct Daemon {
-    engine: Arc<Engine>,
     port: u16,
     queue_path: PathBuf,
     records: Mutex<Vec<TaskRecord>>,
@@ -67,7 +69,6 @@ impl Daemon {
         };
 
         Ok(Self {
-            engine: Arc::new(Engine::new(EngineConfig::default())?),
             port: DEFAULT_PORT,
             queue_path,
             records: Mutex::new(records),
@@ -166,7 +167,7 @@ impl Daemon {
 
     fn dispatch(self: &Arc<Self>, req: Request) -> Response {
         match req.cmd {
-            Command::Add { url, dest_dir } => self.cmd_add(req.id, url, dest_dir),
+            Command::Add { url, dest_dir, headers } => self.cmd_add(req.id, url, dest_dir, headers),
             Command::List => self.cmd_list(req.id),
             Command::Pause { id } => self.cmd_pause(req.id, &id),
             Command::Resume { id } => self.cmd_resume(req.id, &id),
@@ -178,10 +179,28 @@ impl Daemon {
         }
     }
 
-    fn cmd_add(self: &Arc<Self>, req_id: u64, url: String, dest_dir: Option<PathBuf>) -> Response {
+    fn cmd_add(
+        self: &Arc<Self>,
+        req_id: u64,
+        url: String,
+        dest_dir: Option<PathBuf>,
+        headers: std::collections::HashMap<String, String>,
+    ) -> Response {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
         let dest_dir = dest_dir.or_else(default_download_dir);
+        // Idempotency: the same URL into the same destination must not
+        // double-download into one file (sidecar trample = corrupt output).
+        // Re-adding shares the existing task instead.
+        {
+            let records = self.records.lock().unwrap();
+            if let Some(id) = duplicate_task(&records, &url, &dest_dir) {
+                return Response {
+                    id: req_id,
+                    reply: Reply::Added { id },
+                };
+            }
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let rec = TaskRecord {
             id: id.clone(),
@@ -189,6 +208,7 @@ impl Daemon {
             dest_dir,
             state: TaskState::Queued,
             error: None,
+            headers,
         };
         {
             let mut records = self.records.lock().unwrap();
@@ -334,10 +354,24 @@ impl Daemon {
 
             this.set_state(&rec.id, TaskState::Running, None);
 
+            // Per-task engine: task headers live on the client, so both the
+            // probe and every segment carry them.
+            let engine = {
+                let cfg = EngineConfig {
+                    headers: rec.headers.clone(),
+                    ..EngineConfig::default()
+                };
+                match Engine::new(cfg) {
+                    Ok(engine) => Arc::new(engine),
+                    Err(e) => {
+                        this.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
+                        return;
+                    }
+                }
+            };
             let on_progress_this = Arc::clone(&this);
             let on_progress_id = rec.id.clone();
-            let result = this
-                .engine
+            let result = engine
                 .download(&rec.url, rec.dest_dir.clone(), token, move |p| {
                     on_progress_this.on_progress(&on_progress_id, p)
                 })
@@ -404,6 +438,48 @@ async fn main() {
 /// folder, falling back to the home directory - never the daemon's cwd.
 fn default_download_dir() -> Option<PathBuf> {
     dirs::download_dir().or_else(dirs::home_dir)
+}
+
+/// Idempotency guard: the same URL into the same destination must not
+/// double-download into one file (sidecar trample = corrupt output).
+fn duplicate_task(
+    records: &[TaskRecord],
+    url: &str,
+    dest_dir: &Option<PathBuf>,
+) -> Option<String> {
+    records
+        .iter()
+        .find(|r| &r.url == url && &r.dest_dir == dest_dir)
+        .map(|r| r.id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(id: &str, url: &str, dest: Option<&str>) -> TaskRecord {
+        TaskRecord {
+            id: id.to_string(),
+            url: url.to_string(),
+            dest_dir: dest.map(PathBuf::from),
+            state: TaskState::Completed,
+            error: None,
+            headers: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn duplicate_found_for_same_url_and_dest() {
+        let records = vec![rec("a", "https://x/f.zip", Some("C:\\dl"))];
+        assert_eq!(duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\dl"))), Some("a".into()));
+    }
+
+    #[test]
+    fn no_duplicate_for_different_dest() {
+        let records = vec![rec("a", "https://x/f.zip", Some("C:\\dl"))];
+        assert!(duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\other"))).is_none());
+        assert!(duplicate_task(&records, "https://x/g.zip", &Some(PathBuf::from("C:\\dl"))).is_none());
+    }
 }
 
 async fn real_main() -> Result<()> {

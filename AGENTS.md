@@ -70,11 +70,11 @@ bytes.
 ## Current status
 
 Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-17:
-P0/P1 core complete and committed (multi-segment download, resume, retry,
-daemon + RPC, persistent queue); failure-injection integration tests pass
-offline (`cargo test -p ripdl-core`; mock server with drop-injection, no-range
-mode, etag switching); segment writes are buffered (256 KiB, blocking pool);
-token-bucket speed limiter shared across segments with CLI `--max-speed`.
-Daemon `add` defaults destinations to the user's Downloads folder.
-Next up: P4 REA research for browser click-capture (the killer feature), or
-scheduler (last big P1 item).
+P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
+persistent queue, buffered writes, shared speed limiter, header/auth/cookie
+pass-through, Content-Disposition naming, duplicate-URL idempotency. 21 tests
+pass offline (`cargo test --workspace`).
+In progress: P4 browser integration — REA research on FDM/IDM extension JS
+(research/ artifacts gitignored, findings in docs/rea-findings.md), then our
+WebExtension + Rust native messaging host.
+Backlog: scheduler, named pipe transport, daemon config file.

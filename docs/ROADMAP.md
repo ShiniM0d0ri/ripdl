@@ -26,6 +26,11 @@ Guiding rules:
       sidecar, etag-change fresh restart)
 - [x] Buffered async segment writes (256 KiB blocks through the blocking
       pool; slow disks no longer stall the network pipeline)
+- [x] Request headers pass-through (`--header`/`--referer`/`--cookie`/`--user-agent`;
+      engine default_headers so probe + segments carry them; user UA wins)
+- [x] Content-Disposition filename (RFC 5987 decode + basename sanitization)
+- [x] Daemon idempotency: same URL + dest shares the live task (no file
+      trample)
 
 ## P1 - daemon + persistence
 

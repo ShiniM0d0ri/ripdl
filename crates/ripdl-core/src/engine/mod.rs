@@ -33,6 +33,9 @@ pub struct EngineConfig {
     pub user_agent: String,
     /// Global bytes-per-second cap shared by all segments (None = unlimited).
     pub max_speed: Option<u64>,
+    /// Extra request headers sent by probe + every segment (cookies,
+    /// referer, auth...). Later entries may replace same-named ones.
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 impl Default for EngineConfig {
@@ -43,6 +46,7 @@ impl Default for EngineConfig {
             retry: retry::RetryConfig::default(),
             user_agent: concat!("ripdl/", env!("CARGO_PKG_VERSION")).to_string(),
             max_speed: None,
+            headers: std::collections::HashMap::new(),
         }
     }
 }
@@ -55,9 +59,24 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(cfg.user_agent.clone())
-            .build()?;
+        // If the user supplies their own User-Agent header, it must win over
+        // the built-in one, so only set the default when they don't.
+        let has_user_ua = cfg.headers.keys().any(|k| k.to_ascii_lowercase() == "user-agent");
+        let mut builder = reqwest::Client::builder();
+        if !has_user_ua {
+            builder = builder.user_agent(cfg.user_agent.clone());
+        }
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        for (k, v) in &cfg.headers {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                Error::Io(std::io::Error::other(format!("bad header name '{k}': {e}")))
+            })?;
+            let value = reqwest::header::HeaderValue::from_str(v.as_str()).map_err(|e| {
+                Error::Io(std::io::Error::other(format!("bad header value for '{k}': {e}")))
+            })?;
+            default_headers.insert(name, value);
+        }
+        let client = builder.default_headers(default_headers).build()?;
         let limiter = std::sync::Arc::new(limiter::Limiter::new(cfg.max_speed));
         Ok(Self { client, cfg, limiter })
     }

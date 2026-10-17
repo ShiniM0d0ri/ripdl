@@ -23,6 +23,9 @@ pub enum Command {
         url: String,
         #[serde(default)]
         dest_dir: Option<PathBuf>,
+        /// Extra request headers for the engine (cookies, referer...).
+        #[serde(default)]
+        headers: std::collections::HashMap<String, String>,
     },
     List,
     Pause {

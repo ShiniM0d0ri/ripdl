@@ -64,6 +64,11 @@ struct ServerState {
     etag_version: AtomicUsize,
     /// Sleep inserted between body blocks (pacing, tests 4-5 only).
     block_pace: Option<Duration>,
+    /// Content-Disposition advertised by HEAD (filename override path).
+    content_disposition: Option<String>,
+    /// Every "name: value" header line seen, lowercased name, in arrival
+    /// order (headers pass-through verification).
+    headers_seen: Mutex<Vec<String>>,
     /// Every ranged GET's "a-b" request, in connection order.
     ranges_seen: Mutex<Vec<String>>,
 }
@@ -111,6 +116,17 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
     head.truncate(head_len);
     let text = String::from_utf8_lossy(&head);
 
+    // Capture every header for pass-through assertions.
+    for line in text.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            state.headers_seen.lock().unwrap().push(format!(
+                "{}: {}",
+                k.trim().to_ascii_lowercase(),
+                v.trim()
+            ));
+        }
+    }
+
     let is_head = text.lines().next().unwrap_or("").starts_with("HEAD");
     let mut range: Option<(u64, Option<u64>)> = None;
     let mut if_match = String::new();
@@ -135,8 +151,13 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
     // HEAD = engine probe: advertise size + range support, send no body.
     if is_head {
         let ranges_hdr = if state.ranges { "accept-ranges: bytes\r\n" } else { "" };
+        let cd_hdr = state
+            .content_disposition
+            .as_deref()
+            .map(|cd| format!("content-disposition: {cd}\r\n"))
+            .unwrap_or_default();
         let resp = format!(
-            "HTTP/1.1 200 OK\r\netag: {etag}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n{ranges_hdr}connection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\netag: {etag}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n{cd_hdr}{ranges_hdr}connection: close\r\n\r\n",
             state.total
         );
         sock.write_all(resp.as_bytes()).await?;
@@ -280,6 +301,8 @@ async fn multi_segment_exact_bytes() {
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
         block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
@@ -316,6 +339,8 @@ async fn dropped_connection_recovered_by_retry() {
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
         block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
@@ -342,6 +367,8 @@ async fn no_ranges_falls_back_to_single_stream() {
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
         block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
@@ -377,6 +404,8 @@ async fn pause_resumes_from_sidecar() {
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
         block_pace: Some(Duration::from_millis(40)),
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
@@ -454,6 +483,8 @@ async fn speed_limit_paces_download() {
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
         block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
@@ -503,6 +534,8 @@ async fn stale_etag_forces_fresh_restart() {
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
         block_pace: Some(Duration::from_millis(40)),
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
@@ -559,5 +592,72 @@ async fn stale_etag_forces_fresh_restart() {
     assert!(
         !names.iter().any(|n| n.ends_with(".ripdl.json")),
         "sidecar must be removed on success: {names:?}"
+    );
+}
+
+/// A check to buy drinks for: every request (probe + segments) carries the
+/// configured headers, and a Content-Disposition filename override beats the
+/// URL's last segment.
+#[tokio::test]
+async fn carries_headers_and_uses_cd_filename() {
+    let state = Arc::new(ServerState {
+        total: MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: Some("attachment; filename*=UTF-8''ripdl%20%C3%A9tude.bin".to_string()),
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("Referer".to_string(), "https://example.org/dir".to_string());
+    headers.insert("User-Agent".to_string(), "ripdl-cli-test/2.0".to_string());
+    headers.insert("Cookie".to_string(), "bin=31337".to_string());
+    let engine = Engine::new(EngineConfig {
+        max_segments: 8,
+        min_segment_size: 128 * KIB,
+        retry: RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(50),
+            max_delay: Duration::from_millis(200),
+        },
+        headers,
+        ..EngineConfig::default()
+    })
+    .expect("engine");
+
+    let tmp = temp_dir("headers");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download ok");
+
+    // The RFC 5987 name wins over the URL's /file.bin.
+    assert_eq!(
+        dest.file_name().and_then(|n| n.to_str()),
+        Some("ripdl étude.bin")
+    );
+    verify(&dest, MIB);
+
+    let seen = state.headers_seen.lock().unwrap().clone();
+    for wanted in [
+        "referer: https://example.org/dir",
+        "user-agent: ripdl-cli-test/2.0",
+        "cookie: bin=31337",
+    ] {
+        assert!(
+            seen.iter().any(|h| h == wanted),
+            "header '{wanted}' missing, saw {seen:?}"
+        );
+    }
+    // The built-in UA must yield to the user's.
+    assert!(
+        !seen.iter().any(|h| h.starts_with("user-agent: ripdl/")),
+        "default UA leaked past the override, saw {seen:?}"
     );
 }
