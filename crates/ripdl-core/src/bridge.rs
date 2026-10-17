@@ -351,6 +351,7 @@ mod tests {
                 dest_dir: None,
                 headers: Default::default(),
                 start_at: None,
+                kind: Default::default(),
             },
         )
         .unwrap();

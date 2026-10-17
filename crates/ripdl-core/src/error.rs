@@ -29,6 +29,9 @@ pub enum Error {
     #[error("state file error: {0}")]
     State(String),
 
+    #[error("hunt error: {0}")]
+    Hunt(String),
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }

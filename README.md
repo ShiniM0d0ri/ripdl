@@ -60,6 +60,7 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | Queue with concurrency limits | ✅ core + daemon-persisted |
 | Auto-categorization by file type | ✅ core |
 | Daemon + RPC (TCP localhost + named pipe) | ✅ v1 |
+| Video/stream hunt (`yt-dlp` sidecar, `add --video`) | ✅ daemon + CLI |
 | Tauri GUI | 🚧 P2 |
 | Torrent (via `librqbit`) | 🚧 P3 |
 
@@ -96,6 +97,18 @@ ripdl info https://example.com/big-file.zip      # inspect before downloading
 ripdl download https://example.com/big-file.zip  # 8 segments, resumable
 ripdl download -o D:/Downloads -s 16 <url>       # custom dir + segment count
 ```
+
+### Hunt mode (video/stream pages)
+
+```sh
+ripdl add --video "https://www.youtube.com/watch?v=..."        # or any stream page
+```
+
+Video tasks are handed to a `yt-dlp` sidecar (ripdl does **not** reimplement
+site extraction). Progress, pause/resume/cancel behave like every other task;
+resume continues partial `.part` files. yt-dlp must be installed — e.g.
+`winget install yt-dlp.yt-dlp` — or point the daemon at it in
+`%LOCALAPPDATA%\ripdl\config.json`.
 
 Interrupted downloads keep a `<file>.ripdl.json` sidecar; rerun the same
 command and it resumes from where it stopped.

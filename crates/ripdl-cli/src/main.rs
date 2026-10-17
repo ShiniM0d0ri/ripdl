@@ -76,6 +76,11 @@ enum Cmd {
         /// Start at local wall-clock time `HH:MM` (today, or tomorrow if past).
         #[arg(long = "at")]
         at: Option<String>,
+        /// Hunt mode: treat the URL as a video/stream page and hand it to
+        /// the yt-dlp sidecar. Needs yt-dlp on `PATH` or `ytdlp_path` in
+        /// the daemon's config.json.
+        #[arg(long = "video")]
+        video: bool,
     },
     /// List tasks known to the daemon.
     Ls,
@@ -168,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{info:#?}");
             Ok(())
         }
-        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at } => {
+        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video } => {
             let start_at = match (&after, &at) {
                 (Some(_), Some(_)) => bail!("use --after or --at, not both"),
                 (Some(delay), None) => Some(now_unix() + parse_after(delay)? as i64),
@@ -176,7 +181,12 @@ async fn main() -> anyhow::Result<()> {
                 (None, None) => None,
             };
             let headers = collect_headers(&header, referer, cookie, user_agent)?;
-            rpc(Command::Add { url, dest_dir: dest, headers, start_at }).await
+            let kind = if video {
+                ripdl_core::task::TaskKind::Video
+            } else {
+                ripdl_core::task::TaskKind::Http
+            };
+            rpc(Command::Add { url, dest_dir: dest, headers, start_at, kind }).await
         }
         Cmd::RegisterHost { ext_id, host } => register_host(&ext_id, &host),
         Cmd::Ls => rpc(Command::List).await,
@@ -219,14 +229,18 @@ async fn rpc(cmd: Command) -> anyhow::Result<()> {
                         state = "timed".to_string();
                     }
                 }
-                let progress = match t.total {
-                    Some(total) => format!(
-                        "{}/{} ({:.0}%)",
-                        humans(t.downloaded),
-                        humans(total),
-                        t.downloaded as f64 / total as f64 * 100.0
-                    ),
-                    None => humans(t.downloaded),
+                let progress = match t.percent {
+                    // Video tasks report a tool-level percent, not bytes.
+                    Some(pct) => format!("{pct:.1}%"),
+                    None => match t.total {
+                        Some(total) => format!(
+                            "{}/{} ({:.0}%)",
+                            humans(t.downloaded),
+                            humans(total),
+                            t.downloaded as f64 / total as f64 * 100.0
+                        ),
+                        None => humans(t.downloaded),
+                    },
                 };
                 let speed = t
                     .speed_bps

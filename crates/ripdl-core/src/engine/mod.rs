@@ -200,6 +200,7 @@ impl Engine {
                             id: meta_task.id.clone(),
                             downloaded: downloaded.load(Ordering::Relaxed),
                             total: meta_task.total,
+                            percent: None,
                         });
                         break;
                     }
@@ -214,6 +215,7 @@ impl Engine {
                         id: file.id.clone(),
                         downloaded: downloaded_now,
                         total: file.total,
+                        percent: None,
                     });
                 }
             })

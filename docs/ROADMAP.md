@@ -65,11 +65,13 @@ Guiding rules:
 
 ## P4 - browser integration (the killer feature)
 
-- [ ] REA analysis of FDM / IDM browser extensions: how URL capture +
+- [x] REA analysis of FDM / IDM browser extensions: how URL capture +
       native messaging actually work, and what telemetry they send
-- [ ] Our own WebExtension + Rust native messaging host
-- [ ] Click-to-capture: intercepted links flow into the daemon queue
-- [ ] Optional video-grab: wrap `yt-dlp` as a sidecar (do NOT rebuild it)
+- [x] Our own WebExtension + Rust native messaging host
+- [x] Click-to-capture: intercepted links flow into the daemon queue
+- [x] Hunt mode: video/stream tasks via the `yt-dlp` sidecar (`add
+      --video`; `ytdlp_path` in config.json; progress parsed from the
+      tool's lines; pause/resume = kill/continue)
 
 ## P5 - ship it
 

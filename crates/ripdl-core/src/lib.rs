@@ -8,6 +8,7 @@ pub mod bridge;
 pub mod categories;
 pub mod engine;
 pub mod error;
+pub mod hunt;
 pub mod queue;
 pub mod rpc;
 pub mod task;

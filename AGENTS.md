@@ -90,8 +90,11 @@ pass-through, Content-Disposition naming, duplicate-URL idempotency,
 scheduler (`--after`/`--at` with delayed runner start), named pipe transport
 (pipe-first client + dual listeners; TCP kept as fallback; unix socket on
 non-Windows), daemon config file (`config.json`: max_concurrent,
-max_segments, min_segment_size, max_speed_bytes, default_download_dir).
-34 tests pass offline (`cargo test --workspace`).
+max_segments, min_segment_size, max_speed_bytes, default_download_dir),
+hunt mode (video/stream tasks via the `yt-dlp` sidecar: `add --video`,
+`ytdlp_path` config key, percent-based progress, pause = kill sidecar,
+resume = re-invoke which continues `.part` files).
+41 tests pass offline (`cargo test --workspace`).
 In progress: P4 browser integration — REA research done; bridge +
 `register-host` + MV3 extension landed and capture verified live twice
 (temp Chrome profile -> daemon -> file). Extension now has: SW-race matching

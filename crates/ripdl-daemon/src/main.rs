@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ripdl_core::rpc::{Command, Reply, Request, Response, TaskInfo, DEFAULT_PORT};
-use ripdl_core::task::{Progress, TaskState};
+use ripdl_core::task::{Progress, TaskKind, TaskState};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
 
 /// Persisted queue record.
@@ -29,6 +29,9 @@ struct TaskRecord {
     /// Unix seconds when the task may start (None = immediately).
     #[serde(default)]
     start_at: Option<i64>,
+    /// Tool routing (`http` default; `video` = yt-dlp sidecar).
+    #[serde(default)]
+    kind: TaskKind,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +70,9 @@ struct DaemonConfig {
     min_segment_size: Option<u64>,
     max_speed_bytes: Option<u64>,
     default_download_dir: Option<PathBuf>,
+    /// Where the yt-dlp sidecar lives for video tasks. Bare names resolve
+    /// through `PATH`; unset means the literal name `yt-dlp`.
+    ytdlp_path: Option<String>,
 }
 
 impl DaemonConfig {
@@ -92,6 +98,14 @@ impl DaemonConfig {
 
     fn min_segment_size(&self) -> u64 {
         self.min_segment_size.unwrap_or(EngineConfig::default().min_segment_size)
+    }
+
+    /// The sidecar entry point for video tasks: explicit config path or
+    /// PATH fallback.
+    fn ytdlp_path(&self) -> String {
+        self.ytdlp_path
+            .clone()
+            .unwrap_or_else(|| "yt-dlp".to_string())
     }
 }
 
@@ -305,8 +319,8 @@ impl Daemon {
 
     fn dispatch(self: &Arc<Self>, req: Request) -> Response {
         match req.cmd {
-            Command::Add { url, dest_dir, headers, start_at } => {
-                self.cmd_add(req.id, url, dest_dir, headers, start_at)
+            Command::Add { url, dest_dir, headers, start_at, kind } => {
+                self.cmd_add(req.id, url, dest_dir, headers, start_at, kind)
             }
             Command::List => self.cmd_list(req.id),
             Command::Pause { id } => self.cmd_pause(req.id, &id),
@@ -326,18 +340,19 @@ impl Daemon {
         dest_dir: Option<PathBuf>,
         headers: std::collections::HashMap<String, String>,
         start_at: Option<i64>,
+        kind: TaskKind,
     ) -> Response {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
         let dest_dir = dest_dir
             .or_else(|| self.config.default_download_dir.clone())
             .or_else(default_download_dir);
-        // Idempotency: the same URL into the same destination must not
+        // Idempotency: the same URL, tool and destination must not
         // double-download into one file (sidecar trample = corrupt output).
         // Re-adding shares the existing task instead.
         {
             let records = self.records.lock().unwrap();
-            if let Some(id) = duplicate_task(&records, &url, &dest_dir) {
+            if let Some(id) = duplicate_task(&records, &url, &dest_dir, kind) {
                 return Response {
                     id: req_id,
                     reply: Reply::Added { id },
@@ -353,6 +368,7 @@ impl Daemon {
             error: None,
             headers,
             start_at,
+            kind,
         };
         {
             let mut records = self.records.lock().unwrap();
@@ -372,9 +388,9 @@ impl Daemon {
         let tasks = records
             .iter()
             .map(|r| {
-                let (downloaded, total, speed_bps) = match progress.get(&r.id) {
-                    Some(t) => (t.last.downloaded, t.last.total, t.speed),
-                    None => (0, None, None),
+                 let (downloaded, total, speed_bps, percent) = match progress.get(&r.id) {
+                    Some(t) => (t.last.downloaded, t.last.total, t.speed, t.last.percent),
+                    None => (0, None, None, None),
                 };
                 TaskInfo {
                     id: r.id.clone(),
@@ -386,6 +402,8 @@ impl Daemon {
                     speed_bps,
                     error: r.error.clone(),
                     start_at: r.start_at,
+                    kind: r.kind,
+                    percent,
                 }
             })
             .collect();
@@ -514,32 +532,52 @@ impl Daemon {
 
             this.set_state(&rec.id, TaskState::Running, None);
 
-            // Per-task engine: daemon policy (config.json) sets the defaults;
-            // task headers live on the client and always override. Both the
-            // probe and every segment carry them.
-            let engine = {
-                let cfg = EngineConfig {
-                    max_segments: this.config.max_segments(),
-                    min_segment_size: this.config.min_segment_size(),
-                    max_speed: this.config.max_speed_bytes,
-                    headers: rec.headers.clone(),
-                    ..EngineConfig::default()
-                };
-                match Engine::new(cfg) {
-                    Ok(engine) => Arc::new(engine),
-                    Err(e) => {
-                        this.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
-                        return;
-                    }
-                }
-            };
             let on_progress_this = Arc::clone(&this);
             let on_progress_id = rec.id.clone();
-            let result = engine
-                .download(&rec.url, rec.dest_dir.clone(), token, move |p| {
-                    on_progress_this.on_progress(&on_progress_id, p)
-                })
-                .await;
+            let on_progress = move |p| on_progress_this.on_progress(&on_progress_id, p);
+
+            // Route by tool: HTTP gets the multi-segment engine, video gets
+            // the yt-dlp sidecar. Both feed the same progress stream and
+            // the same pause/cancel semantics.
+            let result = match rec.kind {
+                TaskKind::Video => {
+                    let cfg = ripdl_core::hunt::HuntConfig {
+                        id: rec.id.clone(),
+                        program: this.config.ytdlp_path(),
+                        url: rec.url.clone(),
+                        dest_dir: rec.dest_dir.clone().unwrap_or_default(),
+                        headers: rec.headers.clone(),
+                    };
+                    ripdl_core::hunt::download(cfg, &token, on_progress)
+                        .await
+                        .map(|_out| ())
+                }
+                TaskKind::Http => {
+                    // Per-task engine: daemon policy (config.json) sets the
+                    // defaults; task headers live on the client and always
+                    // override. Both the probe and every segment carry them.
+                    let engine = {
+                        let cfg = EngineConfig {
+                            max_segments: this.config.max_segments(),
+                            min_segment_size: this.config.min_segment_size(),
+                            max_speed: this.config.max_speed_bytes,
+                            headers: rec.headers.clone(),
+                            ..EngineConfig::default()
+                        };
+                        match Engine::new(cfg) {
+                            Ok(engine) => Arc::new(engine),
+                            Err(e) => {
+                                this.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
+                                return;
+                            }
+                        }
+                    };
+                    engine
+                        .download(&rec.url, rec.dest_dir.clone(), token, on_progress)
+                        .await
+                        .map(|_dest| ())
+                }
+            };
 
             this.runtime.lock().unwrap().remove(&rec.id);
             match result {
@@ -579,12 +617,20 @@ impl Daemon {
             at: Instant::now(),
         });
         let now = Instant::now();
-        let dt = now.duration_since(entry.at).as_secs_f64().max(0.05);
-        let inst = ((p.downloaded as f64 - entry.last.downloaded as f64) / dt).clamp(0.0, 1.0e12);
-        entry.speed = Some(match entry.speed {
-            Some(s) => 0.7 * inst + 0.3 * s,
-            None => inst,
-        });
+        match p.percent {
+            // Byte-free progress (video sidecar): percent only, no speed.
+            Some(_) => entry.speed = None,
+            None => {
+                let dt = now.duration_since(entry.at).as_secs_f64().max(0.05);
+                let inst =
+                    ((p.downloaded as f64 - entry.last.downloaded as f64) / dt)
+                        .clamp(0.0, 1.0e12);
+                entry.speed = Some(match entry.speed {
+                    Some(s) => 0.7 * inst + 0.3 * s,
+                    None => inst,
+                });
+            }
+        }
         entry.last = p;
         entry.at = now;
     }
@@ -604,16 +650,17 @@ fn default_download_dir() -> Option<PathBuf> {
     dirs::download_dir().or_else(dirs::home_dir)
 }
 
-/// Idempotency guard: the same URL into the same destination must not
+/// Idempotency guard: the same URL, tool and destination must not
 /// double-download into one file (sidecar trample = corrupt output).
 fn duplicate_task(
     records: &[TaskRecord],
     url: &str,
     dest_dir: &Option<PathBuf>,
+    kind: TaskKind,
 ) -> Option<String> {
     records
         .iter()
-        .find(|r| &r.url == url && &r.dest_dir == dest_dir)
+        .find(|r| r.kind == kind && &r.url == url && &r.dest_dir == dest_dir)
         .map(|r| r.id.clone())
 }
 
@@ -647,20 +694,27 @@ mod tests {
             error: None,
             headers: std::collections::HashMap::new(),
             start_at: None,
+            kind: TaskKind::Http,
         }
     }
 
     #[test]
-    fn duplicate_found_for_same_url_and_dest() {
+    fn duplicate_found_for_same_url_dest_and_kind() {
         let records = vec![rec("a", "https://x/f.zip", Some("C:\\dl"))];
-        assert_eq!(duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\dl"))), Some("a".into()));
+        assert_eq!(
+            duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\dl")), TaskKind::Http),
+            Some("a".into())
+        );
+        // Different tool does not collide (a video hunt of the same URL is a
+        // separate artifact).
+        assert!(duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\dl")), TaskKind::Video).is_none());
     }
 
     #[test]
     fn no_duplicate_for_different_dest() {
         let records = vec![rec("a", "https://x/f.zip", Some("C:\\dl"))];
-        assert!(duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\other"))).is_none());
-        assert!(duplicate_task(&records, "https://x/g.zip", &Some(PathBuf::from("C:\\dl"))).is_none());
+        assert!(duplicate_task(&records, "https://x/f.zip", &Some(PathBuf::from("C:\\other")), TaskKind::Http).is_none());
+        assert!(duplicate_task(&records, "https://x/g.zip", &Some(PathBuf::from("C:\\dl")), TaskKind::Http).is_none());
     }
 
     #[test]

@@ -30,6 +30,9 @@ pub enum Command {
         /// The runner holds the task Queued until then.
         #[serde(default)]
         start_at: Option<i64>,
+        /// Tool routing: `http` (default) or `video` (yt-dlp sidecar).
+        #[serde(default)]
+        kind: crate::task::TaskKind,
     },
     List,
     Pause {
@@ -79,4 +82,10 @@ pub struct TaskInfo {
     /// Unix seconds when the task may start (None = immediately).
     #[serde(default)]
     pub start_at: Option<i64>,
+    /// Tool routing (`http` default; `video` = yt-dlp sidecar).
+    #[serde(default)]
+    pub kind: crate::task::TaskKind,
+    /// Percent for tasks whose byte totals are unknown (video).
+    #[serde(default)]
+    pub percent: Option<f64>,
 }
