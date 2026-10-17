@@ -98,6 +98,8 @@ enum Cmd {
         #[arg(long = "files")]
         files: bool,
     },
+    /// Torrent details for one task: files, peers, trackers.
+    Details { id: String },
     /// Stop the daemon.
     Stop,
     /// Register this binary as the browser's native messaging host
@@ -205,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
+        Cmd::Details { id } => rpc(Command::Details { id }).await,
         Cmd::Stop => rpc(Command::Shutdown).await,
     }
 }
@@ -231,6 +234,28 @@ async fn rpc(cmd: Command) -> anyhow::Result<()> {
         Reply::Ok => println!("ok"),
         Reply::Added { id } => println!("queued: {id}"),
         Reply::Error { message } => bail!("{message}"),
+        Reply::TorrentDetails { details } => {
+            println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));
+            println!("hash: {}", details.info_hash);
+            if let Some(root) = &details.root {
+                println!("root: {}", root.display());
+            }
+            println!("state: {} ({} B / {} B)", if details.finished { "finished" } else { "running" }, details.downloaded, details.total);
+            if !details.trackers.is_empty() {
+                println!("trackers:");
+                for t in &details.trackers { println!("  {t}"); }
+            }
+            if !details.files.is_empty() {
+                println!("files:");
+                for f in &details.files {
+                    println!("  {:>9} {:>3}  {}", humans(f.size), if f.included { "yes" } else { "no " }, f.name);
+                }
+            }
+            println!("peers: {} connected", details.peers.len());
+            for p in details.peers.iter().take(12) {
+                println!("  {:>21} {:>12} {:<28} dl {:>12} ul {:>12}", p.addr, p.state, p.client.clone().unwrap_or_default(), p.downloaded, p.uploaded);
+            }
+        }
         Reply::Tasks { tasks } => {
             println!("{:<38} {:<10} {:>16} {:>12}", "ID", "STATE", "PROGRESS", "SPEED");
             let now = now_unix();

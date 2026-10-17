@@ -41,6 +41,12 @@ struct TaskRecord {
     downloaded: u64,
     #[serde(default)]
     total: Option<u64>,
+    /// Torrent identity + display name, recorded as soon as the engine
+    /// manages the torrent (details queries, friendly row titles).
+    #[serde(default)]
+    info_hash: Option<String>,
+    #[serde(default)]
+    torrent_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -318,7 +324,7 @@ impl Daemon {
                 continue;
             }
             let resp = match serde_json::from_str::<Request>(&line) {
-                Ok(req) => self.dispatch(req),
+                Ok(req) => self.dispatch(req).await,
                 Err(e) => Response {
                     id: 0,
                     reply: Reply::Error { message: format!("bad request: {e}") },
@@ -331,12 +337,13 @@ impl Daemon {
         Ok(())
     }
 
-    fn dispatch(self: &Arc<Self>, req: Request) -> Response {
+    async fn dispatch(self: &Arc<Self>, req: Request) -> Response {
         match req.cmd {
             Command::Add { url, dest_dir, headers, start_at, kind } => {
                 self.cmd_add(req.id, url, dest_dir, headers, start_at, kind)
             }
             Command::List => self.cmd_list(req.id),
+            Command::Details { id } => self.cmd_torrent_details(req.id, &id).await,
             Command::Pause { id } => self.cmd_pause(req.id, &id),
             Command::Resume { id } => self.cmd_resume(req.id, &id),
             Command::Remove { id, delete_files } => {
@@ -388,6 +395,8 @@ impl Daemon {
             dest_file: None,
             downloaded: 0,
             total: None,
+            info_hash: None,
+            torrent_name: None,
         };
         {
             let mut records = self.records.lock().unwrap();
@@ -398,6 +407,45 @@ impl Daemon {
         }
         self.spawn_runner(rec);
         Response { id: req_id, reply: Reply::Added { id } }
+    }
+
+    /// Torrent details: match the task's recorded info-hash against the
+    /// session's managed torrents and snapshot files/peers/trackers.
+    async fn cmd_torrent_details(&self, req_id: u64, id: &str) -> Response {
+        let reply: Result<Reply, String> = async {
+            let record = {
+                let records = self.records.lock().unwrap();
+                records
+                    .iter()
+                    .find(|r| r.id == id)
+                    .cloned()
+                    .ok_or_else(|| "task not found".to_string())?
+            };
+            if record.kind != TaskKind::Torrent {
+                return Err("task is not a torrent".into());
+            }
+            let session = {
+                let guard = self.torrents.lock().await;
+                match guard.as_ref() {
+                    Some(s) => Arc::clone(s),
+                    None => return Err("torrent session not running".into()),
+                }
+            };
+            let hash = record
+                .info_hash
+                .clone()
+                .ok_or_else(|| "torrent not yet resolved (no metadata yet?)".to_string())?;
+            session
+                .details(&hash)
+                .map_err(|e| e.to_string())
+                .map(|d| Reply::TorrentDetails { details: d })
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
     }
 
     fn cmd_list(&self, req_id: u64) -> Response {
@@ -424,6 +472,8 @@ impl Daemon {
                     kind: r.kind,
                     percent,
                     dest_file: r.dest_file.clone(),
+                    name: r.torrent_name.clone(),
+                    info_hash: r.info_hash.clone(),
                 }
             })
             .collect();
@@ -616,9 +666,31 @@ impl Daemon {
                         }),
                         only_files: None,
                     };
-                    ripdl_core::torrent::download(&session, &cfg, &token, on_progress)
-                        .await
-                        .map(|out| Some(out.root))
+                    ripdl_core::torrent::download(&session, &cfg, &token, on_progress, {
+                        // Identity lands here the moment the engine manages
+                        // the torrent; persist it for details queries and
+                        // friendly row titles.
+                        let this = Arc::clone(&this);
+                        let task_id = rec.id.clone();
+                        move |meta| {
+                            let snapshot = {
+                                let mut records = this.records.lock().unwrap();
+                                if let Some(r) = records.iter_mut().find(|r| r.id == task_id) {
+                                    r.info_hash = Some(meta.info_hash.clone());
+                                    r.torrent_name = meta.name.clone();
+                                    // Adopt the root early so delete_files
+                                    // works on partial torrents too.
+                                    if r.dest_file.is_none() {
+                                        r.dest_file = Some(meta.root.clone());
+                                    }
+                                }
+                                records.clone()
+                            };
+                            let _ = this.persist(&snapshot);
+                        }
+                    })
+                    .await
+                    .map(|out| Some(out.root))
                 }
                 TaskKind::Http => {
                     // Per-task engine: daemon policy (config.json) sets the
@@ -778,7 +850,7 @@ fn default_download_dir() -> Option<PathBuf> {
 /// paths it deleted; best effort, never fails the removal.
 fn delete_artifacts(rec: &TaskRecord) -> Vec<PathBuf> {
     let mut deleted = Vec::new();
-    let mut remove_file = |p: &std::path::Path, out: &mut Vec<PathBuf>| {
+    let remove_file = |p: &std::path::Path, out: &mut Vec<PathBuf>| {
         if std::fs::remove_file(p).is_ok() {
             out.push(p.to_path_buf());
         }
@@ -869,6 +941,8 @@ mod tests {
             dest_file: None,
             downloaded: 0,
             total: None,
+            info_hash: None,
+            torrent_name: None,
         }
     }
 
@@ -966,6 +1040,8 @@ mod tests {
             dest_file: Some(out.clone()),
             downloaded: 4,
             total: Some(4),
+            info_hash: None,
+            torrent_name: None,
         };
         let deleted = delete_artifacts(&rec);
 
@@ -995,6 +1071,8 @@ mod tests {
             dest_file: None,
             downloaded: 0,
             total: None,
+            info_hash: None,
+            torrent_name: None,
         };
         assert!(delete_artifacts(&rec).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);

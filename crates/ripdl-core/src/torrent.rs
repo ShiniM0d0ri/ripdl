@@ -16,6 +16,7 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, TorrentStats,
     TorrentStatsState,
 };
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
@@ -34,10 +35,11 @@ pub struct TorrentConfig {
 
 /// Disk artifacts of a finished torrent: the torrent's root (the file
 /// itself for single-file payloads, `<dest_dir>/<name>` for multi-file
-/// ones, per rqbit's own layout).
+/// ones, per rqbit's own layout) plus its identity.
 #[derive(Debug, Clone)]
 pub struct TorrentOutput {
     pub root: PathBuf,
+    pub info_hash: String,
 }
 
 /// Result of `ensure`: the managed handle plus the guaranteed
@@ -47,6 +49,57 @@ pub struct Ensured {
     /// `<dest_dir>/<display name>`: single-file torrents put their file
     /// right there, multi-file ones fill the folder.
     pub root: PathBuf,
+}
+
+/// Identity facts surfaced as soon as the torrent is managed (works even
+/// before metadata arrives: the info-hash is known from the payload).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentMeta {
+    pub info_hash: String,
+    /// Display name if known at this point (magnet `dn=`, metainfo parse,
+    /// or library metadata once fetched).
+    pub name: Option<String>,
+    /// Task-owned artifact root computed for this task.
+    pub root: PathBuf,
+}
+
+/// One row of the Files tab.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentFileSnapshot {
+    /// Relative path inside the task root (joined components).
+    pub name: String,
+    pub size: u64,
+    /// Bytes verified on disk for this file.
+    pub downloaded: u64,
+    /// Is this file part of the current `only_files` selection?
+    pub included: bool,
+}
+
+/// One row of the Peers tab (rqbit exposes counters per peer, not
+/// instantaneous dw/up speeds).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentPeerSnapshot {
+    pub addr: String,
+    pub client: Option<String>,
+    /// rqbit peer state name ("Live", "Connecting", ...).
+    pub state: String,
+    pub downloaded: u64,
+    pub uploaded: u64,
+}
+
+/// Everything the details dialog / `details` CLI command needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentDetailsSnapshot {
+    pub info_hash: String,
+    pub name: Option<String>,
+    pub root: Option<PathBuf>,
+    pub total: u64,
+    pub downloaded: u64,
+    pub finished: bool,
+    pub paused: bool,
+    pub files: Vec<TorrentFileSnapshot>,
+    pub peers: Vec<TorrentPeerSnapshot>,
+    pub trackers: Vec<String>,
 }
 
 /// Does a user-supplied payload look like a torrent (auto-detection for
@@ -260,20 +313,118 @@ impl TorrentSession {
     pub async fn pause(&self, h: &Arc<ManagedTorrent>) {
         let _ = self.session.pause(h).await;
     }
+
+    /// Snapshot hash of every managed torrent, keyed by info-hash. Frontends
+    /// match these against their records.
+    pub fn list_torrents(&self) -> Vec<String> {
+        self.session
+            .with_torrents(|torrents| torrents.map(|(_, t)| t.info_hash().as_string()).collect())
+    }
+
+    /// Full details for one managed torrent, found by info-hash.
+    pub fn details(&self, info_hash_hex: &str) -> Result<TorrentDetailsSnapshot> {
+        // Details come straight off the library: TorrentStats for totals,
+        // per-file details from the metainfo, per-peer counters via Api.
+        let found = self
+            .session
+            .with_torrents(|torrents| {
+                torrents
+                    .map(|(_, t)| Arc::clone(t))
+                    .find(|t| t.info_hash().as_string() == info_hash_hex)
+            });
+        let handle = found.ok_or_else(|| {
+            Error::State(format!("no managed torrent with hash {info_hash_hex}"))
+        })?;
+
+        let st = handle.stats();
+        let mut snapshot = TorrentDetailsSnapshot {
+            info_hash: handle.info_hash().as_string(),
+            name: handle.name(),
+            root: Some(handle.output_folder().to_path_buf()),
+            total: st.total_bytes,
+            downloaded: st.progress_bytes,
+            finished: st.finished,
+            paused: matches!(st.state, TorrentStatsState::Paused),
+            files: Vec::new(),
+            peers: Vec::new(),
+            trackers: {
+                let mut v: Vec<String> = handle
+                    .shared()
+                    .trackers
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect();
+                v.sort();
+                v
+            },
+        };
+
+        // Files + per-file progress (file_progress lines up with the
+        // metadata file order).
+        let wanted = handle.only_files();
+        if let Ok(files) = handle.with_metadata(|meta| {
+            meta.info
+                .iter_file_details()
+                .enumerate()
+                .map(|(idx, d)| TorrentFileSnapshot {
+                    name: d.filename.to_string(),
+                    size: d.len,
+                    downloaded: st.file_progress.get(idx).copied().unwrap_or(0),
+                    included: wanted.as_deref().map(|o| o.contains(&idx)).unwrap_or(true),
+                })
+                .collect::<Vec<_>>()
+        }) {
+            snapshot.files = files;
+        }
+
+        // Peers: grab state + counters from the library Api (the filter
+        // type lives in a private module; Default::default() names nothing).
+        let api = librqbit::Api::new(self.session.clone(), None);
+        if let Ok(snap) = api.api_peer_stats(
+            librqbit::api::TorrentIdOrHash::Hash(handle.info_hash()),
+            Default::default(),
+        ) {
+            let mut peers: Vec<TorrentPeerSnapshot> = snap
+                .peers
+                .into_iter()
+                .map(|(addr, p)| TorrentPeerSnapshot {
+                    addr,
+                    client: p.client_name,
+                    state: p.state.to_string(),
+                    downloaded: p.counters.fetched_bytes,
+                    uploaded: p.counters.uploaded_bytes,
+                })
+                .collect();
+            peers.sort_by(|a, b| b.downloaded.cmp(&a.downloaded));
+            snapshot.peers = peers;
+        }
+
+        Ok(snapshot)
+    }
 }
 
 /// Full run loop for one task: ensure -> sample stats every second ->
 /// cancel-aware pause. Mirrors `engine::download`'s contract exactly.
+///
+/// `on_meta` fires once right after the torrent is managed with its
+/// identity (info-hash, display name, artifact root) so callers can record
+/// it into the task record while the download is still running.
 pub async fn download(
     session: &TorrentSession,
     cfg: &TorrentConfig,
     token: &CancellationToken,
     mut on_progress: impl FnMut(Progress) + Send,
+    mut on_meta: impl FnMut(TorrentMeta) + Send,
 ) -> Result<TorrentOutput> {
     if token.is_cancelled() {
         return Err(Error::Cancelled);
     }
     let ensured = session.ensure(cfg).await?;
+    on_meta(TorrentMeta {
+        info_hash: ensured.handle.info_hash().as_string(),
+        name: ensured.handle.name(),
+        root: ensured.root.clone(),
+    });
 
     loop {
         if token.is_cancelled() {
@@ -288,7 +439,10 @@ pub async fn download(
         }
         if stats.finished {
             emit(&cfg.id, &stats, &mut on_progress);
-            return Ok(TorrentOutput { root: ensured.root });
+            return Ok(TorrentOutput {
+                root: ensured.root,
+                info_hash: ensured.handle.info_hash().as_string(),
+            });
         }
         emit(&cfg.id, &stats, &mut on_progress);
         // While only metadata fetching is happening (no bytes yet) poll a
@@ -442,6 +596,9 @@ mod tests {
             crate::torrent::download(&leech, &cfg, &token, move |p| {
                 use std::sync::atomic::Ordering::Relaxed;
                 seen2.store(p.downloaded, Relaxed);
+            }, |meta| {
+                assert_eq!(meta.root.file_name().and_then(|n| n.to_str()), Some("payload.bin"));
+                assert_eq!(meta.info_hash.len(), 40, "hex info-hash");
             }),
         )
         .await

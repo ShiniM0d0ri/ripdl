@@ -34,6 +34,11 @@ pub enum Command {
         #[serde(default)]
         kind: crate::task::TaskKind,
     },
+    /// Details for one task's torrent: files/peers/trackers snapshot.
+    /// Errors if the task is not a torrent or the session lost it.
+    Details {
+        id: String,
+    },
     List,
     Pause {
         id: String,
@@ -60,10 +65,19 @@ pub struct Response {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
-    Added { id: String },
-    Tasks { tasks: Vec<TaskInfo> },
+    Added {
+        id: String,
+    },
+    Tasks {
+        tasks: Vec<TaskInfo>,
+    },
+    TorrentDetails {
+        details: crate::torrent::TorrentDetailsSnapshot,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Serializable view of one task for frontends.
@@ -94,4 +108,11 @@ pub struct TaskInfo {
     /// Resolved output file after completion (for open/delete actions).
     #[serde(default)]
     pub dest_file: Option<PathBuf>,
+    /// Torrent display name once known (the payload may be a magnet with no
+    /// meaningful text; frontends show this instead of the URL).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Torrent identity (recorded as soon as the engine manages it).
+    #[serde(default)]
+    pub info_hash: Option<String>,
 }
