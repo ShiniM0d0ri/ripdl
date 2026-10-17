@@ -74,11 +74,12 @@ P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
 persistent queue, buffered writes, shared speed limiter, header/auth/cookie
 pass-through, Content-Disposition naming, duplicate-URL idempotency. 21 tests
 pass offline (`cargo test --workspace`).
-In progress: P4 browser integration — REA research done (entry 1 in
-docs/rea-findings.md); first code landed: `ripdl_core::bridge` native
-messaging host (u32-LE + JSON stdio framing -> daemon line RPC, spawns
-ripdl-daemon when absent, in-band error replies = browser fallback),
-`ripdl register-host` (manifest + HKCU keys for Chrome/Edge), MV3 extension
-skeleton `ext/` (context-menu handoff + onDeterminingFilename capture, no
-content scripts/cookie harvest). Tests: 27 pass offline.
-Backlog: scheduler, named pipe transport, daemon config file.
+In progress: P4 browser integration — REA research done; bridge +
+`register-host` + MV3 extension landed and capture verified live twice
+(temp Chrome profile -> daemon -> file). Extension now has: SW-race matching
+(700ms + content-length + initiator), correct suggest/cancel discipline,
+popup with capture toggle and OPT-IN cookie sharing (optional permission,
+off = permission revoked entirely). Original commit: "ext hardening: SW-race
+matching, suggest discipline, opt-in cookie sharing (popup + optional
+permission)". Tests: 27 pass offline. Next: selection/all-links capture
+(on-demand scripting), DNR fallback referer, then scheduler backlog.
