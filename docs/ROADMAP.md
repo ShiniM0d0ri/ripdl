@@ -19,7 +19,13 @@ Guiding rules:
 - [x] In-memory queue + auto-categorization
 - [x] Atomic sidecar writes (temp + rename)
 - [x] Retry/backoff per segment (bounded; transport errors only)
-- [ ] Integration tests against a local test HTTP server
+- [x] Integration tests against a local test HTTP server
+      (`crates/ripdl-core/tests/engine_integration.rs`: offline mock server
+      with drop-injection, no-range mode, etag switching; covers exact-byte
+      correctness, retry recovery, single-stream fallback, pause→resume from
+      sidecar, etag-change fresh restart)
+- [x] Buffered async segment writes (256 KiB blocks through the blocking
+      pool; slow disks no longer stall the network pipeline)
 
 ## P1 - daemon + persistence
 

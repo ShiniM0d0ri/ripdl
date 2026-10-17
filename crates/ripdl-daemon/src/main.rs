@@ -179,6 +179,9 @@ impl Daemon {
     }
 
     fn cmd_add(self: &Arc<Self>, req_id: u64, url: String, dest_dir: Option<PathBuf>) -> Response {
+        // Tasks without an explicit destination land in the user's Downloads
+        // folder - never in the daemon's working directory.
+        let dest_dir = dest_dir.or_else(default_download_dir);
         let id = uuid::Uuid::new_v4().to_string();
         let rec = TaskRecord {
             id: id.clone(),
@@ -395,6 +398,12 @@ async fn main() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Daemon-added tasks without an explicit `-d` land in the user's Downloads
+/// folder, falling back to the home directory - never the daemon's cwd.
+fn default_download_dir() -> Option<PathBuf> {
+    dirs::download_dir().or_else(dirs::home_dir)
 }
 
 async fn real_main() -> Result<()> {

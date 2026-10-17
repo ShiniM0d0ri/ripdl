@@ -20,6 +20,7 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | Resume (sidecar state file) | ✅ core |
 | Per-segment retry + backoff | ✅ core |
 | Cancellation | ✅ core |
+| Failure-injection integration tests (offline) | ✅ core |
 | CLI (`ripdl download`, `ripdl info`) | ✅ |
 | Queue with concurrency limits | ✅ core + daemon-persisted |
 | Auto-categorization by file type | ✅ core |

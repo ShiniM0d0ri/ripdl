@@ -1,7 +1,6 @@
 mod planner;
 pub mod retry;
 
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +16,10 @@ use crate::task::{Progress, SegmentState, TaskState, TaskStateFile};
 
 /// Sentinel end offset for "unknown total size, stream to the end".
 const UNBOUNDED: u64 = u64::MAX;
+
+/// Write buffer per segment: syscalls drop ~64x and disks can't stall the
+/// network pipeline.
+const SEGMENT_BUF: usize = 256 * 1024;
 
 /// Tunables for the download engine.
 #[derive(Debug, Clone)]
@@ -309,8 +312,11 @@ async fn run_segment(
     }
 }
 
-/// One attempt at fetching a segment. Advances `cells[index].done` as bytes
-/// land so a retry (or a crash) resumes from the last written offset.
+/// One attempt at fetching a segment. Bytes are buffered and written at their
+/// absolute file positions via the blocking pool, so slow disks cannot stall
+/// the network pipeline; `cells[index].done` advances only for flushed bytes,
+/// so a retry (or a crash) resumes from the last durable offset.
+#[allow(unused_assignments)] // final-flush stores are intentionally dead
 async fn segment_attempt(
     client: &reqwest::Client,
     url: &str,
@@ -321,8 +327,12 @@ async fn segment_attempt(
     downloaded: &Arc<AtomicU64>,
     token: &CancellationToken,
 ) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new().create(true).write(true).open(dest)?;
-    file.seek(SeekFrom::Start(seg.start + seg.done))?;
+    let mut file: Option<std::fs::File> = Some(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(dest)?,
+    );
 
     let mut req = client.get(url);
     if seg.end != UNBOUNDED {
@@ -337,7 +347,43 @@ async fn segment_attempt(
     }
 
     let mut stream = req.send().await?.error_for_status()?.bytes_stream();
+    let mut pos = seg.start + seg.done;
     let mut seg_done = seg.done;
+    let mut buf: Vec<u8> = Vec::with_capacity(SEGMENT_BUF + 1024);
+
+    macro_rules! flush {
+        () => {
+            if !buf.is_empty() {
+                let mut handle = file.take().expect("segment file handle");
+                let block = std::mem::take(&mut buf);
+                let pos_abs = pos;
+                let (handle, block, flushed) = tokio::task::spawn_blocking(move || {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut flushed = 0usize;
+                    if handle.seek(SeekFrom::Start(pos_abs)).is_ok()
+                        && handle.write_all(&block).is_ok()
+                    {
+                        flushed = block.len();
+                    }
+                    (handle, block, flushed)
+                })
+                .await
+                .expect("blocking pool join");
+
+                if flushed != block.len() {
+                    return Err(std::io::Error::other("segment file write failed").into());
+                }
+                pos += flushed as u64;
+                seg_done += flushed as u64;
+                downloaded.fetch_add(flushed as u64, Ordering::Relaxed);
+                cells.lock().expect("state cells")[seg.index].done = seg_done;
+
+                file = Some(handle);
+                buf = block;
+                buf.clear();
+            }
+        };
+    }
 
     loop {
         let chunk = tokio::select! {
@@ -347,12 +393,13 @@ async fn segment_attempt(
                 None => break,
             },
         };
-        file.write_all(&chunk)?;
-        seg_done += chunk.len() as u64;
-        downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        cells.lock().expect("state cells")[seg.index].done = seg_done;
+
+        buf.extend_from_slice(&chunk);
+        if buf.len() >= SEGMENT_BUF {
+            flush!();
+        }
     }
-    file.flush()?;
+    flush!();
 
     // Server ended the stream early: count as a retryable transport fault.
     if seg.end != UNBOUNDED && seg_done < seg.end + 1 - seg.start {
