@@ -32,6 +32,9 @@ struct TaskRecord {
     /// Tool routing (`http` default; `video` = yt-dlp sidecar).
     #[serde(default)]
     kind: TaskKind,
+    /// Resolved output file once a tool produced one (completion-time).
+    #[serde(default)]
+    dest_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -325,7 +328,9 @@ impl Daemon {
             Command::List => self.cmd_list(req.id),
             Command::Pause { id } => self.cmd_pause(req.id, &id),
             Command::Resume { id } => self.cmd_resume(req.id, &id),
-            Command::Remove { id } => self.cmd_remove(req.id, &id),
+            Command::Remove { id, delete_files } => {
+                self.cmd_remove(req.id, &id, delete_files)
+            }
             Command::Shutdown => {
                 self.shutdown.notify_waiters();
                 Response { id: req.id, reply: Reply::Ok }
@@ -369,6 +374,7 @@ impl Daemon {
             headers,
             start_at,
             kind,
+            dest_file: None,
         };
         {
             let mut records = self.records.lock().unwrap();
@@ -404,6 +410,7 @@ impl Daemon {
                     start_at: r.start_at,
                     kind: r.kind,
                     percent,
+                    dest_file: r.dest_file.clone(),
                 }
             })
             .collect();
@@ -466,17 +473,25 @@ impl Daemon {
         }
     }
 
-    fn cmd_remove(self: &Arc<Self>, req_id: u64, id: &str) -> Response {
+    fn cmd_remove(self: &Arc<Self>, req_id: u64, id: &str, delete_files: bool) -> Response {
         let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
         if let Some(t) = token {
             t.cancel();
         }
-        {
+        let evicted = {
             let mut records = self.records.lock().unwrap();
-            records.retain(|r| r.id != id);
+            let Some(pos) = records.iter().position(|r| r.id == id) else {
+                return Response { id: req_id, reply: Reply::Ok };
+            };
+            let rec = records.remove(pos);
             let snapshot = records.clone();
             drop(records);
             let _ = self.persist(&snapshot);
+            rec
+        };
+        if delete_files {
+            let removed = delete_artifacts(&evicted);
+            tracing::info!(id = id, files = removed.len(), "deleted task files");
         }
         self.progress.lock().unwrap().remove(id);
         Response { id: req_id, reply: Reply::Ok }
@@ -538,7 +553,8 @@ impl Daemon {
 
             // Route by tool: HTTP gets the multi-segment engine, video gets
             // the yt-dlp sidecar. Both feed the same progress stream and
-            // the same pause/cancel semantics.
+            // the same pause/cancel semantics; both hand back the produced
+            // file (for "open file"/"delete files" and clean removal).
             let result = match rec.kind {
                 TaskKind::Video => {
                     let cfg = ripdl_core::hunt::HuntConfig {
@@ -550,7 +566,7 @@ impl Daemon {
                     };
                     ripdl_core::hunt::download(cfg, &token, on_progress)
                         .await
-                        .map(|_out| ())
+                        .map(|out| out.file)
                 }
                 TaskKind::Http => {
                     // Per-task engine: daemon policy (config.json) sets the
@@ -575,13 +591,13 @@ impl Daemon {
                     engine
                         .download(&rec.url, rec.dest_dir.clone(), token, on_progress)
                         .await
-                        .map(|_dest| ())
+                        .map(Some)
                 }
             };
 
             this.runtime.lock().unwrap().remove(&rec.id);
             match result {
-                Ok(_dest) => this.set_state(&rec.id, TaskState::Completed, None),
+                Ok(file) => this.set_completed(&rec.id, file),
                 Err(Error::Cancelled) => this.set_state(&rec.id, TaskState::Paused, None),
                 Err(e) => this.set_state(&rec.id, TaskState::Failed, Some(e.to_string())),
             }
@@ -606,6 +622,26 @@ impl Daemon {
             // Fresh run: drop stale speed/progress from any previous attempt.
             self.progress.lock().unwrap().remove(id);
         }
+    }
+
+    /// Terminal success with the produced file, remembered for the
+    /// "open file" / "delete files" flows.
+    fn set_completed(&self, id: &str, file: Option<PathBuf>) {
+        {
+            let mut records = self.records.lock().unwrap();
+            match records.iter_mut().find(|r| r.id == id) {
+                Some(r) => {
+                    r.state = TaskState::Completed;
+                    r.error = None;
+                    r.dest_file = file;
+                }
+                None => return, // removed meanwhile: never resurrect it
+            }
+            let snapshot = records.clone();
+            drop(records);
+            let _ = self.persist(&snapshot);
+        }
+        self.progress.lock().unwrap().remove(id);
     }
 
     /// Track per-task progress and derive an EMA-smoothed speed.
@@ -648,6 +684,47 @@ async fn main() {
 /// folder, falling back to the home directory - never the daemon's cwd.
 fn default_download_dir() -> Option<PathBuf> {
     dirs::download_dir().or_else(dirs::home_dir)
+}
+
+/// Disk artifacts owned by a removed task: the known output file and its
+/// engine sidecar, plus any sidecar in the destination whose task URL
+/// matches (partial/failed runs never resolved a `dest_file`). Returns the
+/// paths it deleted; best effort, never fails the removal.
+fn delete_artifacts(rec: &TaskRecord) -> Vec<PathBuf> {
+    let mut deleted = Vec::new();
+    let mut remove_file = |p: &std::path::Path, out: &mut Vec<PathBuf>| {
+        if std::fs::remove_file(p).is_ok() {
+            out.push(p.to_path_buf());
+        }
+    };
+    if let Some(f) = &rec.dest_file {
+        remove_file(f, &mut deleted);
+        let mut sidecar = f.as_os_str().to_os_string();
+        sidecar.push(".ripdl.json");
+        remove_file(std::path::Path::new(&sidecar), &mut deleted);
+    }
+    if let Some(dir) = &rec.dest_dir {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".ripdl.json") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(entry.path()) else { continue };
+                let parsed = serde_json::from_slice::<ripdl_core::task::TaskStateFile>(&bytes);
+                match parsed {
+                    Ok(state) if state.url == rec.url => {
+                        let stem_len = name.len() - ".ripdl.json".len();
+                        let target = dir.join(&name[..stem_len]);
+                        remove_file(&target, &mut deleted);
+                        remove_file(&entry.path(), &mut deleted);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    deleted
 }
 
 /// Idempotency guard: the same URL, tool and destination must not
@@ -695,6 +772,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             start_at: None,
             kind: TaskKind::Http,
+            dest_file: None,
         }
     }
 
@@ -758,6 +836,68 @@ mod tests {
     #[test]
     fn config_garbage_is_rejected_not_panicking() {
         assert!(serde_json::from_str::<DaemonConfig>("nope").is_err());
+    }
+
+    #[test]
+    fn delete_artifacts_removes_output_sidecar_and_partials() {
+        let tmp = std::env::temp_dir().join(format!("ripdl-deltest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let out = tmp.join("file.zip");
+        let partial = tmp.join("other.zip");
+        std::fs::write(&out, b"done").unwrap();
+        std::fs::write(&partial, b"half").unwrap();
+        std::fs::write(
+            tmp.join("file.zip.ripdl.json"),
+            r#"{"id":"x","url":"https://x/file.zip","etag":null,"total":null,"state":"paused","segments":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("other.zip.ripdl.json"),
+            r#"{"id":"y","url":"https://x/other.zip","etag":null,"total":null,"state":"paused","segments":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.join("unrelated.txt"), b"keep").unwrap();
+
+        let rec = TaskRecord {
+            id: "t".into(),
+            url: "https://x/file.zip".into(),
+            dest_dir: Some(tmp.clone()),
+            state: TaskState::Paused,
+            error: None,
+            headers: Default::default(),
+            start_at: None,
+            kind: TaskKind::Http,
+            dest_file: Some(out.clone()),
+        };
+        let deleted = delete_artifacts(&rec);
+
+        assert!(!out.exists(), "output file deleted");
+        assert!(!tmp.join("file.zip.ripdl.json").exists(), "its sidecar deleted");
+        assert!(partial.exists(), "different-url task files kept");
+        assert!(tmp.join("other.zip.ripdl.json").exists(), "different-url sidecar kept");
+        assert!(tmp.join("unrelated.txt").exists(), "unrelated files kept");
+        assert_eq!(deleted.len(), 2, "out + sidecar only");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn delete_artifacts_is_safe_when_nothing_matches() {
+        let tmp = std::env::temp_dir().join(format!("ripdl-delsafe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let rec = TaskRecord {
+            id: "t".into(),
+            url: "https://x/never.seen".into(),
+            dest_dir: Some(tmp.clone()),
+            state: TaskState::Failed,
+            error: None,
+            headers: Default::default(),
+            start_at: None,
+            kind: TaskKind::Http,
+            dest_file: None,
+        };
+        assert!(delete_artifacts(&rec).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

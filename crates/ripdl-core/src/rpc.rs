@@ -43,6 +43,9 @@ pub enum Command {
     },
     Remove {
         id: String,
+        /// Also delete the downloaded file(s) from disk (default: keep them).
+        #[serde(default)]
+        delete_files: bool,
     },
     Shutdown,
 }
@@ -88,4 +91,7 @@ pub struct TaskInfo {
     /// Percent for tasks whose byte totals are unknown (video).
     #[serde(default)]
     pub percent: Option<f64>,
+    /// Resolved output file after completion (for open/delete actions).
+    #[serde(default)]
+    pub dest_file: Option<PathBuf>,
 }

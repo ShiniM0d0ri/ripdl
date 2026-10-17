@@ -55,7 +55,12 @@ Guiding rules:
 - [x] Task list: progress, speed, per-task pause/resume/cancel (`ripdl-gui`,
       IDM-style: toolbar, category sidebar, grid with inline progress bars,
       context menu, status bar; auto-spawns the daemon on first poll)
-- [x] Add-URL dialog (`add_task` command + URL/category form)
+- [x] Add-URL dialog (`add_task` command + URL/category form, per-task
+      "Save to" location with native folder browser, hunt toggle)
+- [x] Location + file management: per-row destination display, open
+      file/folder, remove-with-files (`Remove { delete_files }`, sidecar-aware,
+      `rm --files` in the CLI); GUI rows re-render only on real changes and
+      daemon auto-spawn is rate-limited
 - [ ] Settings: category folders, segment count, concurrency
 - [ ] System tray + minimize-to-tray
 

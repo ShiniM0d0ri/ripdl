@@ -6,11 +6,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use ripdl_core::categories::categorize;
 use ripdl_core::bridge;
+use ripdl_core::categories::categorize;
 use ripdl_core::engine::percent_decode_lossy;
 use ripdl_core::rpc::{Command, Reply, Request, Response, TaskInfo};
 use ripdl_core::transport;
+use ripdl_core::task::TaskKind;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 /// One-shot RPC round trip against the daemon, with a single
@@ -90,19 +91,49 @@ async fn list_tasks() -> Result<Vec<TaskInfo>, String> {
     }
 }
 
+/// Queue a URL. `dest_dir` overrides the location entirely (the Add dialog
+/// passes an explicit user choice); otherwise category rules apply.
 #[tauri::command]
-async fn add_task(url: String, category: Option<String>) -> Result<String, String> {
-    let mut dest = download_root();
-    if let Some(sub) = category_subdir_for(&url, category.as_deref()) {
-        dest.push(sub);
-    }
+async fn add_task(url: String, category: Option<String>, dest_dir: Option<String>) -> Result<String, String> {
+    let dest = match dest_dir {
+        Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
+        _ => {
+            let mut d = download_root();
+            if let Some(sub) = category_subdir_for(&url, category.as_deref()) {
+                d.push(sub);
+            }
+            d
+        }
+    };
     let _ = tokio::fs::create_dir_all(&dest).await;
     match rpc(Command::Add {
         url,
         dest_dir: Some(dest),
         headers: Default::default(),
         start_at: None,
-        kind: ripdl_core::task::TaskKind::Http,
+        kind: TaskKind::Http,
+    })
+    .await?
+    {
+        Reply::Added { id } => Ok(id),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+/// Queue a video/stream page through the yt-dlp sidecar.
+#[tauri::command]
+async fn add_video_task(url: String, dest_dir: Option<String>) -> Result<String, String> {
+    let dest = match dest_dir {
+        Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
+        _ => download_root(),
+    };
+    let _ = tokio::fs::create_dir_all(&dest).await;
+    match rpc(Command::Add {
+        url,
+        dest_dir: Some(dest),
+        headers: Default::default(),
+        start_at: None,
+        kind: TaskKind::Video,
     })
     .await?
     {
@@ -121,9 +152,79 @@ async fn resume_task(id: String) -> Result<(), String> {
     expect_ok(rpc(Command::Resume { id }).await?)
 }
 
+/// Remove the queue record; `delete_files` also erases the downloaded
+/// file(s) and their sidecars from disk.
 #[tauri::command]
-async fn remove_task(id: String) -> Result<(), String> {
-    expect_ok(rpc(Command::Remove { id }).await?)
+async fn remove_task(id: String, delete_files: Option<bool>) -> Result<(), String> {
+    expect_ok(
+        rpc(Command::Remove {
+            id,
+            delete_files: delete_files.unwrap_or(false),
+        })
+        .await?,
+    )
+}
+
+/// Native directory picker for the Add dialog's "Save to" field.
+#[tauri::command]
+async fn pick_dir() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Choose download folder")
+            .pick_folder()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Open the task's folder (or reveal the completed file in it).
+#[tauri::command]
+async fn open_path(path: String, reveal: Option<String>) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.exists() {
+        return Err(format!("path does not exist: {path}"));
+    }
+    tokio::task::spawn_blocking(move || open_in_explorer(p, reveal))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(windows)]
+fn open_in_explorer(p: std::path::PathBuf, reveal: Option<String>) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("explorer.exe");
+    match reveal {
+        // /select,<file> reveals the exact file inside its folder.
+        Some(f) => {
+            let full = p.join(&f);
+            if full.exists() {
+                cmd.arg(format!("/select,{}", full.display()));
+            } else {
+                cmd.arg(&p);
+            }
+        }
+        None => {
+            cmd.arg(&p);
+        }
+    }
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn open_in_explorer(p: std::path::PathBuf, _reveal: Option<String>) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(p)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn download_root_path() -> String {
+    download_root().to_string_lossy().into_owned()
 }
 
 fn expect_ok(reply: Reply) -> Result<(), String> {
@@ -139,9 +240,13 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_tasks,
             add_task,
+            add_video_task,
             pause_task,
             resume_task,
-            remove_task
+            remove_task,
+            pick_dir,
+            open_path,
+            download_root_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running ripdl gui");

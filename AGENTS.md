@@ -99,14 +99,12 @@ IDM-style task manager over daemon RPC (`list_tasks`/`add_task`/pause/
 resume/remove commands, static frontend embedded at build time, no bundler;
 auto-spawns the daemon like the bridge). P4 extension stays live; hunt
 offers from the popup are the remaining P4 thread.
-41 tests pass offline (`cargo test --workspace`).
-In progress: P4 browser integration — REA research done; bridge +
-`register-host` + MV3 extension landed and capture verified live twice
-(temp Chrome profile -> daemon -> file). Extension now has: SW-race matching
-(700ms + content-length + initiator), correct suggest/cancel discipline,
-popup with capture toggle and OPT-IN cookie sharing (optional permission,
-off = permission revoked entirely), selection/all-links capture via
-on-demand scripting, 256 KiB seize floor. Tests: 34 pass offline.
+43 tests pass offline (`cargo test --workspace`).
+In progress: P2 GUI polish — basic file management landed (per-task "Save to"
+with native browse, per-row location display, open file/folder via Explorer
+`/select`, `remove_task(delete_files)` with sidecar-aware disk cleanup,
+`rm --files` CLI flag, GUI render-on-change, spawn rate limit in the bridge);
+remaining P2: settings panel (daemon config) + tray.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), video/stream hunt mode, per-task quota polish,

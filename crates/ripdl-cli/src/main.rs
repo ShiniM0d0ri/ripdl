@@ -89,7 +89,12 @@ enum Cmd {
     /// Resume a paused or failed task.
     Resume { id: String },
     /// Remove a task from the queue.
-    Rm { id: String },
+    Rm {
+        id: String,
+        /// Also delete the downloaded file(s) from disk (default: keep).
+        #[arg(long = "files")]
+        files: bool,
+    },
     /// Stop the daemon.
     Stop,
     /// Register this binary as the browser's native messaging host
@@ -192,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Ls => rpc(Command::List).await,
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
-        Cmd::Rm { id } => rpc(Command::Remove { id }).await,
+        Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
         Cmd::Stop => rpc(Command::Shutdown).await,
     }
 }

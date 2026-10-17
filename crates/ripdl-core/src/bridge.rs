@@ -201,7 +201,23 @@ fn talk(config: &BridgeConfig, rpc_seq: &mut u64, cmd: &Command) -> Result<Reply
 /// detached and window-less. Best effort: failure is fine, the caller already
 /// reports "daemon unreachable" after exhausting retries. Shared by the
 /// native-messaging bridge and the GUI shell.
+///
+/// Rate-limited: second-guessing pollers (GUI) retry every second, and while
+/// an old daemon is still shutting its ports down each retry would launch
+/// another process that only binds and dies. One spawn attempt at most per
+/// rate-limit window.
 pub fn spawn_daemon_bg() -> Result<()> {
+    const RESPAWN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+    static LAST_SPAWN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut last = LAST_SPAWN.lock().unwrap();
+        if let Some(t) = *last {
+            if t.elapsed() < RESPAWN_COOLDOWN {
+                return Err(Error::State("spawn rate-limited".to_string()));
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
     let exe = std::env::current_exe()?;
     let dir = exe
         .parent()

@@ -20,7 +20,7 @@
     <button id="btn-stop-all" class="tb-btn" title="Pause all running">
       <span class="tb-ico amber">&#9646;&#8709;</span><span>Stop All</span>
     </button>
-    <button id="btn-clear-done" class="tb-btn" title="Remove completed tasks from the list">
+    <button id="btn-clear-done" class="tb-btn" title="Remove completed tasks from the list (files stay on disk)">
       <span class="tb-ico gray">&#10005;</span><span>Clear Done</span>
     </button>
   </div>
@@ -73,6 +73,12 @@
           <option value="programs">Programs</option>
           <option value="other">Other (no subfolder)</option>
         </select>
+        <label class="chk"><input type="checkbox" id="dlg-hunt" /> Video/stream page (hunt via yt-dlp)</label>
+      </div>
+      <div class="dlg-row">
+        <label for="dlg-dest">Save to</label>
+        <input id="dlg-dest" type="text" placeholder="&lt;your downloads folder&gt;" />
+        <button id="dlg-browse">Browse&hellip;</button>
       </div>
       <div class="dlg-actions">
         <button id="dlg-cancel">Cancel</button>
@@ -85,7 +91,11 @@
   <!-- Row context menu -->
   <div id="ctx" class="hidden">
     <div data-act="toggle">Pause / Resume</div>
+    <div data-act="openFile">Open file</div>
+    <div data-act="openFolder">Open download folder</div>
+    <hr />
     <div data-act="remove">Remove from list</div>
+    <div data-act="deleteFiles">Remove &amp; delete files</div>
   </div>
 
   <script src="app.js"></script>
