@@ -14,6 +14,9 @@
     <button id="btn-add" class="tb-btn" title="Add a download (Ctrl+N)">
       <span class="tb-ico green">&#10133;</span><span>Add URL</span>
     </button>
+    <button id="btn-add-torrent" class="tb-btn" title="Add a .torrent file (Ctrl+T)">
+      <span class="tb-ico green">&#127386;</span><span>Add Torrent</span>
+    </button>
     <button id="btn-resume-all" class="tb-btn" title="Resume all paused / failed">
       <span class="tb-ico blue">&#10148;</span><span>Resume All</span>
     </button>
@@ -91,11 +94,26 @@
   <!-- Row context menu -->
   <div id="ctx" class="hidden">
     <div data-act="toggle">Pause / Resume</div>
+    <div data-act="details" class="ctx-torrent">Torrent details&hellip;</div>
     <div data-act="openFile">Open file</div>
     <div data-act="openFolder">Open download folder</div>
     <hr />
     <div data-act="remove">Remove from list</div>
     <div data-act="deleteFiles">Remove &amp; delete files</div>
+  </div>
+
+  <!-- Torrent details dialog -->
+  <div id="tdg-backdrop" class="hidden">
+    <div id="tdg">
+      <div class="tdg-title"><span id="tdg-name"></span><button id="tdg-close">&times;</button></div>
+      <div class="tdg-summary" id="tdg-summary"></div>
+      <div id="tdg-tabs">
+        <span class="tdg-tab active" data-tab="files">Files</span>
+        <span class="tdg-tab" data-tab="peers">Peers</span>
+        <span class="tdg-tab" data-tab="trackers">Trackers</span>
+      </div>
+      <div id="tdg-body"></div>
+    </div>
   </div>
 
   <script src="app.js"></script>

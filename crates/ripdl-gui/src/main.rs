@@ -183,6 +183,30 @@ async fn pick_dir() -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Native file picker for "Add Torrent" (.torrent files).
+#[tauri::command]
+async fn pick_file() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Choose torrent file")
+            .add_filter("Torrent files", &["torrent"])
+            .pick_file()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Files/peers/trackers snapshot for one torrent task.
+#[tauri::command]
+async fn torrent_details(id: String) -> Result<ripdl_core::torrent::TorrentDetailsSnapshot, String> {
+    match rpc(Command::Details { id }).await? {
+        Reply::TorrentDetails { details } => Ok(details),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
 /// Open the task's folder (or reveal the completed file in it).
 #[tauri::command]
 async fn open_path(path: String, reveal: Option<String>) -> Result<(), String> {
@@ -250,6 +274,8 @@ fn main() {
             resume_task,
             remove_task,
             pick_dir,
+            pick_file,
+            torrent_details,
             open_path,
             download_root_path
         ])

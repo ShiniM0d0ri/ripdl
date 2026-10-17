@@ -97,8 +97,10 @@ resume = re-invoke which continues `.part` files).
 GUI: `ripdl-gui` (Tauri 2 shell, `crates/ripdl-gui` + static `ui/`):
 IDM-style task manager over daemon RPC (`list_tasks`/`add_task`/pause/
 resume/remove commands, static frontend embedded at build time, no bundler;
-auto-spawns the daemon like the bridge). P4 extension stays live; hunt
-offers from the popup are the remaining P4 thread.
+auto-spawns the daemon like the bridge). Torrent rows show display names +
+Torrents sidebar filter; "Add Torrent" picker; details dialog (double-click)
+with Files/Peers/Trackers tabs refreshed every 2s. P4 extension stays live;
+hunt offers from the popup are the remaining P4 thread.
 50 tests pass offline (`cargo test --workspace`), including an in-proc
 seeder↔leecher torrent round-trip.
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
@@ -110,8 +112,9 @@ P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root
 folder, same Progress stream + pause/resume/cancel as HTTP, CLI auto-detect
-(`--torrent`), GUI add auto-routes torrents; M3.3 Details RPC/peers/files is
-the remaining P3 thread. Daemon counters now sum torrent folder trees.
+(`--torrent`), GUI add auto-routes torrents; M3.3 GUI merge landed (Add
+Torrent picker, torrent rows/details dialog with Files/Peers/Trackers);
+the remaining P3 thread is per-file selection (update_only_files).
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish,

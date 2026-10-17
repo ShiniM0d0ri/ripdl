@@ -17,6 +17,7 @@ const CAT_LABEL = {
     all: "All Downloads",
     unfinished: "Unfinished",
     completed: "Completed",
+    torrents: "Torrents",
     video: "Videos",
     music: "Music",
     images: "Images",
@@ -24,7 +25,7 @@ const CAT_LABEL = {
     archives: "Archives",
     programs: "Programs",
 };
-const CATALOG = ["all", "unfinished", "completed", "video", "music", "images", "documents", "archives", "programs"];
+const CATALOG = ["all", "unfinished", "completed", "torrents", "video", "music", "images", "documents", "archives", "programs"];
 
 let tasks = [];
 let currentCategory = "all";
@@ -93,11 +94,18 @@ function errorHint(e) {
     return "";
 }
 
+// The row title: torrent display name when known, else URL basename.
+function rowName(t) {
+    if (t.kind === "torrent" && t.name) return t.name;
+    return urlName(t.url);
+}
+
 // Multi-line title for a row: full error + diagnostics.
 function detailsTitle(t) {
     const lines = [];
     lines.push(t.url || "");
     if (t.dest_dir) lines.push("Location: " + t.dest_dir);
+    if (t.info_hash) lines.push("Info-hash: " + t.info_hash);
     if (t.error) { lines.push("Error: " + t.error); const h = errorHint(t.error); if (h) lines.push(h); }
     return lines.join("\n");
 }
@@ -121,6 +129,8 @@ function humans(bytes) {
 function stateLabel(t) {
     if (t.state === "queued" && t.start_at && t.start_at * 1000 > Date.now()) return "timed";
     if (t.state === "running" && t.kind === "video") return "hunt";
+    // Torrent still fetching metadata: no bytes and no total yet.
+    if (t.state === "running" && t.kind === "torrent" && !t.total) return "metadata";
     return t.state;
 }
 
@@ -163,15 +173,17 @@ function inCurrentView(t) {
     if (currentCategory === "all") return true;
     if (currentCategory === "unfinished") return t.state !== "completed";
     if (currentCategory === "completed") return t.state === "completed";
+    if (currentCategory === "torrents") return t.kind === "torrent";
     return categoryOf(urlName(t.url)) === currentCategory;
 }
 
 function render() {
     // Category counts (also shown in the sidebar).
-    const counts = { all: tasks.length, unfinished: 0, completed: 0 };
+    const counts = { all: tasks.length, unfinished: 0, completed: 0, torrents: 0 };
     for (const cat of ["video", "music", "images", "documents", "archives", "programs"]) counts[cat] = 0;
     for (const t of tasks) {
         if (t.state === "completed") counts.completed++; else counts.unfinished++;
+        if (t.kind === "torrent") counts.torrents++;
         const cat = categoryOf(urlName(t.url));
         if (cat in counts) counts[cat]++;
     }
@@ -181,7 +193,7 @@ function render() {
     const view = tasks.filter(inCurrentView);
     $("#empty-hint").classList.toggle("hidden", view.length > 0);
     rows.innerHTML = view.map((t) => {
-        const name = urlName(t.url);
+        const name = rowName(t);
         const state = stateLabel(t);
         const pct = percentOf(t);
         const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "timed"].includes(state) ? "paused" : "");
@@ -211,10 +223,32 @@ function render() {
         </tr>`;
     }).join("");
 
-    $("#task-table").querySelectorAll("tbody tr").forEach((tr) => {
-        tr.onclick = () => { selectedId = tr.dataset.id; renderKeepSelection(); };
-        tr.oncontextmenu = (ev) => { ev.preventDefault(); selectedId = tr.dataset.id; renderKeepSelection(); showCtx(ev.clientX, ev.clientY); };
-    });
+    // Handlers live on the tbody (delegation) so re-renders mid-click
+    // don't swallow double-clicks / context menus. Selection toggles a
+    // class in place instead of re-rendering (a re-render replaces the
+    // row node, which swallows the browser's dblclick).
+    const tbody = $("#task-rows");
+    tbody.onclick = (ev) => {
+        const tr = ev.target.closest("tr");
+        if (!tr) return;
+        selectedId = tr.dataset.id;
+        tbody.querySelectorAll("tr").forEach((x) => x.classList.toggle("selected", x === tr));
+    };
+    tbody.ondblclick = (ev) => {
+        const tr = ev.target.closest("tr");
+        if (!tr) return;
+        selectedId = tr.dataset.id;
+        renderKeepSelection();
+        openDetails(tr.dataset.id);
+    };
+    tbody.oncontextmenu = (ev) => {
+        const tr = ev.target.closest("tr");
+        if (!tr) return;
+        ev.preventDefault();
+        selectedId = tr.dataset.id;
+        renderKeepSelection();
+        showCtx(ev.clientX, ev.clientY);
+    };
     $("#task-table").querySelectorAll(".row-btn").forEach((btn) => {
         btn.onclick = (ev) => { ev.stopPropagation(); doTaskAction(btn.dataset.act, btn.dataset.id); };
     });
@@ -269,8 +303,11 @@ async function doTaskAction(act, id) {
     try {
         if (act === "remove") await invokeSafe("remove_task", { id, deleteFiles: false });
         else if (act === "deleteFiles") {
-            if (!confirm(`Delete the downloaded file(s) for "${urlName(t.url)}" from disk?\nThis cannot be undone.`)) return;
+            if (!confirm(`Delete the downloaded file(s) for "${rowName(t)}" from disk?\nThis cannot be undone.`)) return;
             await invokeSafe("remove_task", { id, deleteFiles: true });
+        } else if (act === "details") {
+            if (t.kind !== "torrent") { flashErr("Details are only available for torrent tasks."); return; }
+            await openDetails(id);
         } else if (act === "openFolder") {
             await invokeSafe("open_path", { path: t.dest_dir || "", reveal: null });
         } else if (act === "openFile") {
@@ -324,6 +361,7 @@ function renderStatusbar() {
 let dlgDestTouched = false;
 
 $("#btn-add").onclick = () => openAddDialog();
+$("#btn-add-torrent").onclick = pickTorrent;
 $("#btn-resume-all").onclick = async () => {
     for (const t of tasks.filter((x) => ["paused", "failed"].includes(x.state))) {
         try { await invokeSafe("resume_task", { id: t.id }); } catch (e) { flashErr(String(e)); break; }
@@ -372,12 +410,121 @@ $("#dlg-ok").onclick = submitAdd;
 $("#dlg-url").onkeydown = (ev) => { if (ev.key === "Enter") submitAdd(); };
 $("#dlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) $("#dlg-backdrop").classList.add("hidden"); };
 document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") $("#dlg-backdrop").classList.add("hidden");
+    if (ev.key === "Escape") { $("#dlg-backdrop").classList.add("hidden"); closeDetails(); }
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "n") {
         ev.preventDefault();
         openAddDialog();
     }
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "t") {
+        ev.preventDefault();
+        pickTorrent();
+    }
 });
+
+// Pick a .torrent from disk (dialog) and hand it to the daemon; the daemon
+// routes it by kind, save-to defaults to the downloads root.
+async function pickTorrent() {
+    try {
+        const file = await invokeSafe("pick_file");
+        if (!file) return;
+        await invokeSafe("add_task", { url: file, category: null, destDir: null });
+        await poll();
+    } catch (e) {
+        flashErr(String(e).replace(/^.*error: /, ""));
+    }
+}
+
+/* Torrent details dialog */
+let detailsTaskId = null;
+let detailsTab = "files";
+let detailsTimer = null;
+
+async function openDetails(id) {
+    const t = findTask(id);
+    if (!t || t.kind !== "torrent") return;
+    detailsTaskId = id;
+    detailsTab = "files";
+    for (const el of document.querySelectorAll("#tdg-tabs .tdg-tab")) {
+        el.classList.toggle("active", el.dataset.tab === "files");
+    }
+    $("#tdg-backdrop").classList.remove("hidden");
+    await refreshDetails();
+    clearInterval(detailsTimer);
+    detailsTimer = setInterval(async () => {
+        if (!detailsTaskId || $("#tdg-backdrop").classList.contains("hidden")) return;
+        if (!findTask(detailsTaskId)) { closeDetails(); return; }
+        await refreshDetails();
+    }, 2000);
+}
+
+function closeDetails() {
+    detailsTaskId = null;
+    clearInterval(detailsTimer);
+    $("#tdg-backdrop").classList.add("hidden");
+}
+
+$("#tdg-close").onclick = closeDetails;
+$("#tdg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeDetails(); };
+document.querySelectorAll("#tdg-tabs .tdg-tab").forEach((el) => {
+    el.onclick = () => {
+        detailsTab = el.dataset.tab;
+        document.querySelectorAll("#tdg-tabs .tdg-tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === detailsTab));
+        refreshDetails();
+    };
+});
+
+async function refreshDetails() {
+    if (!detailsTaskId) return;
+    let d;
+    try {
+        d = await invokeSafe("torrent_details", { id: detailsTaskId });
+    } catch (e) {
+        $("#tdg-body").innerHTML = `<div class="trk-off">${escapeHtml(String(e).replace(/^.*error: /, ""))}</div>`;
+        return;
+    }
+    const t = findTask(detailsTaskId);
+    const name = (t && t.name) || d.name || "(unknown)";
+    $("#tdg-name").textContent = name;
+    const pct = d.total > 0 ? ((d.downloaded / d.total) * 100).toFixed(1) : "0";
+    $("#tdg-summary").textContent =
+        `${pct}% / ${humans(d.downloaded)} / ${humans(d.total)} / ${d.finished ? "finished" : d.paused ? "paused" : "running"}` +
+        `\n${d.info_hash}` +
+        (d.root ? `\n${d.root}` : "");
+
+    const body = $("#tdg-body");
+    if (detailsTab === "files") {
+        const rows = d.files.map((f) => {
+            const p = f.size > 0 ? Math.min(100, (f.downloaded / f.size) * 100) : 100;
+            return `<tr>
+              <td>${f.included ? "yes" : "no"}</td>
+              <td title="${escapeHtml(f.name)}">${escapeHtml(baseName(f.name) || f.name)}</td>
+              <td class="num">${humans(f.size)}</td>
+              <td class="num">${p.toFixed(0)}%</td>
+              <td><div class="file-bar"><div class="file-fill" style="width:${p.toFixed(1)}%"></div></div></td>
+            </tr>`;
+        }).join("");
+        body.innerHTML = `
+          <table><thead><tr><th>Want</th><th>Name</th><th>Size</th><th>Done</th><th></th></tr></thead>
+          <tbody>${rows}</tbody></table>`;
+    } else if (detailsTab === "peers") {
+        const rows = d.peers.map((p) => `
+          <tr>
+            <td>${escapeHtml(p.addr)}</td>
+            <td>${escapeHtml(p.client || "?")}</td>
+            <td>${escapeHtml(p.state)}</td>
+            <td class="num">${humans(p.downloaded)}</td>
+            <td class="num">${humans(p.uploaded)}</td>
+          </tr>`).join("");
+        body.innerHTML = `
+          <table><thead><tr><th>Address</th><th>Client</th><th>State</th><th>Downloaded</th><th>Uploaded</th></tr></thead>
+          <tbody>${rows}</tbody></table>`;
+    } else {
+        const rows = d.trackers.map((u) => `<tr><td>${escapeHtml(u)}</td></tr>`).join("");
+        body.innerHTML = d.trackers.length
+            ? `<table><thead><tr><th>URL</th></tr></thead><tbody>${rows}</tbody></table>`
+            : '<div class="trk-off">No trackers (DHT only).</div>';
+    }
+}
 
 async function submitAdd() {
     const url = $("#dlg-url").value.trim();

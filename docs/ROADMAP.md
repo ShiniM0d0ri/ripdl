@@ -103,16 +103,16 @@ M3.2 - daemon + CLI:
 - [x] CLI: `add` auto-detects torrent payloads (+ explicit `--torrent`)
 
 M3.3 - GUI merge (HTTP + torrent in one grid):
-- [ ] Row model: kind-specific status labels (metadata/verifying/seeding),
-      torrent name replaces URL basename; per-file selection drives overall %?
-      (report wanted-bytes progress)
-- [ ] Details dialog (double-click / context menu): summary line + tabs
-      Files (checkbox list, Apply → `update_only_files`), Peers (addr, client,
-      flags, down/up, progress; 2s refresh), Trackers
-- [ ] Toolbar: "Add Torrent" (native file picker for .torrent);
-      Add-URL dialog auto-detects magnet/.torrent and routes to hunt-style
-      second phase for metadata fetch
-- [ ] Sidebar adds "Torrents" (kind filter, not extension)
+- [x] Row model: kind-specific status (metadata phase when a magnet still
+      has no bytes), torrent display name replaces the URL basename,
+      Torrents count in the sidebar
+- [x] Details dialog (double-click / context menu): summary line + tabs
+      Files (per-file sizes + verity progress bars, want column),
+      Peers (addr, client, state, counters; 2s refresh while open), Trackers
+- [x] Toolbar: "Add Torrent" (native file picker, Ctrl+T); Add-URL dialog
+      auto-detects magnet/.torrent and routes to the torrent engine
+- [x] Sidebar "Torrents" (kind filter, not extension)
+- [ ] Files tab "Apply" checkbox editing -> `update_only_files`
 
 M3.4 - tests / verification:
 - [x] Offline integration: in-proc seeder ↔ leecher over localhost with a
