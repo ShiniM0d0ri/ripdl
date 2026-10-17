@@ -199,9 +199,9 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
 /* --- lifecycle -------------------------------------------------------- */
 
 chrome.runtime.onStartup.addListener(() => {
-    connectHost();
+    if (!port) connectHost();
 });
 chrome.runtime.onInstalled.addListener(() => {
-    connectHost();
+    if (!port) connectHost();
 });
 connectHost();
