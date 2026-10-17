@@ -63,6 +63,16 @@ the single-stream path.
 - Commits: use `git -c user.name="ripdl" -c user.email="ripdl@localhost" commit …`.
   One commit per coherent unit, terse imperative subject.
 
+## CI / release
+
+- `.github/workflows/ci.yml`: on every push/PR, `cargo check` + offline
+  `cargo test` on windows-latest and ubuntu-latest.
+- `.github/workflows/release.yml`: on tag `v*` → release builds for
+  `x86_64-pc-windows-msvc` (zip: ripdl.exe, ripdl-daemon.exe, `ext/`) and
+  `x86_64-unknown-linux-gnu` (tar.gz), attached to an auto-generated GitHub
+  Release. Cut releases by pushing an annotated tag:
+  `git tag -a vX.Y.Z; git push origin vX.Y.Z`.
+
 ## Resume-sidecar format
 
 `<file>.ripdl.json` (`TaskStateFile` with per-segment `done` offsets).
