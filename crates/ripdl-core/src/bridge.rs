@@ -97,6 +97,10 @@ pub struct BridgeConfig {
     /// Read timeout on daemon replies (a stuck daemon must not wedge the
     /// browser's host process).
     pub rpc_timeout: Duration,
+    /// Try the local-session transports (named pipe / unix socket) before
+    /// TCP. Tests disable this: an unrelated live daemon on the build host
+    /// owns the pipe and would answer for any mock TCP server otherwise.
+    pub use_pipe: bool,
 }
 
 impl Default for BridgeConfig {
@@ -107,6 +111,7 @@ impl Default for BridgeConfig {
             connect_delay: Duration::from_millis(100),
             spawn_daemon: true,
             rpc_timeout: Duration::from_secs(30),
+            use_pipe: true,
         }
     }
 }
@@ -173,24 +178,73 @@ fn forward_once(config: &BridgeConfig, rpc_seq: &mut u64, cmd: Command) -> Resul
     Err(Error::State("daemon unreachable".to_string()))
 }
 
+/// One connected daemon stream for the bridge's blocking IO. The named pipe
+/// (Windows) / unix socket (elsewhere) is primary: no TCP handshake per
+/// message, no port to race. TCP loopback stays as the fallback for
+/// mixed-version dev setups.
+trait RpcStream: std::io::Read + std::io::Write + Send + 'static {}
+impl<T: std::io::Read + std::io::Write + Send + 'static> RpcStream for T {}
+
+fn connect_daemon_sync(use_pipe: bool, port: u16) -> std::io::Result<Box<dyn RpcStream>> {
+    #[cfg(windows)]
+    // std's OpenOptions reaches a named-pipe server directly.
+    if use_pipe {
+        if let Ok(pipe) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(crate::transport::PIPE_NAME)
+        {
+            return Ok(Box::new(pipe));
+        }
+    }
+    #[cfg(not(windows))]
+    if use_pipe {
+        if let Ok(path) = crate::transport::unix_socket_path() {
+            if let Ok(sock) = std::os::unix::net::UnixStream::connect(path) {
+                return Ok(Box::new(sock));
+            }
+        }
+    }
+    let stream = TcpStream::connect(("127.0.0.1", port))?;
+    // Request/reply are small packets; Nagle would delay the daemon's reply.
+    stream.set_nodelay(true)?;
+    Ok(Box::new(stream))
+}
+
 fn talk(config: &BridgeConfig, rpc_seq: &mut u64, cmd: &Command) -> Result<Reply> {
     *rpc_seq += 1;
+
+    let mut stream = connect_daemon_sync(config.use_pipe, config.port)?;
+    // Build the request after the connection exists: a failed connect (spawn
+    // warming up) must not clone the payload per retry attempt.
     let req = crate::rpc::Request {
         id: *rpc_seq,
         cmd: cmd.clone(),
     };
 
-    let stream = TcpStream::connect(("127.0.0.1", config.port))?;
-    stream.set_read_timeout(Some(config.rpc_timeout))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');
-    (&stream).write_all(line.as_bytes())?;
+    stream.write_all(line.as_bytes())?;
 
-    let mut reader = std::io::BufReader::new(&stream);
-    let mut resp_line = Vec::new();
-    reader.read_until(b'\n', &mut resp_line)?;
+    // Read the reply on a worker thread and race it with the RPC deadline:
+    // pipe handles have no std read timeout, and a hung daemon must not wed
+    // the whole native-messaging host. One short-lived thread per message.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reply = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stream);
+        let mut resp_line = Vec::new();
+        let res = reader.read_until(b'\n', &mut resp_line).map(|_| resp_line);
+        let _ = tx.send(res);
+    });
+    let resp_line = match rx.recv_timeout(config.rpc_timeout) {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            return Err(Error::State("daemon reply timed out".to_string()));
+        }
+    };
+    drop(reply); // detached worker exits on its own after the send
+
     if resp_line.is_empty() {
         return Err(Error::State("daemon closed the connection".to_string()));
     }
@@ -364,6 +418,7 @@ mod tests {
             port,
             spawn_daemon: false,
             connect_attempts: 1,
+            use_pipe: false,
             ..BridgeConfig::default()
         };
         let mut seq = 0;
@@ -403,6 +458,7 @@ mod tests {
             spawn_daemon: false,
             connect_attempts: 2,
             connect_delay: Duration::from_millis(20),
+            use_pipe: false,
             ..BridgeConfig::default()
         };
         let mut seq = 0;

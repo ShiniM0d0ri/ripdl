@@ -51,11 +51,14 @@ pub async fn connect_daemon() -> io::Result<AsyncStream> {
     {
         use tokio::net::windows::named_pipe::ClientOptions;
         // The server keeps one free instance; while it recycles there can be
-        // a short busy window - retry a little before falling back to TCP.
+        // a short busy window - retry that only (ERROR_PIPE_BUSY). Retrying
+        // every error made an absent daemon burn 5x80ms per call before the
+        // TCP fallback answered.
+        const PIPE_BUSY: i32 = 231; // ERROR_PIPE_BUSY
         for attempt in 0..6 {
             match ClientOptions::new().open(PIPE_NAME) {
                 Ok(client) => return Ok(Box::new(client)),
-                Err(_) if attempt < 5 => {
+                Err(e) if attempt < 5 && e.raw_os_error() == Some(PIPE_BUSY) => {
                     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
                 }
                 Err(e) => {
@@ -74,8 +77,17 @@ pub async fn connect_daemon() -> io::Result<AsyncStream> {
             }
         }
     }
-    let _ = other_err;
+    // Surface why the local transport failed too: a bare TCP error would
+    // hide the actual cause (e.g. access denied on the pipe).
     let port = crate::rpc::DEFAULT_PORT;
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
-    tcp.map(|s| Box::new(s) as AsyncStream)
+    match tcp {
+        Ok(s) => Ok(Box::new(s) as AsyncStream),
+        Err(e) => match other_err {
+            Some(local) => Err(io::Error::other(format!(
+                "no daemon endpoint reached: local transport: {local}; tcp 127.0.0.1:{port}: {e}"
+            ))),
+            None => Err(e),
+        },
+    }
 }

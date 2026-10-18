@@ -46,7 +46,17 @@ impl DaemonSettings {
     /// Lives here (not in the daemon) so frontends can read the same file.
     pub fn load(path: &std::path::Path) -> Self {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| Self::default()),
+            Ok(mut bytes) => {
+                // Editors (Notepad!) save UTF-8 with BOM; serde rejects it and
+                // the whole user config would silently reset to defaults.
+                if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                    bytes.drain(..3);
+                }
+                serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                    eprintln!("warn: ignoring invalid config {}: {e}", path.display());
+                    Self::default()
+                })
+            }
             Err(_) => Self::default(),
         }
     }

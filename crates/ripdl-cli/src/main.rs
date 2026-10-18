@@ -10,6 +10,20 @@ use tokio_util::sync::CancellationToken;
 use ripdl_core::rpc::{Command, Reply, Request, Response};
 use ripdl_core::{Engine, EngineConfig};
 
+/// Lowercase label for one `ls` row (avoids `{state:?}` + `to_lowercase`
+/// churn per line - Debug prints come back as "Running", not "running").
+fn state_label(s: ripdl_core::TaskState) -> &'static str {
+    use ripdl_core::TaskState::*;
+    match s {
+        Queued => "queued",
+        Running => "running",
+        Paused => "paused",
+        Failed => "failed",
+        Completed => "completed",
+        Cancelled => "cancelled",
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "ripdl",
@@ -383,14 +397,14 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             }
             println!("peers: {} connected", details.peers.len());
             for p in details.peers.iter().take(12) {
-                println!("  {:>21} {:>12} {:<28} dl {:>12} ul {:>12}", p.addr, p.state, p.client.clone().unwrap_or_default(), p.downloaded, p.uploaded);
+                println!("  {:>21} {:>12} {:<28} dl {:>12} ul {:>12}", p.addr, p.state, p.client.as_deref().unwrap_or("-"), p.downloaded, p.uploaded);
             }
         }
         Reply::Tasks { tasks } => {
             println!("{:<38} {:<10} {:>16} {:>12}", "ID", "STATE", "PROGRESS", "SPEED");
             let now = now_unix();
             for t in tasks {
-                let mut state = format!("{:?}", t.state);
+                let mut state = state_label(t.state).to_string();
                 if let Some(start) = t.start_at {
                     if start > now && matches!(t.state, ripdl_core::TaskState::Queued) {
                         state = "timed".to_string();
@@ -416,7 +430,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                 println!(
                     "{:<38} {:<10} {:>16} {:>12}",
                     t.id,
-                    state.to_lowercase(),
+                    state,
                     progress,
                     speed
                 );
