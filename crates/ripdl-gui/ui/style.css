@@ -135,6 +135,26 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
 .st-err { color: #b02a2a; font-weight: 400; font-size: 11px; max-width: 150px; white-space: normal; line-height: 1.15; }
 .st-timed { color: #9a7d3c; font-weight: 600; }
 
+/* Update banner: only ever shown when a newer GitHub release exists. */
+#update-banner {
+    background: linear-gradient(#eaf3fc, #dfeaf7);
+    border-bottom: 1px solid #b9cfe4;
+    padding: 5px 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+}
+#update-banner b { color: #12507e; }
+#update-banner .update-dim { color: #5b6770; }
+#update-banner .update-gap { flex: 1; }
+#update-banner button {
+    padding: 3px 10px; border-radius: 4px; border: 1px solid #9bb8d6;
+    background: linear-gradient(#ffffff, #e8f1fa); cursor: pointer; font: inherit;
+    white-space: nowrap;
+}
+#update-banner button.primary { background: linear-gradient(#f2f8fd, #d7e8f8); }
+
 /* Status bar */
 #statusbar {
     background: linear-gradient(#f6f7f8, #e9ebee);

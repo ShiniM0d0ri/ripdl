@@ -186,6 +186,48 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// Update check through the daemon (one api.github.com GET, information
+/// only — the GUI never downloads or installs anything itself).
+#[tauri::command]
+async fn check_update() -> Result<ripdl_core::update::UpdateInfo, String> {
+    match rpc(Command::CheckUpdate).await? {
+        Reply::Update { info } => Ok(info),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+/// Open a URL in the user's browser (update banner, Help menu).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(format!("not an https url: {url}"));
+    }
+    open_with_default(&url).map_err(|e| e.to_string())
+}
+
+#[cfg(windows)]
+fn open_with_default(url: &str) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // cmd start is the reliable way to hand a URL to the default handler
+    // without an extra dependency; the empty arg eats quoting hazards.
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn open_with_default(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let prog = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let prog = "xdg-open";
+    std::process::Command::new(prog).arg(url).spawn().map(|_| ())
+}
+
 /// Native directory picker for the Add dialog's "Save to" field.
 #[tauri::command]
 async fn pick_dir() -> Result<Option<String>, String> {
@@ -338,6 +380,8 @@ fn main() {
             download_root_path,
             get_config,
             set_config,
+            check_update,
+            open_url,
             exit_app
         ])
         .setup(|app| {

@@ -495,6 +495,9 @@ const MENUS = {
         { label: "Clear Completed", act: () => clearDone() },
     ],
     help: () => [
+        { label: "Check for Updates", act: () => runUpdateCheck(false) },
+        { label: "Open Release Page", act: () => openReleases() },
+        null,
         { label: "About ripdl", act: () =>
             alert("ripdl — free, ad-free, multi-segment download manager.\n" +
                   "No telemetry, no ads, forever. License: MIT OR Apache-2.0.\n" +
@@ -539,6 +542,46 @@ $("#btn-add-torrent").onclick = pickTorrent;
 $("#btn-resume-all").onclick = resumeAll;
 $("#btn-stop-all").onclick = stopAll;
 $("#btn-clear-done").onclick = clearDone;
+
+/* Update check (GitHub releases). Information only - the GUI never
+   downloads or installs anything; the user gets a banner and decides. */
+const RELEASES_URL = "https://github.com/ShiniM0d0ri/ripdl/releases";
+
+function openReleases() {
+    invokeSafe("open_url", { url: RELEASES_URL }).catch((e) => flashErr(String(e)));
+}
+
+async function runUpdateCheck(initial) {
+    let info;
+    try {
+        info = await invokeSafe("check_update");
+    } catch (e) {
+        // Startup checks stay silent (offline is normal, not an error);
+        // Help > Check for Updates reports the reason instead.
+        if (!initial) flashErr(String(e).replace(/^.*error: /, ""));
+        return;
+    }
+    if (info && info.update_available) {
+        $("#update-text").innerHTML =
+            `New version <b>v${escapeHtml(info.latest)}</b> is available` +
+            ` <span class="update-dim">(running v${escapeHtml(info.current)})</span>`;
+        $("#update-banner").classList.remove("hidden");
+    } else if (!initial) {
+        flashStatus(`ripdl v${info.current} is up to date`);
+    }
+}
+
+$("#update-open").onclick = openReleases;
+$("#update-dismiss").onclick = () => $("#update-banner").classList.add("hidden");
+
+// Once per GUI launch, gated by the settings switch (default on). Errors
+// are deliberately invisible here.
+(async () => {
+    try {
+        const s = await invokeSafe("get_config");
+        if (s.update_check ?? true) runUpdateCheck(true);
+    } catch { /* config failure must not block the UI */ }
+})();
 
 /* Dialog */
 function openAddDialog(presetUrl) {
@@ -608,6 +651,7 @@ async function openSettings() {
     SET_INPUTS.forEach((sel) => { $(sel).value = ""; });
     $("#set-tray").checked = true;
     $("#set-bond").checked = false;
+    $("#set-update").checked = true;
     try {
         const s = await invokeSafe("get_config");
         $("#set-conc").value = s.max_concurrent ?? "";
@@ -618,6 +662,7 @@ async function openSettings() {
         $("#set-ytdlp").value = s.ytdlp_path ?? "";
         $("#set-tray").checked = s.hide_to_tray ?? true;
         $("#set-bond").checked = s.bond_interfaces ?? false;
+        $("#set-update").checked = s.update_check ?? true;
         $("#set-backdrop").classList.remove("hidden");
         $("#set-conc").focus();
     } catch (e) {
@@ -660,6 +705,7 @@ async function saveSettings() {
         ytdlp_path: $("#set-ytdlp").value.trim() || undefined,
         hide_to_tray: $("#set-tray").checked,
         bond_interfaces: $("#set-bond").checked,
+        update_check: $("#set-update").checked,
     };
     try {
         await invokeSafe("set_config", { settings: payload });
