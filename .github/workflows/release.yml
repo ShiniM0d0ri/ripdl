@@ -122,11 +122,14 @@ jobs:
         run: |
           V="${{ steps.ver.outputs.version }}"
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.36.1
-          export RIPDL_VERSION="$V"
-          export RIPDL_BIN="$PWD/target/release"
-          export RIPDL_SRC="$PWD"
-          "$(go env GOPATH)/bin/nfpm" package --config packaging/linux/nfpm.yaml --packager deb --target dist
-          "$(go env GOPATH)/bin/nfpm" package --config packaging/linux/nfpm.yaml --packager rpm --target dist
+          # nfpm's own env expansion is inconsistent across versions; resolve
+          # the placeholders here so the config is plain absolute paths.
+          sed -e "s|\${RIPDL_VERSION}|$V|g" \
+              -e "s|\${RIPDL_BIN}|$PWD/target/release|g" \
+              -e "s|\${RIPDL_SRC}|$PWD|g" \
+              packaging/linux/nfpm.yaml > nfpm.resolved.yaml
+          "$(go env GOPATH)/bin/nfpm" package --config nfpm.resolved.yaml --packager deb --target dist
+          "$(go env GOPATH)/bin/nfpm" package --config nfpm.resolved.yaml --packager rpm --target dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
