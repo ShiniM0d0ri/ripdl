@@ -61,6 +61,12 @@ struct QueueFile {
     tasks: Vec<TaskRecord>,
 }
 
+/// Borrowed view for persist(): skips the to_vec() deep copy every save.
+#[derive(serde::Serialize)]
+struct QueueFileRef<'a> {
+    tasks: &'a [TaskRecord],
+}
+
 struct TaskRuntime {
     token: CancellationToken,
 }
@@ -129,19 +135,31 @@ impl Daemon {
     /// engine's sidecar resume makes the restart transparent.
     fn boot_resume(self: &Arc<Self>) -> Result<()> {
         let resume_list = {
+            let mut changed = false;
             let mut records = self.records.lock().unwrap();
             for r in records.iter_mut() {
                 if r.state == TaskState::Running {
                     r.state = TaskState::Queued;
+                    changed = true;
                 }
             }
-            let snapshot = records.clone();
-            drop(records);
-            let _ = self.persist(&snapshot);
-            snapshot
-                .into_iter()
-                .filter(|r| r.state == TaskState::Queued)
-                .collect::<Vec<_>>()
+            // Already-clean queue: the on-disk state is identical, skip the
+            // unconditional rewrite.
+            if !changed {
+                records
+                    .iter()
+                    .filter(|r| r.state == TaskState::Queued)
+                    .map(|r| TaskRecord::clone(r))
+                    .collect::<Vec<_>>()
+            } else {
+                let snapshot = records.clone();
+                drop(records);
+                let _ = self.persist(&snapshot);
+                snapshot
+                    .into_iter()
+                    .filter(|r| r.state == TaskState::Queued)
+                    .collect::<Vec<_>>()
+            }
         };
         for r in resume_list {
             self.spawn_runner(r);
@@ -150,7 +168,7 @@ impl Daemon {
     }
 
     fn persist(&self, records: &[TaskRecord]) -> Result<()> {
-        atomic_write_json(&self.queue_path, &QueueFile { tasks: records.to_vec() })?;
+        atomic_write_json(&self.queue_path, &QueueFileRef { tasks: records })?;
         Ok(())
     }
 
@@ -414,30 +432,6 @@ impl Daemon {
         // Idempotency: the same URL, tool and destination must not
         // double-download into one file (sidecar trample = corrupt output).
         // Re-adding shares the existing task instead.
-        {
-            let records = self.records.lock().unwrap();
-            if let Some(id) = duplicate_task(&records, &url, &dest_dir, kind) {
-                return Response {
-                    id: req_id,
-                    reply: Reply::Added { id },
-                };
-            }
-            // Torrents additionally dedupe across destinations: the daemon
-            // runs ONE rqbit session where a payload maps to a single
-            // ManagedTorrent (one output folder), so two same-payload tasks
-            // would fight over the same handle - share the existing task.
-            if kind == TaskKind::Torrent {
-                if let Some(r) = records
-                    .iter()
-                    .find(|r| r.kind == TaskKind::Torrent && r.url.trim() == url.trim())
-                {
-                    return Response {
-                        id: req_id,
-                        reply: Reply::Added { id: r.id.clone() },
-                    };
-                }
-            }
-        }
         let id = uuid::Uuid::new_v4().to_string();
         let rec = TaskRecord {
             id: id.clone(),
@@ -457,7 +451,31 @@ impl Daemon {
             only_files: None,
         };
         {
+            // One lock scope for the duplicate check AND the push: two
+            // concurrent same-URL adds (browser retry / double dialog
+            // submit) must not both pass the check and both insert.
             let mut records = self.records.lock().unwrap();
+            if kind == TaskKind::Torrent {
+                // Torrents additionally dedupe across destinations: the daemon
+                // runs ONE rqbit session where a payload maps to a single
+                // ManagedTorrent (one output folder), so two same-payload tasks
+                // would fight over the same handle - share the existing task.
+                if let Some(r) = records
+                    .iter()
+                    .find(|r| r.kind == TaskKind::Torrent && r.url.trim() == url.trim())
+                {
+                    return Response {
+                        id: req_id,
+                        reply: Reply::Added { id: r.id.clone() },
+                    };
+                }
+            }
+            if let Some(id) = duplicate_task(&records, &url, &rec.dest_dir, kind) {
+                return Response {
+                    id: req_id,
+                    reply: Reply::Added { id },
+                };
+            }
             records.push(rec.clone());
             let snapshot = records.clone();
             drop(records);
@@ -471,15 +489,15 @@ impl Daemon {
     /// session's managed torrents and snapshot files/peers/trackers.
     async fn cmd_torrent_details(&self, req_id: u64, id: &str) -> Response {
         let reply: Result<Reply, String> = async {
-            let record = {
+            let (kind_state, info_hash) = {
                 let records = self.records.lock().unwrap();
-                records
+                let r = records
                     .iter()
                     .find(|r| r.id == id)
-                    .cloned()
-                    .ok_or_else(|| "task not found".to_string())?
+                    .ok_or_else(|| "task not found".to_string())?;
+                (r.kind, r.info_hash.clone())
             };
-            if record.kind != TaskKind::Torrent {
+            if kind_state != TaskKind::Torrent {
                 return Err("task is not a torrent".into());
             }
             let session = {
@@ -489,9 +507,7 @@ impl Daemon {
                     None => return Err("torrent session not running".into()),
                 }
             };
-            let hash = record
-                .info_hash
-                .clone()
+            let hash = info_hash
                 .ok_or_else(|| "torrent not yet resolved (no metadata yet?)".to_string())?;
             session
                 .details(&hash)
@@ -523,7 +539,7 @@ impl Daemon {
                 v.dedup();
                 v
             });
-            let record = {
+            let (record_state, record_hash, snapshot) = {
                 let mut records = self.records.lock().unwrap();
                 let r = records
                     .iter_mut()
@@ -533,11 +549,12 @@ impl Daemon {
                     return Err("task is not a torrent".into());
                 }
                 r.only_files = canonical.clone();
-                r.clone()
+                // One guard pass: mutate AND take the persist snapshot - no
+                // second lock acquisition + full-table clone round trip.
+                (r.state, r.info_hash.clone(), records.clone())
             };
-            let snapshot = self.records.lock().unwrap().clone();
             let _ = self.persist(&snapshot);
-            if record.state == TaskState::Completed {
+            if record_state == TaskState::Completed {
                 // Not in the session (it may even not be running): the
                 // recorded selection is enough - the next resume replays it.
                 return Ok(Reply::Ok);
@@ -549,9 +566,7 @@ impl Daemon {
                     None => return Err("torrent session not running".into()),
                 }
             };
-            let hash = record
-                .info_hash
-                .clone()
+            let hash = record_hash
                 .ok_or_else(|| "torrent not yet resolved (no metadata yet?)".to_string())?;
             session
                 .set_selected_files(&hash, canonical)
@@ -745,12 +760,20 @@ impl Daemon {
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Every early exit below must drop the runner's runtime entry:
+            // paused-while-queued tasks otherwise leave zombie TokenEntries
+            // behind, which stalls the `rm --files` drain loop and leaks
+            // memory per pause cycle.
+            let detach_runtime = || {
+                this.runtime.lock().unwrap().remove(&rec.id);
+            };
             // Scheduled start: hold Queued until the wall clock arrives.
             // Cancel while waiting -> paused, like any queued task.
             match start_delay(&rec.start_at) {
                 Some(delay) => {
                     tokio::select! {
                         _ = token.cancelled() => {
+                            detach_runtime();
                             this.set_state(&rec.id, TaskState::Paused, None);
                             return;
                         }
@@ -763,12 +786,16 @@ impl Daemon {
             // Wait for a concurrency slot; pause/remove while queued bails here.
             let _permit = tokio::select! {
                 _ = token.cancelled() => {
+                    detach_runtime();
                     this.set_state(&rec.id, TaskState::Paused, None);
                     return;
                 }
                 p = this.sem.clone().acquire_owned() => match p {
                     Ok(p) => p,
-                    Err(_) => return,
+                    Err(_) => {
+                        detach_runtime();
+                        return;
+                    }
                 },
             };
 
@@ -777,7 +804,10 @@ impl Daemon {
                 let records = this.records.lock().unwrap();
                 match records.iter().find(|r| r.id == rec.id) {
                     Some(r) if r.state == TaskState::Queued => {}
-                    _ => return,
+                    _ => {
+                        detach_runtime();
+                        return;
+                    }
                 }
             }
 
@@ -834,6 +864,7 @@ impl Daemon {
                                 Ok(s) => *guard = Some(Arc::new(s)),
                                 Err(e) => {
                                     drop(guard);
+                                    detach_runtime();
                                     this.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
                                     return;
                                 }
@@ -900,6 +931,7 @@ impl Daemon {
                         match Engine::new(cfg) {
                             Ok(engine) => Arc::new(engine),
                             Err(e) => {
+                                detach_runtime();
                                 this.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
                                 return;
                             }
@@ -967,6 +999,18 @@ impl Daemon {
     }
 
     fn set_completed(&self, id: &str, file: Option<PathBuf>) {
+        // The produced path is a parameter, so the (possibly huge) torrent
+        // tree walk runs BEFORE any lock is taken - a few-thousand-file
+        // root would otherwise block every list/pause/add for the walk.
+        let disk = file.as_deref().and_then(Self::disk_size);
+        // progress fallback read first: keeps lock order trivial (no
+        // records->progress nesting here at all).
+        let fallback = self
+            .progress
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|t| (t.last.downloaded, t.last.total));
         {
             let mut records = self.records.lock().unwrap();
             match records.iter_mut().find(|r| r.id == id) {
@@ -974,15 +1018,21 @@ impl Daemon {
                     r.state = TaskState::Completed;
                     r.error = None;
                     r.dest_file = file.clone();
-                    if let Some(f) = &r.dest_file {
-                        // Torrent roots are directories: metadata.len() is 0
-                        // there, so sum the tree. Files measure as before.
-                        if let Some(n) = Self::disk_size(f) {
-                            r.downloaded = n;
-                            r.total = Some(n);
-                        } else if let Some(t) = self.progress.lock().unwrap().get(id) {
-                            r.downloaded = t.last.downloaded;
-                            r.total = t.last.total;
+                    if r.dest_file.is_some() {
+                        match disk {
+                            Some(n) => {
+                                r.downloaded = n;
+                                r.total = Some(n);
+                            }
+                            // Torrent roots are directories: metadata.len()
+                            // is 0 there, so fall back to the last progress
+                            // snapshot when the walk fails.
+                            None => {
+                                if let Some((d, t)) = fallback {
+                                    r.downloaded = d;
+                                    r.total = t;
+                                }
+                            }
                         }
                     }
                 }
@@ -998,19 +1048,13 @@ impl Daemon {
     /// Track per-task progress and derive an EMA-smoothed speed.
     fn on_progress(&self, id: &str, p: Progress) {
         let mut map = self.progress.lock().unwrap();
-        // No eager p.clone() on the common path (existing entry): the
-        // progress ticker calls this every 500ms per task.
-        let entry = match map.get_mut(id) {
-            Some(e) => e,
-            None => {
-                map.insert(id.to_string(), ProgressTrack {
-                    last: p.clone(),
-                    speed: None,
-                    at: Instant::now(),
-                });
-                map.get_mut(id).unwrap()
-            }
-        };
+        // or_insert_with clones Progress only on the first tick per task;
+        // the common path skips the eager clone and the extra hash lookup.
+        let entry = map.entry(id.to_string()).or_insert_with(|| ProgressTrack {
+            last: p.clone(),
+            speed: None,
+            at: Instant::now(),
+        });
         let now = Instant::now();
         match p.percent {
             // Byte-free progress (video sidecar): percent only, no speed.
