@@ -126,9 +126,11 @@ enum Cmd {
     /// Register this binary as the browser's native messaging host
     /// (`ripdl host` mode triggers when Chrome passes an extension origin).
     RegisterHost {
-        /// Extension id from chrome://extensions -> Developer mode -> ID.
+        /// Extra extension IDs to allow besides the pinned one (from
+        /// chrome://extensions -> Developer mode -> ID, e.g. a dev build).
+        /// Repeatable. The pinned ID is always allowed.
         #[arg(long)]
-        ext_id: String,
+        ext_id: Vec<String>,
         /// Native host name (reverse dotted name; org.ripdl.host).
         #[arg(long, default_value = "org.ripdl.host")]
         host: String,
@@ -552,7 +554,7 @@ fn parse_header(s: &str) -> anyhow::Result<(String, String)> {
 
 /// Write the native-messaging manifest and point the browser's registry keys
 /// at it (HKCU, so no admin window ever appears).
-fn register_host(ext_id: &str, host: &str) -> anyhow::Result<()> {
+fn register_host(ext_ids: &[String], host: &str) -> anyhow::Result<()> {
     if host.is_empty()
         || !host
             .chars()
@@ -560,8 +562,17 @@ fn register_host(ext_id: &str, host: &str) -> anyhow::Result<()> {
     {
         bail!("host name must be lower-case [a-z0-9.], got '{host}'");
     }
-    if ext_id.is_empty() {
-        bail!("extension id missing (see chrome://extensions -> Developer mode -> ID)");
+
+    // allowed_origins: the pinned ID, whatever the caller adds, and whatever
+    // previous registrations allowed — re-registering must never strand an
+    // extension that worked before.
+    let mut origins = vec![format!("chrome-extension://{}/", ripdl_core::bridge::PINNED_EXT_ID)];
+    for id in ext_ids {
+        validate_ext_id(id, false)?;
+        let o = format!("chrome-extension://{id}/");
+        if !origins.contains(&o) {
+            origins.push(o);
+        }
     }
 
     let exe = std::env::current_exe().context("need our absolute path for the manifest")?;
@@ -569,23 +580,47 @@ fn register_host(ext_id: &str, host: &str) -> anyhow::Result<()> {
     if let Some(parent) = manifest_path.parent() {
         std::fs::create_dir_all(parent).context("create manifest directory")?;
     }
+    if let Ok(bytes) = std::fs::read(&manifest_path) {
+        // Re-registrations must never strand an extension that worked
+        // before: carry the previous origins forward (shape-checked).
+        if let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(list) = existing["allowed_origins"].as_array() {
+                for o in list.iter().filter_map(|v| v.as_str()) {
+                    let Some(rest) = o.strip_prefix("chrome-extension://") else {
+                        continue;
+                    };
+                    if !rest.ends_with('/') {
+                        continue;
+                    }
+                    let id = rest.trim_end_matches('/');
+                    if validate_ext_id(id, true).is_ok() && !origins.contains(&o.to_string()) {
+                        origins.push(o.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let manifest = serde_json::json!({
         "name": host,
         "description": "ripdl browser bridge",
         "path": exe.display().to_string(),
         "type": "stdio",
-        "allowed_origins": [format!("chrome-extension://{ext_id}/")],
+        "allowed_origins": origins,
     });
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
         .context("write manifest json")?;
 
     #[cfg(windows)]
     {
-        // Chrome and Edge keep per-user native-host entries under HKCU; the
-        // default value of the key is the path to our manifest.
+        // Per-user native-host entries under HKCU; the default value of the
+        // key is the path to our manifest. Everything Chromium-based we care
+        // about reads its own subtree (Brave keeps one under BraveSoftware,
+        // unlike Chrome/Edge which share Google's).
         for (browser, subkey) in [
             ("Chrome", r"Software\Google\Chrome\NativeMessagingHosts"),
             ("Edge", r"Software\Microsoft\Edge\NativeMessagingHosts"),
+            ("Brave", r"Software\BraveSoftware\Brave\NativeMessagingHosts"),
         ] {
             let key = format!(r"HKCU\{subkey}\{host}");
             let out = std::process::Command::new("reg")
@@ -599,7 +634,7 @@ fn register_host(ext_id: &str, host: &str) -> anyhow::Result<()> {
                 );
             }
         }
-        println!("registered for Chrome and Edge (HKCU, per-user)");
+        println!("registered for Chrome, Edge and Brave (HKCU, per-user)");
     }
     #[cfg(not(windows))]
     {
@@ -609,9 +644,29 @@ fn register_host(ext_id: &str, host: &str) -> anyhow::Result<()> {
         );
     }
 
+    if origins.len() > 1 {
+        println!("allowed extension ids:");
+        for o in &origins {
+            println!("  {o}");
+        }
+    }
     println!("host manifest: {}", manifest_path.display());
     println!("next: load the extension unpacked (chrome://extensions -> Developer mode -> Load unpacked), then reload it after every `cargo build`");
     Ok(())
+}
+
+/// A Chromium extension ID is 32 base-16-ish chars (letters a..p). With an
+/// empty input (no --ext-id given) treat it as "nothing extra" instead of
+/// an error.
+fn validate_ext_id(id: &str, strict: bool) -> anyhow::Result<()> {
+    let ok = id.len() == 32 && id.chars().all(|c| ('a'..='p').contains(&c));
+    if ok {
+        return Ok(());
+    }
+    if !strict && id.is_empty() {
+        return Ok(());
+    }
+    bail!("extension id must be 32 letters a-p, got '{id}'")
 }
 
 /// Parse a human speed cap like `500k`, `2.5m`, `1g`, or plain bytes/sec.

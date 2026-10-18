@@ -8,20 +8,32 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
 
    ```
    cargo build
-   ripdl register-host --ext-id <EXTENSION-ID>
+   ripdl register-host
    ```
 
-   `<EXTENSION-ID>` comes from chrome://extensions -> Developer mode ->
-   **Load unpacked** -> this directory -> the ID shown on the card. Then
-   click **Reload** on the extension card once (nativeMessaging manifests
-   are read at extension startup; a reload connects it).
+   The extension pins its own ID (see below), so `register-host` needs no
+   ID by default: it allows the pinned one everywhere. Extra dev/build IDs
+   (e.g. an older loaded copy) can be added with `--ext-id <ID>`, repeatable
+   — and previously allowed IDs are never dropped on re-register.
+   Then click **Reload** on the extension card in chrome://extensions once
+   (nativeMessaging manifests are read at extension startup).
 
-2. What `register-host` does: writes
-   `%LOCALAPPDATA%\ripdl\org.ripdl.host.json` pointing at the ripdl binary
-   and sets the per-user HKCU keys for Chrome and Edge. No admin window.
+2. Browsers: `register-host` sets the per-user HKCU keys for **Chrome,
+   Edge and Brave**. What it writes:
+   `%LOCALAPPDATA%\ripdl\org.ripdl.host.json` pointing at the ripdl binary.
+   No admin window.
 
 3. Start the daemon (`ripdl-daemon`) or let the host spawn it automatically
    on first capture (it looks for `ripdl-daemon` next to the ripdl binary).
+
+### Pinned extension ID
+
+`manifest.json` embeds an RSA public key (`"key"`), which overrides
+Chromium's default unpacked-ID derivation from the load path. Without it,
+loading the zip from a different folder silently changes the ID and the
+native host rejects it ("daemon not detected"). With the pin, every unpacked
+load of *any* ripdl extension build has id
+`ripdl-core::bridge::PINNED_EXT_ID` (`cimcjenbnacepkgebkmpkggjoahdmggc`).
 
 ## How capture works
 

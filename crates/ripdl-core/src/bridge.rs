@@ -29,6 +29,13 @@ pub const HOST_TO_BROWSER_MAX: usize = 1024 * 1024;
 /// but a frame header far beyond anything a real message carries is a bug.
 pub const BROWSER_TO_HOST_MAX: usize = 16 * 1024 * 1024;
 
+/// Stable unpacked-extension ID. `ext/manifest.json` embeds a pinned RSA
+/// public key ("key" field), which overrides Chromium's default
+/// load-path-hash ID derivation - loading the extension from any folder
+/// gives this ID everywhere, so `register-host` knows it by default and
+/// users never hit a silently-rejected native host after moving the folder.
+pub const PINNED_EXT_ID: &str = "cimcjenbnacepkgebkmpkggjoahdmggc";
+
 /// One request from the browser: its id is opaque and echoed back unchanged.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NativeRequest {

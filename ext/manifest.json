@@ -4,6 +4,12 @@
   "version": "0.3.0",
   "description": "Send downloads to ripdl - the free, ad-free download manager.",
   "minimum_chrome_version": "88",
+  // Pinned RSA public key: unpacked-extension IDs are otherwise derived from
+  // the load path, so loading the zip from a different folder changes the ID
+  // and the native host silently rejects it. With a key embedded, the ID is
+  // stable on every machine: cimcjenbnacepkgebkmpkggjoahdmggc
+  // ("ripdl register-host" with the default id always matches this).
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4RlNVVbFIImaJOQ1H8inFq8r0ZyGi0Gs/7oFbgbt4WCOM5JB/XVW2d5XFq1HAvzSXGzH/kUAwnm+Yf073D+HjVRQ0LKYwDxlpzJO3ecWlzzWY4pwVGwsfHR7jPmTkzOjeokIOG4l4Xy6w/hZmafrJgeOpCzb4Z0fz1eE4wYB/slwSICZum6JHiwitSoyricIJSYmXA/P8UhzhqjMNIObu0c01OSGUmkFrwmdps6tUSJ9H6fu0HVMVW3fx27OSdxYSr5UDVvcoFh63spg5fgaufUjo/HEPwBClCiLnZwehbBYPtN8m+TBt2sbyILt1S5hpsf6r0cf/L5zSLXZY5rIVQIDAQAB",
   "permissions": [
     "downloads",
     "nativeMessaging",
