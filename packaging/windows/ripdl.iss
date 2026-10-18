@@ -20,7 +20,7 @@ OutputDir=dist
 OutputBaseFilename=ripdl-v{#APP_VERSION}-x86_64-windows-setup
 Compression=lzma2/max
 SolidCompression=yes
-Architectures=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 
 [Tasks]
