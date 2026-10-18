@@ -3,6 +3,11 @@
 ;   ISCC /DAPP_VERSION=x.y.z packaging/windows/ripdl.iss
 ; Contents: ripdl (CLI + native-messaging host), ripdl-daemon (queue owner),
 ; ripdl-gui (UI shell; auto-spawns the daemon), ext/ (browser capture).
+;
+; Upgrade path: the AppId below is the install identity — it must NEVER
+; change, or Setup would detect no previous installation. Running this
+; installer over an existing ripdl replaces the binaries in place and keeps
+; settings + queue (%LOCALAPPDATA%\ripdl) untouched.
 
 [Setup]
 AppId=org.ripdl
@@ -10,6 +15,8 @@ AppName=ripdl
 AppVersion={#APP_VERSION}
 AppPublisher=ripdl
 AppPublisherURL=https://github.com/ShiniM0d0ri/ripdl
+UninstallDisplayName=ripdl
+UninstallDisplayIcon={app}\ripdl-gui.exe
 DefaultDirName={autopf}\ripdl
 DefaultGroupName=ripdl
 DisableProgramGroupPage=yes
@@ -22,6 +29,12 @@ Compression=lzma2/max
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
+; Restart Manager closes a running GUI/daemon whenever possible instead of
+; demanding a reboot; OpenFilesFromRM shows its name in the files-in-use
+; list. PrepareToInstall + the uninstall step additionally taskkill as a
+; belt-and-braces measure below.
+CloseApplications=yes
+RestartApplications=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "Additional icons:"; Flags: unchecked
@@ -39,9 +52,74 @@ Name: "{group}\ripdl"; Filename: "{app}\ripdl-gui.exe"
 Name: "{group}\ripdl command line"; Filename: "{app}\ripdl.exe"
 Name: "{autodesktop}\ripdl"; Filename: "{app}\ripdl-gui.exe"; Tasks: desktopicon
 
+[InstallDelete]
+; A new release may rename or drop files under ext/; recopying over the old
+; tree would leave stale scripts behind. Wipe it, then recopy, every time.
+Type: filesandordirs; Name: "{app}\ext"
+
 [Run]
 Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall nowait skipifsilent
 
-[UninstallDelete]
-; Nothing extra: the daemon's data dir (%LOCALAPPDATA%\ripdl) is user data and
-; survives uninstalls on purpose.
+[UninstallRun]
+; The native-messaging registrations below are deleted from Pascal code so
+; foreign keys stay untouched; nothing else runs on uninstall.
+
+[Code]
+// Belt-and-braces process killer: the Restart Manager usually arranges the
+// file locks on its own, but silent installs (/S) skip its prompt, so both
+// the upgrade and the uninstall paths call this first. Harmless no-op when
+// nothing is running.
+procedure KillRipdlProcesses;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'),
+       '/F /IM ripdl-daemon.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'),
+       '/F /IM ripdl-gui.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'),
+       '/F /IM ripdl.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Uninstall-time native-messaging cleanup: delete the HKCU keys this
+// install created (Chrome, Edge, Brave), but only when their manifest
+// value really is ripdl's. A left-behind key pointing at a ripdl path in
+// Program Files would break; a foreign key (another app's host under the
+// same key name with a different manifest) must survive.
+procedure RemoveNativeHostRegistrations;
+const
+  Root = 'org.ripdl.host';
+  Subkeys: array[1..3] of String = (
+    'Software\Google\Chrome\NativeMessagingHosts',
+    'Software\Microsoft\Edge\NativeMessagingHosts',
+    'Software\BraveSoftware\Brave\NativeMessagingHosts'
+  );
+var
+  I: Integer;
+  Key, Manifest: String;
+begin
+  for I := Low(Subkeys) to High(Subkeys) do
+  begin
+    Key := Subkeys[I] + '\' + Root;
+    if RegQueryStringValue(HKCU, Key, '', Manifest) then
+      if Pos('ripdl', LowerCase(Manifest)) > 0 then
+        RegDeleteKeyIncludingSubkeys(HKCU, Key);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    KillRipdlProcesses;
+    RemoveNativeHostRegistrations;
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  // Runs right before files are copied: stop the daemon/GUI so an in-place
+  // upgrade never trips over a locked exe.
+  KillRipdlProcesses;
+  Result := ''; // no error = keep going
+end;

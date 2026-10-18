@@ -16,9 +16,11 @@ Prebuilt binaries for **Windows x64** and **Linux x64** are attached to each
 [GitHub Release](https://github.com/ShiniM0d0ri/ripdl/releases) (tagged
 releases; latest build → latest tag).
 
-- Windows: unzip `ripdl-v*-x86_64-pc-windows-msvc.zip`, put `ripdl.exe` /
-  `ripdl-daemon.exe` on your `PATH`. The MV3 browser extension is included
-  in the same archive under `ext/`.
+- Windows: run `ripdl-v*-x86_64-windows-setup.exe` (installs to
+  `C:\Program Files\ripdl`, Start-menu entry, in-place upgrades green-light
+  the older version), or unzip the portable `ripdl-v*-x86_64-windows.zip`
+  and put `ripdl.exe` / `ripdl-daemon.exe` on your `PATH`. The MV3 browser
+  extension ships with both under `ext/`.
 - Linux: extract `ripdl-v*-x86_64-unknown-linux-gnu.tar.gz`
   (`tar -xzf ripdl-*.tar.gz -C ~/.local/bin`).
 
@@ -39,6 +41,43 @@ Build from source instead (Rust 1.98+):
 ```sh
 cargo build --release
 ```
+
+## Updating
+
+- **GUI**: `Help → Check for Updates` (or just wait — the GUI
+  auto-checks once per launch when the *Check for updates at startup*
+  setting is on, default). When a newer release exists a banner appears
+  with an **Open release page** button that runs the new installer over
+  the old one. Turn the startup check off in Settings.
+- **CLI**: `ripdl update` prints the installed/latest versions and the
+  release URL. It never downloads anything by itself — no daemon needed.
+- **Windows**: re-run the new `setup.exe` over the old install. The
+  installer has the same AppId, closes a running GUI/daemon, replaces the
+  binaries and the `ext/` tree, and keeps everything user-side:
+  downloads, the queue (`%LOCALAPPDATA%\ripdl`), and browser
+  registrations.
+- **Manual/portable installs**: download the new zip, replace the exes
+  while no task is running.
+- The check is one direct request to `api.github.com` when you ask for it
+  (or at GUI start): no accounts, no machine fingerprint, no telemetry of
+  any kind.
+
+## Uninstalling
+
+- **Windows**: Settings → Apps → *ripdl* → *Uninstall*
+  (or `C:\Program Files\ripdl\unins000.exe`). This stops the daemon/GUI,
+  removes `C:\Program Files\ripdl`, and cleans up the per-user
+  native-messaging keys it registered (Chrome / Edge / Brave).
+  - Your downloads and `%LOCALAPPDATA%\ripdl` (queue, settings) are user
+    data and are **kept** — delete that folder yourself if you want a
+    spotless machine.
+  - Browser extension: remove it from the browser manually
+    (`chrome://extensions` → Remove) — extensions live in your browser,
+    not in ripdl's folders.
+- **Portable**: delete the folder you unzipped to; nothing else remains.
+- **Linux**: remove the binaries from wherever you extracted them
+  (e.g. `rm ~/.local/bin/ripdl*`). The unix socket and queue live under
+  the daemon's data dir and go if you delete that too.
 
 ## Status
 
@@ -66,6 +105,7 @@ Check [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 | **Torrents** (librqbit; magnets/.torrent, file picks, sequential) | ✅ v0.2 |
 | **P4 hunt offers in the extension popup** (yt-dlp / direct media) | ✅ v0.2 |
 | **NIC bonding — torrents** (outgoing peer rotation, vendored librqbit) | ✅ v0.3 |
+| **Update check** (GUI banner + `ripdl update`, GitHub releases) | ✅ v0.4 |
 | Shared speed cap, per-task quota polish, selected-links capture | 🚧 backlog |
 | DNR fallback for referer | 🚧 backlog |
 

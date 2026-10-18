@@ -138,6 +138,13 @@ settings panel + tray landed: `GetConfig`/`SetConfig` RPC (core
 resizes the runner semaphore live), GUI Settings dialog (toolbar gear),
 tray icon with close-to-tray (`hide_to_tray` preference in config.json).
 Remaining P2: nothing major.
+Update mechanism landed: `ripdl-core::update` (GitHub Releases probe of
+`api.github.com`, v-compare, tests incl. mock server), RPC `CheckUpdate` →
+`Reply::Update`, CLI `ripdl update`, GUI banner + Help menu + per-launch
+auto-check (setting `update_check`, default on). Information only — never
+auto-downloads. Windows setup upgraded in place (`AppId` fixed forever,
+[Code] kills daemon/GUI before file copy, `[InstallDelete]` refreshes
+`ext/`, uninstaller removes ripdl's per-user native-messaging keys).
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

@@ -165,7 +165,16 @@ M3.4 - tests / verification:
 ## P5 - ship it
 
 - [x] Packaging: GitHub Release pipeline (portable zip + Inno setup.exe,
-      tar.gz + deb/rpm, extension zip + SHA256SUMS) - proven v0.2.0
+      tar.gz + deb/rpm, extension zip + SHA256SUMS) - proven v0.2.0. The
+      Windows setup upgrades in place (fixed `AppId`, closes a running
+      daemon/GUI, refreshes `ext/`) and the uninstaller removes the
+      per-user native-messaging keys; "Updating"/"Uninstalling" documented
+      in the README.
+- [x] Update mechanism: core `update` module (GitHub Releases probe, v-semver
+      compare) + RPC `CheckUpdate` + `Reply::Update`; GUI auto-check once per
+      launch (setting `update_check`, default on) with a release-page banner,
+      Help menu item, CLI `ripdl update`. Information only - never
+      auto-downloads; one api.github.com GET, no telemetry.
 - [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n
