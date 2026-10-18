@@ -175,6 +175,13 @@ M3.4 - tests / verification:
       launch (setting `update_check`, default on) with a release-page banner,
       Help menu item, CLI `ripdl update`. Information only - never
       auto-downloads; one api.github.com GET, no telemetry.
+- [x] Auto-update install: verified download path (`UpdateAsset` from release
+      JSON, SHA256SUMS.txt check, streamed to `<data_dir>/update` with size cap,
+      .part-atomic swap, re-use of a previously verified installer), RPC
+      `UpdateInstall` (busy-guarded), GUI banner "Download & Install" +
+      `update_auto_install` opt-in setting (daemon-side unattended
+      `/VERYSILENT` run at boot; installer replaces ripdl in place), CLI
+      `ripdl update --install`. Old installers pruned after a week.
 - [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n

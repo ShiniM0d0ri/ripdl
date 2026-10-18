@@ -197,6 +197,14 @@ async fn check_update() -> Result<ripdl_core::update::UpdateInfo, String> {
     }
 }
 
+/// One-click upgrade: the daemon downloads the SHA256-verified setup.exe
+/// and launches it; the installer then replaces ripdl in place (and stops
+/// this GUI as part of that).
+#[tauri::command]
+async fn install_update() -> Result<(), String> {
+    expect_ok(rpc(Command::UpdateInstall).await?)
+}
+
 /// Open a URL in the user's browser (update banner, Help menu).
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
@@ -381,6 +389,7 @@ fn main() {
             get_config,
             set_config,
             check_update,
+            install_update,
             open_url,
             exit_app
         ])

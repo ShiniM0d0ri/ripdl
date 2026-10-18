@@ -571,15 +571,40 @@ async function runUpdateCheck(initial) {
     }
 }
 
+// One-click upgrade: daemon downloads the SHA256-verified setup.exe and
+// launches it; the installer closes this GUI on the way to replacing us,
+// so the last visible act here is the banner text.
+async function installUpdate() {
+    const el = $("#update-text");
+    el.textContent = "Downloading & verifying the new setup\u2026";
+    try {
+        await invokeSafe("install_update");
+        el.textContent = "Installer launched \u2014 follow its prompts; ripdl will close and reopen itself.";
+    } catch (e) {
+        flashErr(String(e).replace(/^.*error: /, ""));
+        el.textContent = "Install failed \u2014 use \u201cOpen release page\u201d instead.";
+    }
+}
+
 $("#update-open").onclick = openReleases;
+$("#update-install").onclick = installUpdate;
 $("#update-dismiss").onclick = () => $("#update-banner").classList.add("hidden");
 
-// Once per GUI launch, gated by the settings switch (default on). Errors
-// are deliberately invisible here.
+// Once per GUI launch, gated by the settings switches (checks on by
+// default; full auto-install off by default). Errors are deliberately
+// invisible here.
 (async () => {
     try {
         const s = await invokeSafe("get_config");
-        if (s.update_check ?? true) runUpdateCheck(true);
+        if (s.update_check ?? true) {
+            runUpdateCheck(true);
+            // Opt-in fully automatic path: the daemon downloads & runs the
+            // verified installer unattended. The daemon's own boot path may
+            // have raced ahead; "already latest" is a silent no-op there.
+            if (s.update_auto_install ?? false) {
+                invokeSafe("install_update").catch(() => {});
+            }
+        }
     } catch { /* config failure must not block the UI */ }
 })();
 
@@ -652,6 +677,7 @@ async function openSettings() {
     $("#set-tray").checked = true;
     $("#set-bond").checked = false;
     $("#set-update").checked = true;
+    $("#set-auto").checked = false;
     try {
         const s = await invokeSafe("get_config");
         $("#set-conc").value = s.max_concurrent ?? "";
@@ -663,6 +689,7 @@ async function openSettings() {
         $("#set-tray").checked = s.hide_to_tray ?? true;
         $("#set-bond").checked = s.bond_interfaces ?? false;
         $("#set-update").checked = s.update_check ?? true;
+        $("#set-auto").checked = s.update_auto_install ?? false;
         $("#set-backdrop").classList.remove("hidden");
         $("#set-conc").focus();
     } catch (e) {
@@ -706,6 +733,7 @@ async function saveSettings() {
         hide_to_tray: $("#set-tray").checked,
         bond_interfaces: $("#set-bond").checked,
         update_check: $("#set-update").checked,
+        update_auto_install: $("#set-auto").checked,
     };
     try {
         await invokeSafe("set_config", { settings: payload });

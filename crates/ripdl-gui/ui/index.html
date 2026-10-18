@@ -36,7 +36,8 @@
   <div id="update-banner" class="hidden">
     <span id="update-text"></span>
     <span class="update-gap"></span>
-    <button id="update-open" class="primary">Open release page</button>
+    <button id="update-install" class="primary">Download &amp; Install</button>
+    <button id="update-open">Open release page</button>
     <button id="update-dismiss" title="Dismiss">&times;</button>
   </div>
 
@@ -150,6 +151,8 @@
         <div class="set-row"><label for="set-bond">Combine network connections (bond all NICs)</label><input id="set-bond" type="checkbox" class="chk-box" /></div>
 
         <div class="set-row"><label for="set-update">Check for updates at startup</label><input id="set-update" type="checkbox" class="chk-box" /></div>
+
+        <div class="set-row"><label for="set-auto" title="When a startup check finds a newer release: download the SHA256-verified installer and run it unattended (only the UAC prompt shows)">Download &amp; install updates automatically</label><input id="set-auto" type="checkbox" class="chk-box" /></div>
       </div>
       <div class="set-actions">
         <button id="set-cancel">Cancel</button>

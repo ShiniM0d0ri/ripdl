@@ -141,10 +141,17 @@ Remaining P2: nothing major.
 Update mechanism landed: `ripdl-core::update` (GitHub Releases probe of
 `api.github.com`, v-compare, tests incl. mock server), RPC `CheckUpdate` →
 `Reply::Update`, CLI `ripdl update`, GUI banner + Help menu + per-launch
-auto-check (setting `update_check`, default on). Information only — never
-auto-downloads. Windows setup upgraded in place (`AppId` fixed forever,
-[Code] kills daemon/GUI before file copy, `[InstallDelete]` refreshes
-`ext/`, uninstaller removes ripdl's per-user native-messaging keys).
+auto-check (setting `update_check`, default on). Plus an explicit install
+path: `UpdateAsset` (windows-setup.exe picker), SHA256SUMS.txt verification,
+streamed 256 MiB-capped download into `<data_dir>/update` (atomic `.part`
+swap, reuse-by-size of a previously verified installer, week-pruning at
+boot), RPC `UpdateInstall` (AtomicBool busy-guard, `silent` variant), GUI
+banner "Download & Install" button + `update_auto_install` opt-in setting
+(daemon does the unattended `/VERYSILENT` run at boot), CLI
+`ripdl update --install`; sha2 dep. Windows setup upgraded in place
+(`AppId` fixed forever, [Code] kills daemon/GUI before file copy,
+`[InstallDelete]` refreshes `ext/`, uninstaller removes ripdl's per-user
+native-messaging keys).
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

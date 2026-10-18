@@ -45,12 +45,21 @@ cargo build --release
 ## Updating
 
 - **GUI**: `Help → Check for Updates` (or just wait — the GUI
-  auto-checks once per launch when the *Check for updates at startup*
-  setting is on, default). When a newer release exists a banner appears
-  with an **Open release page** button that runs the new installer over
-  the old one. Turn the startup check off in Settings.
+  auto-checks once per launch; the *Check for updates at startup* setting
+  is on by default). When a newer release exists a banner appears with
+  **Download & Install** — one click: the daemon downloads the setup.exe,
+  verifies its SHA-256 against the release's `SHA256SUMS.txt`, and runs
+  the installer, which closes ripdl, replaces itself in place, and starts
+  the new version. **Open release page** is always there as the manual
+  fallback.
+- **Fully automatic (opt-in)**: turn on *Download & install updates
+  automatically* in Settings and updates install themselves at startup —
+  the installer runs unattended (`/VERYSILENT`), so the only visible step
+  is the standard UAC prompt. Off by default.
 - **CLI**: `ripdl update` prints the installed/latest versions and the
-  release URL. It never downloads anything by itself — no daemon needed.
+  release URL; `ripdl update --install` does the same verified
+  download-and-run suited for scripting. It never downloads anything on
+  its own — no daemon needed for a plain check.
 - **Windows**: re-run the new `setup.exe` over the old install. The
   installer has the same AppId, closes a running GUI/daemon, replaces the
   binaries and the `ext/` tree, and keeps everything user-side:
@@ -58,9 +67,9 @@ cargo build --release
   registrations.
 - **Manual/portable installs**: download the new zip, replace the exes
   while no task is running.
-- The check is one direct request to `api.github.com` when you ask for it
-  (or at GUI start): no accounts, no machine fingerprint, no telemetry of
-  any kind.
+- The checks are direct requests to `api.github.com` / the asset CDN at
+  the moments described above: no accounts, no machine fingerprint, no
+  telemetry of any kind.
 
 ## Uninstalling
 
@@ -106,6 +115,7 @@ Check [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 | **P4 hunt offers in the extension popup** (yt-dlp / direct media) | ✅ v0.2 |
 | **NIC bonding — torrents** (outgoing peer rotation, vendored librqbit) | ✅ v0.3 |
 | **Update check** (GUI banner + `ripdl update`, GitHub releases) | ✅ v0.4 |
+| **Auto-update install** (SHA256-verified setup download + launch) | ✅ v0.4 |
 | Shared speed cap, per-task quota polish, selected-links capture | 🚧 backlog |
 | DNR fallback for referer | 🚧 backlog |
 
