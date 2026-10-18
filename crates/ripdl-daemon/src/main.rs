@@ -674,8 +674,37 @@ impl Daemon {
             rec
         };
         if delete_files {
+            // Drain before sweeping: the runner is inside the queue's
+            // semaphore and reacts to cancellation, but its pause path may
+            // still write ONE final sidecar snapshot. Sweeping first would
+            // delete file + sidecar, then the runner would resurrect the
+            // sidecar (orphan resume state pointing at deleted bytes).
+            // The runner removes itself from `runtime` when finished.
+            let mut drained = false;
+            for _ in 0..60 {
+                if !self.runtime.lock().unwrap().contains_key(id) {
+                    drained = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             let removed = delete_artifacts(&evicted);
-            tracing::info!(id = id, files = removed.len(), "deleted task files");
+            tracing::info!(id = id, files = removed.len(), drained, "deleted task files");
+            if !drained {
+                // Runner still winding down (kept its semaphore permit until
+                // now): sweep again once it exits so nothing gets re-created.
+                let this = Arc::clone(self);
+                let rec = evicted.clone();
+                tokio::spawn(async move {
+                    for _ in 0..120 {
+                        if !this.runtime.lock().unwrap().contains_key(&rec.id) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    delete_artifacts(&rec);
+                });
+            }
         }
         self.progress.lock().unwrap().remove(id);
         // Release the task's ManagedTorrent from the shared session. Without

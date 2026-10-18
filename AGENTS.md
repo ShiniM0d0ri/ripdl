@@ -112,8 +112,17 @@ IDM-style task manager over daemon RPC (`list_tasks`/`add_task`/pause/
 resume/remove commands, static frontend embedded at build time, no bundler;
 auto-spawns the daemon like the bridge). Torrent rows show display names +
 Torrents sidebar filter; "Add Torrent" picker; details dialog (double-click)
-with Files/Peers/Trackers tabs refreshed every 2s. P4 extension stays live;
-hunt offers from the popup are the remaining P4 thread.
+with Files/Peers/Trackers tabs refreshed every 2s. P4 complete and E2E
+verified (2026-10-19): yt-dlp standalone binary via config `ytdlp_path`
+watched the "Me at the zoo" task end-to-end (`ripdl add … --video` →
+completed webm in Downloads), and the popup chain proven over CDP in
+headless Edge (branded Chrome ≥137 ignores `--load-extension`; a repurposed
+driver lives at `research/ext-e2e-cdp.js`): `ripdl_send` add and
+`ripdl_hunt_query` answered from the real popup-page context with the task
+completing on disk; `rm --files` now drains the runner before the path
+sweep so the pause path can no longer resurrect a sidecar after deletion
+(fix in `cmd_remove`, daemon). Media-URL offer rows and activeTab-granted
+page reads remain user-confirmable only in a real browser session.
 50 tests pass offline (`cargo test --workspace`), including an in-proc
 seeder↔leecher torrent round-trip.
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
@@ -138,5 +147,4 @@ existing on-disk files fixed via `AddTorrentOptions.overwrite = true`);
 remaining P3: none beyond backlog items below.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
-still speaks TCP), per-task quota polish,
-`rm` sidecar cleanup, global daemon speed cap.
+still speaks TCP), per-task quota polish, global daemon speed cap.
