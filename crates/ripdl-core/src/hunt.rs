@@ -405,7 +405,11 @@ mod tests {
         let s = args.join(" ");
         assert!(s.contains("--newline"), "{s}");
         assert!(s.contains("--no-playlist"), "{s}");
-        assert!(s.contains("D:\\dl\\%(title).180B.%(ext)s"), "{s}");
+        // The `-o` arg must be dest_dir joined with the template; compare via
+        // the same std join so the split between the Windows and POSIX path
+        // separators (`Path::push` vs `/`) is not asserted by string literal.
+        let o = args.iter().position(|a| a == "-o").expect("-o present");
+        assert_eq!(args[o + 1], c.dest_dir.join(OUTPUT_TEMPLATE).to_string_lossy().into_owned());
         assert!(s.contains("Cookie: sid=1"), "{s}");
         // Reserved header must not be duplicated from task headers.
         assert_eq!(s.matches("Accept-Language").count(), 1, "{s}");
