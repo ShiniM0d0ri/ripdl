@@ -118,6 +118,14 @@ impl Engine {
         if let Some(ip) = local {
             builder = builder.local_address(ip);
         }
+        // Dead-connection guards: a half-open server (accepts, then never
+        // sends and never FINs) would otherwise pend a segment forever and
+        // keep retry/backoff permanently disabled for it. Both timeouts are
+        // far above any legitimate read stall.
+        builder = builder
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(15));
         Ok(builder.build()?)
     }
 
@@ -273,6 +281,8 @@ impl Engine {
             let mut on_progress = on_progress;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
+                // Sentinel != any real value: force one write on the first tick.
+                let mut persisted_downloaded = u64::MAX;
                 loop {
                     tick.tick().await;
                     let drained = active.load(Ordering::SeqCst) == 0;
@@ -288,17 +298,33 @@ impl Engine {
                         });
                         break;
                     }
-                    let segments = cells.lock().expect("state cells").clone();
                     let downloaded_now = downloaded.load(Ordering::Relaxed);
-                    let file = TaskStateFile {
-                        segments,
-                        ..meta_task.clone()
-                    };
-                    let _ = write_sidecar(&state_path, &file);
+                    // Skip the disk write when no bytes landed since last tick
+                    // (retry backoff, limiter throttle, stalled server):
+                    // downloaded is the only sidecar field that moves between
+                    // ticks, so an unchanged counter means an unchanged file.
+                    if downloaded_now != persisted_downloaded {
+                        persisted_downloaded = downloaded_now;
+                        let segments = cells.lock().expect("state cells").clone();
+                        let file = TaskStateFile {
+                            segments,
+                            ..meta_task.clone()
+                        };
+                        // Serialize on this thread (cheap); the fs write+rename
+                        // runs on the blocking pool, keeping runtime workers
+                        // responsive under antivirus/flush stalls.
+                        if let Ok(json) = serde_json::to_vec(&file) {
+                            let path = state_path.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                write_sidecar_bytes(&path, json)
+                            })
+                            .await;
+                        }
+                    }
                     on_progress(Progress {
-                        id: file.id.clone(),
+                        id: meta_task.id.clone(),
                         downloaded: downloaded_now,
-                        total: file.total,
+                        total: meta_task.total,
                         percent: None,
                         speed_bps: None,
                     });
@@ -562,6 +588,12 @@ async fn segment_attempt(
         // Pace consumption: all segments draw from one shared budget.
         limiter.acquire(chunk.len() as u64).await;
 
+        // Flush before an extension that would exceed the preallocated
+        // capacity: a realloc here doubles the buffer and memcpy's the whole
+        // ~256 KiB block - every flush.
+        if buf.capacity() - buf.len() < chunk.len() {
+            flush!();
+        }
         buf.extend_from_slice(&chunk);
         if buf.len() >= SEGMENT_BUF {
             flush!();
@@ -619,9 +651,16 @@ fn sidecar_path(dest: &Path) -> PathBuf {
 }
 
 /// Atomic sidecar write: temp file + rename, so a crash mid-write never
-/// leaves a corrupt state file behind.
+/// leaves a corrupt state file behind. Compact JSON: the sidecar is never
+/// read by humans, and resume parses both forms.
 fn write_sidecar(path: &Path, file: &TaskStateFile) -> Result<()> {
-    let json = serde_json::to_vec_pretty(file).map_err(|e| Error::State(e.to_string()))?;
+    let json = serde_json::to_vec(file).map_err(|e| Error::State(e.to_string()))?;
+    write_sidecar_bytes(path, json)
+}
+
+/// Blocking half: writes prebuilt JSON bytes atomically. Lets the reporter
+/// serialize outside the blocking pool and keep runtime threads free.
+fn write_sidecar_bytes(path: &Path, json: Vec<u8>) -> Result<()> {
     let tmp = path.with_extension("ripdl.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, path)?;

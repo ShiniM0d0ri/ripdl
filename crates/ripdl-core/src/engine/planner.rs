@@ -75,8 +75,14 @@ fn total_from(resp: &reqwest::Response) -> Option<u64> {
     // Ranged probe: "bytes 0-0/12345"
     if let Some(cr) = headers.get(CONTENT_RANGE).and_then(|v| v.to_str().ok()) {
         if let Some(total) = cr.rsplit('/').next() {
+            // 0 (or a parse-failed jumble) must not become a plan total: the
+            // planner derives `end: total - 1` and 0u64 - 1 underflows.
             if let Ok(n) = total.parse::<u64>() {
-                return Some(n);
+                // 0 (weird server, empty file) must not become a plan total:
+                // the planner derives `end: total - 1` and 0u64 - 1 underflows.
+                if n > 0 {
+                    return Some(n);
+                }
             }
         }
     }
