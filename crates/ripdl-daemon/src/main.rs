@@ -568,7 +568,10 @@ impl Daemon {
     }
 
     fn cmd_list(&self, req_id: u64) -> Response {
-        let records = self.records.lock().unwrap().clone();
+        // The GUI polls this at 2 Hz; no snapshot deep-clone of every record
+        // (urls, paths, file vectors) needed - iterate the guard directly.
+        // Lock order records -> progress matches set_completed.
+        let records = self.records.lock().unwrap();
         let progress = self.progress.lock().unwrap();
 
         let tasks = records
@@ -599,6 +602,8 @@ impl Daemon {
             })
             .collect();
 
+        drop(records);
+        drop(progress);
         Response { id: req_id, reply: Reply::Tasks { tasks } }
     }
 
@@ -993,11 +998,19 @@ impl Daemon {
     /// Track per-task progress and derive an EMA-smoothed speed.
     fn on_progress(&self, id: &str, p: Progress) {
         let mut map = self.progress.lock().unwrap();
-        let entry = map.entry(id.to_string()).or_insert(ProgressTrack {
-            last: p.clone(),
-            speed: None,
-            at: Instant::now(),
-        });
+        // No eager p.clone() on the common path (existing entry): the
+        // progress ticker calls this every 500ms per task.
+        let entry = match map.get_mut(id) {
+            Some(e) => e,
+            None => {
+                map.insert(id.to_string(), ProgressTrack {
+                    last: p.clone(),
+                    speed: None,
+                    at: Instant::now(),
+                });
+                map.get_mut(id).unwrap()
+            }
+        };
         let now = Instant::now();
         match p.percent {
             // Byte-free progress (video sidecar): percent only, no speed.
