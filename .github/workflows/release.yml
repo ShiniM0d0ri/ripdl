@@ -51,7 +51,7 @@ jobs:
           $v = "${{ steps.ver.outputs.version }}"
           $stage = "ripdl-v$v"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item target\release\ripgrep.exe $stage\
+          Copy-Item target\release\ripdl.exe $stage\
           Copy-Item target\release\ripdl-daemon.exe $stage\
           Copy-Item target\release\ripdl-gui.exe $stage\
           Copy-Item ext "$stage\ext" -Recurse
@@ -111,7 +111,7 @@ jobs:
         run: |
           V="${{ steps.ver.outputs.version }}"
           mkdir -p "ripdl-v$V"
-          cp target/release/ripgrep target/release/ripdl-daemon target/release/ripdl-gui "ripdl-v$V/"
+          cp target/release/ripdl target/release/ripdl-daemon target/release/ripdl-gui "ripdl-v$V/"
           cp -r ext "ripdl-v$V/ext"
           cp README.md LICENSE-MIT LICENSE-APACHE "ripdl-v$V/"
           tar -czf "ripdl-v$V-x86_64-linux.tar.gz" -C . "ripdl-v$V"

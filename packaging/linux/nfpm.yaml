@@ -18,8 +18,8 @@ description: |-
 homepage: https://github.com/ShiniM0d0ri/ripdl
 license: MIT OR Apache-2.0
 contents:
-  - src: "${RIPDL_BIN}/ripgrep"
-    dst: /usr/bin/ripgrep
+  - src: "${RIPDL_BIN}/ripdl"
+    dst: /usr/bin/ripdl
   - src: "${RIPDL_BIN}/ripdl-daemon"
     dst: /usr/bin/ripdl-daemon
   - src: "${RIPDL_BIN}/ripdl-gui"

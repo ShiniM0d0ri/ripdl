@@ -28,7 +28,7 @@ WizardStyle=modern
 Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-Source: "target\release\ripgrep.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "target\release\ripdl.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "target\release\ripdl-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "target\release\ripdl-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "ext\*"; DestDir: "{app}\ext"; Flags: ignoreversion recursesubdirs
@@ -37,7 +37,7 @@ Source: "LICENSE-APACHE"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\ripdl"; Filename: "{app}\ripdl-gui.exe"
-Name: "{group}\ripdl command line"; Filename: "{app}\ripgrep.exe"
+Name: "{group}\ripdl command line"; Filename: "{app}\ripdl.exe"
 Name: "{autodesktop}\ripdl"; Filename: "{app}\ripdl-gui.exe"; Tasks: desktopicon
 
 [Run]
