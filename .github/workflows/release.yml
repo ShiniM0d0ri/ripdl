@@ -125,7 +125,8 @@ jobs:
           export RIPDL_VERSION="$V"
           export RIPDL_BIN="$PWD/target/release"
           export RIPDL_SRC="$PWD"
-          "$(go env GOPATH)/bin/nfpm" package --config packaging/linux/nfpm.yaml --target dist
+          "$(go env GOPATH)/bin/nfpm" package --config packaging/linux/nfpm.yaml --packager deb --target dist
+          "$(go env GOPATH)/bin/nfpm" package --config packaging/linux/nfpm.yaml --packager rpm --target dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
