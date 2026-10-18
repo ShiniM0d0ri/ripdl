@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -95,6 +95,9 @@ struct Daemon {
     torrents: tokio::sync::Mutex<Option<Arc<ripdl_core::torrent::TorrentSession>>>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
+    /// Update-install lock: two concurrent setups would fight over the
+    /// same .part file. compare_exchange'd around run_update_install.
+    update_busy: std::sync::atomic::AtomicBool,
 }
 
 /// Daemon policy from `<data_dir>/config.json`. Shared type with all
@@ -128,6 +131,7 @@ impl Daemon {
             torrents: tokio::sync::Mutex::new(None),
             shutdown: tokio::sync::Notify::new(),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            update_busy: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -347,6 +351,7 @@ impl Daemon {
             Command::GetConfig => self.cmd_get_config(req.id),
             Command::SetConfig { settings } => self.cmd_set_config(req.id, settings).await,
             Command::CheckUpdate => self.cmd_check_update(req.id).await,
+            Command::UpdateInstall => self.cmd_update_install(req.id, false).await,
         }
     }
 
@@ -370,6 +375,51 @@ impl Daemon {
                 reply: Reply::Error { message: e.to_string() },
             },
         }
+    }
+
+    /// Explicit install: SHA256-verified setup.exe download then launch.
+    /// `silent` = unattended (/VERYSILENT) for the opt-in auto path.
+    async fn cmd_update_install(self: &Arc<Self>, req_id: u64, silent: bool) -> Response {
+        match self.run_update_install(silent).await {
+            Ok(()) => Response { id: req_id, reply: Reply::Ok },
+            Err(e) => Response {
+                id: req_id,
+                reply: Reply::Error { message: e.to_string() },
+            },
+        }
+    }
+
+    async fn run_update_install(self: &Arc<Self>, silent: bool) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self
+            .update_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            bail!("an update is already being fetched");
+        }
+        let result = self.run_update_install_inner(silent).await;
+        self.update_busy.store(false, Ordering::SeqCst);
+        result
+    }
+
+    async fn run_update_install_inner(self: &Arc<Self>, silent: bool) -> anyhow::Result<()> {
+        let info = ripdl_core::update::fetch_latest().await
+            .context("update check failed")?;
+        if !info.update_available {
+            bail!("already on the latest release (v{})", info.current);
+        }
+        let setup = info.setup.as_ref()
+            .context("the new release has no Windows setup.exe attached")?;
+        let update_dir = ripdl_core::update::update_dir(
+            self.config_path.parent().unwrap_or(&std::env::temp_dir()),
+        );
+        let path = ripdl_core::update::download_setup(&update_dir, setup, info.sha256.as_ref())
+            .await
+            .context("installer download failed")?;
+        tracing::info!(path = %path.display(), "launching upgrade installer");
+        ripdl_core::update::run_installer(&path, silent)
+            .context("failed to launch installer")
     }
 
     /// Replace the settings wholesale, persist them, and live-apply the
@@ -1374,11 +1424,24 @@ async fn real_main() -> Result<()> {
         .join("ripdl");
     std::fs::create_dir_all(&data_dir).context("create data directory")?;
     let queue_path = data_dir.join("queue.json");
+    // Stale installers (kept a week as rollback) and half downloads.
+    ripdl_core::update::prune_update_dir(&ripdl_core::update::update_dir(&data_dir));
 
     let config_path = data_dir.join("config.json");
     let config = DaemonConfig::load(&config_path);
     let daemon = Arc::new(Daemon::new(queue_path, config_path, config).context("init daemon")?);
     daemon.boot_resume().context("resume queue")?;
+    // Opt-in fully-automatic updates: after the queue settles, check and
+    // (SHA256-verified) install a newer release unattended.
+    if daemon.conf().update_check() && daemon.conf().update_auto_install() {
+        let d = daemon.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if let Err(e) = d.run_update_install(true).await {
+                tracing::warn!(error = %e, "automatic update failed (retries next launch)");
+            }
+        });
+    }
     daemon.run().await
 }
 

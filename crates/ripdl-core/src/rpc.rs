@@ -42,6 +42,12 @@ pub struct DaemonSettings {
     /// newer release when the app starts. Default on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
+    /// When a startup check finds a newer release AND this is on: download
+    /// the SHA256-verified Windows setup.exe and run it unattended
+    /// (`/VERYSILENT`); only the UAC prompt shows. Default off — new
+    /// releases install on one explicit click unless the user opts in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_auto_install: Option<bool>,
 }
 
 impl DaemonSettings {
@@ -109,6 +115,11 @@ impl DaemonSettings {
         self.update_check.unwrap_or(true)
     }
 
+    /// Startup update checks also install automatically (default off).
+    pub fn update_auto_install(&self) -> bool {
+        self.update_auto_install.unwrap_or(false)
+    }
+
     /// Apply a partial update: every `Some(x)` in `patch` wins; `None`
     /// leaves the current value untouched. Useful for CLI-style
     /// single-key edits on top of the live values.
@@ -139,6 +150,9 @@ impl DaemonSettings {
         }
         if patch.update_check.is_some() {
             self.update_check = patch.update_check;
+        }
+        if patch.update_auto_install.is_some() {
+            self.update_auto_install = patch.update_auto_install;
         }
     }
 }
@@ -203,6 +217,11 @@ pub enum Command {
     /// Ask GitHub whether a newer release exists than the running build.
     /// One direct api.github.com GET; never automatic, no telemetry.
     CheckUpdate,
+    /// Download the latest release's Windows setup.exe (SHA256-verified
+    /// against the release's SHA256SUMS.txt) and run it, upgrading in
+    /// place. Only reached via an explicit click or the
+    /// `update_auto_install` opt-in setting.
+    UpdateInstall,
     /// Replace the daemon settings wholesale (omitted fields = default).
     /// Persisted to `<data_dir>/config.json`; `max_concurrent` applies
     /// live, the rest take effect on the next task start.

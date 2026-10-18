@@ -132,7 +132,7 @@ enum Cmd {
         /// just show the current settings. Valid keys: max_concurrent,
         /// max_segments, min_segment_size, max_speed_bytes (0 = uncapped),
         /// default_download_dir, ytdlp_path, hide_to_tray, bond_interfaces,
-        /// update_check (true|false).
+        /// update_check, update_auto_install (true|false).
         #[arg(value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
@@ -140,7 +140,12 @@ enum Cmd {
     Stop,
     /// Check GitHub for a newer ripdl release and print the release page
     /// URL if one exists. Never downloads anything; needs no daemon.
-    Update,
+    Update {
+        /// Also download the SHA256-verified installer and run it to
+        /// upgrade in place (Windows; goes through the daemon).
+        #[arg(long)]
+        install: bool,
+    },
     /// Register this binary as the browser's native messaging host
     /// (`ripdl host` mode triggers when Chrome passes an extension origin).
     RegisterHost {
@@ -314,13 +319,31 @@ async fn main() -> anyhow::Result<()> {
                         settings.update_check =
                             Some(val.parse().context("update_check needs true|false")?)
                     }
+                    "update_auto_install" => {
+                        settings.update_auto_install =
+                            Some(val.parse().context("update_auto_install needs true|false")?)
+                    }
                     other => bail!("unknown setting {other:?} (see: ripdl config --help)"),
                 }
             }
             rpc(Command::SetConfig { settings }).await
         }
         Cmd::Stop => rpc(Command::Shutdown).await,
-        Cmd::Update => {
+        Cmd::Update { install } => {
+            if install {
+                // Via the daemon: it owns the version stamp, does the
+                // verified download and launches the Inno setup.
+                let reply = rpc_reply(Command::UpdateInstall).await?;
+                match reply {
+                    Reply::Ok => {
+                        println!("new setup downloaded (sha256-verified) and launched;");
+                        println!("follow the install prompts, then start ripdl again");
+                        return Ok(());
+                    }
+                    Reply::Error { message } => bail!("{message}"),
+                    other => bail!("unexpected daemon reply: {other:?}"),
+                }
+            }
             let info =
                 ripdl_core::update::fetch_latest().await.context("update check failed")?;
             if info.update_available {
@@ -404,6 +427,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             println!("hide_to_tray:         {}", settings.hide_to_tray.unwrap_or(true));
             println!("bond_interfaces:      {}", settings.bond_interfaces.unwrap_or(false));
             println!("update_check:         {}", settings.update_check.unwrap_or(true));
+            println!("update_auto_install:  {}", settings.update_auto_install.unwrap_or(false));
         }
         Reply::TorrentDetails { details } => {
             println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));
