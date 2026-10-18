@@ -179,6 +179,13 @@ async fn remove_task(id: String, delete_files: Option<bool>) -> Result<(), Strin
     )
 }
 
+/// Quit the whole app (File > Exit). Tray "Exit" uses its own handler; this
+/// is the webview's entry point.
+#[tauri::command]
+fn exit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 /// Native directory picker for the Add dialog's "Save to" field.
 #[tauri::command]
 async fn pick_dir() -> Result<Option<String>, String> {
@@ -330,7 +337,8 @@ fn main() {
             open_path,
             download_root_path,
             get_config,
-            set_config
+            set_config,
+            exit_app
         ])
         .setup(|app| {
             use tauri::Manager;

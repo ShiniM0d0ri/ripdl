@@ -21,7 +21,19 @@ body {
     gap: 4px;
 }
 #menubar span { padding: 3px 10px; border-radius: 3px; cursor: default; }
-#menubar span:hover { background: #e8ebef; }
+#menubar span:hover, #menubar span.open { background: #e8ebef; }
+
+/* Dropdown menus hanging off the menu bar (one shared #menudrop element). */
+#menudrop {
+    position: fixed; z-index: 70;
+    background: #fbfcfd; border: 1px solid #c3c9cf; border-radius: 4px;
+    box-shadow: 0 8px 22px #0003;
+    padding: 4px; min-width: 180px;
+}
+#menudrop div.menu-item { padding: 6px 14px; cursor: default; display: flex; justify-content: space-between; gap: 18px; }
+#menudrop div.menu-item:hover { background: #e8f0f8; }
+#menudrop div.menu-item .hint { color: #8a929a; margin-left: 24px; }
+#menudrop hr { border: none; border-top: 1px solid #e0e3e7; margin: 3px 0; }
 
 /* Toolbar */
 #toolbar {

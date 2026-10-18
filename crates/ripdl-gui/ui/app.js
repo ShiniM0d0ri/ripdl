@@ -199,7 +199,7 @@ function render() {
         const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "timed"].includes(state) ? "paused" : "");
         const prog = pct == null
             ? `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:0%"></div></div>`
-            : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${pct.toFixed(0)}%</span>`;
+            : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${(["running", "hunt", "downloading", "verifying"].includes(state) ? pct.toFixed(1) : pct.toFixed(0))}%</span>`;
         const size = t.state === "completed"
             ? humans(t.total || t.downloaded)
             : t.percent != null
@@ -285,7 +285,7 @@ function showCtx(x, y) {
     menu.style.left = Math.min(x, innerWidth - 190) + "px";
     menu.style.top = Math.min(y, innerHeight - 130) + "px";
 }
-document.addEventListener("click", () => $("#ctx").classList.add("hidden"));
+document.addEventListener("click", () => { $("#ctx").classList.add("hidden"); closeMenus(); });
 $("#ctx").onclick = (ev) => {
     const act = ev.target.dataset.act;
     if (!act) return;
@@ -361,26 +361,84 @@ function renderStatusbar() {
 /* Toolbar */
 let dlgDestTouched = false;
 
-$("#btn-add").onclick = () => openAddDialog();
-$("#btn-add-torrent").onclick = pickTorrent;
-$("#btn-resume-all").onclick = async () => {
+async function resumeAll() {
     for (const t of tasks.filter((x) => ["paused", "failed"].includes(x.state))) {
         try { await invokeSafe("resume_task", { id: t.id }); } catch (e) { flashErr(String(e)); break; }
     }
     poll();
-};
-$("#btn-stop-all").onclick = async () => {
+}
+async function stopAll() {
     for (const t of tasks.filter((x) => ["running", "queued"].includes(x.state))) {
         try { await invokeSafe("pause_task", { id: t.id }); } catch (e) { flashErr(String(e)); break; }
     }
     poll();
-};
-$("#btn-clear-done").onclick = async () => {
+}
+async function clearDone() {
     for (const t of tasks.filter((x) => x.state === "completed")) {
         try { await invokeSafe("remove_task", { id: t.id, deleteFiles: false }); } catch (e) { break; }
     }
     poll();
+}
+
+/* Menu bar: real dropdowns under File / Tasks / Help. */
+const MENUS = {
+    file: () => [
+        { label: "Add URL", hint: "Ctrl+N", act: () => openAddDialog() },
+        { label: "Add Torrent", hint: "Ctrl+T", act: () => pickTorrent() },
+        null,
+        { label: "Exit", act: () => { invokeSafe("exit_app"); } },
+    ],
+    tasks: () => [
+        { label: "Resume All", act: () => resumeAll() },
+        { label: "Stop All", act: () => stopAll() },
+        null,
+        { label: "Clear Completed", act: () => clearDone() },
+    ],
+    help: () => [
+        { label: "About ripdl", act: () =>
+            alert("ripdl — free, ad-free, multi-segment download manager.\n" +
+                  "No telemetry, no ads, forever. License: MIT OR Apache-2.0.\n" +
+                  "https://github.com/ShiniM0d0ri/ripdl") },
+    ],
 };
+let openMenu = null;
+function closeMenus() {
+    if (openMenu) openMenu.classList.remove("open");
+    openMenu = null;
+    $("#menudrop").classList.add("hidden");
+}
+document.querySelectorAll("#menubar span").forEach((el) => {
+    el.onclick = (ev) => {
+        ev.stopPropagation();
+        const wasOpen = openMenu === el;
+        closeMenus();
+        if (wasOpen) return;
+        const items = MENUS[el.dataset.menu]();
+        const drop = $("#menudrop");
+        drop.innerHTML = items.map((it) => !it ? "<hr>" :
+            `<div class="menu-item" data-i="${items.indexOf(it)}"><span>${it.label}</span>${it.hint ? `<span class="hint">${it.hint}</span>` : ""}</div>`).join("");
+        drop.classList.remove("hidden");
+        const r = el.getBoundingClientRect();
+        drop.style.left = r.left + "px";
+        drop.style.top = r.bottom + "px";
+        drop.querySelectorAll(".menu-item").forEach((mi) => {
+            mi.onclick = (e) => {
+                e.stopPropagation();
+                closeMenus();
+                items[Number(mi.dataset.i)].act();
+            };
+        });
+        openMenu = el;
+        el.classList.add("open");
+    };
+});
+$("#menudrop").onclick = (ev) => ev.stopPropagation();
+
+$("#btn-add").onclick = () => openAddDialog();
+$("#btn-add-torrent").onclick = pickTorrent;
+$("#btn-resume-all").onclick = resumeAll;
+$("#btn-stop-all").onclick = stopAll;
+$("#btn-clear-done").onclick = clearDone;
 
 /* Dialog */
 function openAddDialog(presetUrl) {
@@ -535,6 +593,7 @@ document.addEventListener("keydown", (ev) => {
         $("#dlg-backdrop").classList.add("hidden");
         closeDetails();
         closeSettings();
+        closeMenus();
     }
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "n") {
         ev.preventDefault();
@@ -771,5 +830,7 @@ $("#tdg-apply").onclick = async () => {
 
 setConn(false);
 poll().then(() => {
-    setInterval(poll, 1000);
+    // 500ms keeps the percent/speed columns within ~1s of the engine's own
+    // 500ms progress ticker; identical snapshots don't re-render.
+    setInterval(poll, 500);
 });
