@@ -42,7 +42,7 @@ cargo build --release
 
 ## Status
 
-v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
+Check [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 
 | Feature | Status |
 | --- | --- |
@@ -59,10 +59,15 @@ v0.1 - engine + CLI. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan.
 | CLI (`ripdl download`, `ripdl info`) | ✅ |
 | Queue with concurrency limits | ✅ core + daemon-persisted |
 | Auto-categorization by file type | ✅ core |
-| Daemon + RPC (TCP localhost + named pipe) | ✅ v1 |
+| Daemon + RPC (named pipe primary, TCP fallback) | ✅ |
 | Video/stream hunt (`yt-dlp` sidecar, `add --video`) | ✅ daemon + CLI |
-| Tauri GUI | 🚧 P2 |
-| Torrent (via `librqbit`) | 🚧 P3 |
+| **NIC bonding — HTTP** (`bond_interfaces`, per-NIC clients) | ✅ v0.2 |
+| **Tail GUI** — IDM-style manager, torrents, settings, tray | ✅ v0.2 |
+| **Torrents** (librqbit; magnets/.torrent, file picks, sequential) | ✅ v0.2 |
+| **P4 hunt offers in the extension popup** (yt-dlp / direct media) | ✅ v0.2 |
+| **NIC bonding — torrents** (outgoing peer rotation, vendored librqbit) | ✅ v0.3 |
+| Shared speed cap, per-task quota polish, selected-links capture | 🚧 backlog |
+| DNR fallback for referer | 🚧 backlog |
 
 ## Architecture
 
@@ -73,11 +78,14 @@ ripdl-core (pure library, no UI deps)
    ┌────┴─────┬──────────┬──────────────┐
    │          │          │              │
  ripdl     daemon      Tauri GUI    browser ext
- (CLI)      (RPC)       (P2)      + native host (P4)
+ (CLI)      (RPC)             + native host
 ```
 
 New features are implemented in `ripdl-core`/daemon once; every frontend gets
 them automatically. That is the rule that keeps this codebase sane as it grows.
+
+Torrents run on a vendored, minimally-patched librqbit (`vendor/librqbit`,
+Apache-2.0 — the patch adds per-connection source-IP binding for NIC bonding).
 
 ## Build
 
@@ -92,11 +100,27 @@ switching) - the suite never hits real networks.
 
 ## Usage
 
+### Quick start
+
 ```sh
 ripdl info https://example.com/big-file.zip      # inspect before downloading
 ripdl download https://example.com/big-file.zip  # 8 segments, resumable
 ripdl download -o D:/Downloads -s 16 <url>       # custom dir + segment count
+ripdl add <magnet>                               # or a .torrent path/URL
+ripdl add <torrent> --sequential                 # streaming-drain the files
 ```
+
+### NIC bonding (aggregate every uplink)
+
+```sh
+ripdl config bond_interfaces=true                # or the GUI settings gear,
+                                                 # or per-download: --bond
+```
+
+With two live uplinks (e.g. Wi-Fi + phone tether), downloads spread segments
+across both — the sum of your bandwidth, not the lighter of the two. Torrents
+bond their outgoing peer connections the same way; the daemon rebalances
+live for HTTP, and torrent bonding applies at (re)start.
 
 ### Hunt mode (video/stream pages)
 
@@ -107,8 +131,8 @@ ripdl add --video "https://www.youtube.com/watch?v=..."        # or any stream p
 Video tasks are handed to a `yt-dlp` sidecar (ripdl does **not** reimplement
 site extraction). Progress, pause/resume/cancel behave like every other task;
 resume continues partial `.part` files. yt-dlp must be installed — e.g.
-`winget install yt-dlp.yt-dlp` — or point the daemon at it in
-`%LOCALAPPDATA%\ripdl\config.json`.
+`winget install yt-dlp.yt-dlp` — or point the daemon at it via
+`ripdl config ytdlp_path=<path>`.
 
 Interrupted downloads keep a `<file>.ripdl.json` sidecar; rerun the same
 command and it resumes from where it stopped.
@@ -120,13 +144,26 @@ ripdl-daemon                                     # queue server (auto-spawned if
 ripdl add https://example.com/big-file.zip      # queue it, return immediately
 ripdl ls                                        # live progress + speeds
 ripdl add --after 6s <url>                      # schedule (also: --at 22:30)
-ripdl pause <id> | resume <id> | rm <id>
+ripdl pause <id> | resume <id> | rm <id> [--files]
+ripdl config max_concurrent=3 max_speed_bytes=8000000 bond_interfaces=true
 ```
 
-### Browser capture (experimental)
+Daemon settings persist in `%LOCALAPPDATA%\ripdl\config.json` (or the GUI
+settings dialog) — concurrency, segment budget, speed cap, default folder,
+bonding, optional yt-dlp path.
 
-The MV3 extension in `ext/` hands intercepted downloads to the ripdl daemon.
-Minimal setup:
+### GUI
+
+`ripdl-gui` is the IDM-style task manager: live rows with speeds, a Torrents
+filter, per-file selection + sequential streaming, a details dialog
+(files/peers/trackers), per-task "save to", settings (incl. bonding + speed
+cap) and a tray icon. Spawns the daemon automatically.
+
+### Browser capture + hunt offers (experimental)
+
+The MV3 extension in `ext/` hands intercepted downloads to the ripdl daemon —
+and, from the popup, offers to download the current stream page via yt-dlp or
+any direct media the tab's own requests revealed. Minimal setup:
 
 ```sh
 ripdl register-host                              # registers the native host
@@ -134,7 +171,8 @@ ripdl register-host                              # registers the native host
 
 …then load `ext/` unpacked (chrome://extensions). Privacy posture: the
 extension offers a daemon download *before* cancelling the browser item,
-never touches your history, and shares cookies only if you opt in.
+only reads the page URL while the popup is open, never touches your history,
+never runs page scripts, and shares cookies only if you opt in.
 
 ## Anti-adware position
 
