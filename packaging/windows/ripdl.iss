@@ -16,7 +16,6 @@ DisableProgramGroupPage=yes
 ; Sources are relative to the script, but the release workflow runs ISCC
 ; from the repo root with the sources/target/dist one level up.
 SourceDir=..\..
-OutputDir=..\..\dist
 OutputDir=dist
 OutputBaseFilename=ripdl-v{#APP_VERSION}-x86_64-windows-setup
 Compression=lzma2/max
