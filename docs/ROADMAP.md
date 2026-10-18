@@ -156,6 +156,11 @@ M3.4 - tests / verification:
 - [x] Hunt mode: video/stream tasks via the `yt-dlp` sidecar (`add
       --video`; `ytdlp_path` in config.json; progress parsed from the
       tool's lines; pause/resume = kill/continue)
+- [x] Popup hunt offers: the extension popup lists direct media files
+      seen in the tab (webRequest content-type/ext sniffing, no content
+      scripts, no new standing permissions) and offers "download page
+      as video" for known stream sites (activeTab, granted only while
+      the popup is open)
 
 ## P5 - ship it
 

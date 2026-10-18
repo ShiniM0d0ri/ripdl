@@ -46,6 +46,76 @@ const reqByRequestId = new Map();
 const reqByUrl = new Map();
 const MAP_BUDGET = 512;
 
+/* --- hunt: per-tab direct-media sightings for the popup ---------------- */
+
+/** tabId -> [{url, at}] — what this tab visibly streamed/fetched as media.
+ * Fed from the same webRequest listeners capture already uses; no new
+ * permissions, no content scripts, never leaves the SW. */
+const mediaByTab = new Map();
+/** URL paths ending in a media container are media even without a
+ * contents-type sniff (direct file links). */
+const MEDIA_EXT_RE = /\.(mp4|mkv|webm|mov|avi|flv|m4v|ts|mp3|m4a|aac|opus|ogg|flac)([?#]|$)/i;
+const MEDIA_PER_TAB = 40;
+const MEDIA_TTL_MS = 15 * 60 * 1000;
+
+function forgetOldTabMedia(tabId) {
+    const list = mediaByTab.get(tabId);
+    if (!list) return;
+    const cutoff = Date.now() - MEDIA_TTL_MS;
+    const kept = list.filter((m) => m.at >= cutoff);
+    if (kept.length) mediaByTab.set(tabId, kept);
+    else mediaByTab.delete(tabId);
+}
+
+function rememberMedia(tabId, url) {
+    if (typeof tabId !== "number" || tabId < 0) return;
+    let list = mediaByTab.get(tabId);
+    if (!list) {
+        list = [];
+        mediaByTab.set(tabId, list);
+    }
+    if (!list.some((m) => m.url === url)) {
+        list.push({ url, at: Date.now() });
+        // Bounded per tab: newest wins.
+        while (list.length > MEDIA_PER_TAB) list.shift();
+        if (mediaByTab.size > 32) {
+            // Drop the oldest tab entry wholesale.
+            const oldest = [...mediaByTab.entries()].sort((a, b) =>
+                a[1][a[1].length - 1].at - b[1][b[1].length - 1].at
+            )[0];
+            if (oldest && oldest[0] !== tabId) mediaByTab.delete(oldest[0]);
+        }
+    }
+}
+
+/** Stream/video sites where handing the *page URL* to yt-dlp is the
+ * right move (hunt mode). Enough coverage for common cases; the
+ * direct-media list below covers everything else. */
+const VIDEO_HOSTS = [
+    "youtube.com", "youtu.be", "youtube-nocookie.com", "vimeo.com",
+    "twitch.tv", "dailymotion.com", "bilibili.com",
+    "tiktok.com", "rumble.com", "odysee.com", "nicovideo.jp",
+    "rutube.ru", "streamable.com", "tubitv.com", "vkvideo.ru",
+    "x.com", "twitter.com", "ted.com", "soundcloud.com",
+];
+
+/** Is handing this page URL to yt-dlp a sensible offer? */
+function videoishPage(url) {
+    let u;
+    try { u = new URL(url); } catch { return false; }
+    if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    return VIDEO_HOSTS.some((h) => host === h || host.endsWith("." + h));
+}
+
+/** Fresh media sightings for a tab, newest last. */
+function mediaForTab(tabId) {
+    forgetOldTabMedia(tabId);
+    return [...(mediaByTab.get(tabId) || [])].filter((m) => {
+        try { return !!new URL(m.url); } catch { return false; }
+    });
+}
+
 function setBadge(text) {
     chrome.action.setBadgeText({ text });
     chrome.action.setBadgeBackgroundColor({ color: hostAlive ? "#2e7d32" : "#9e9e9e" });
@@ -104,13 +174,44 @@ function connectHost() {
 }
 
 /** Popup and other UI poke us here; answer is mirrored via storage. */
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "ripdl_light_probe") {
         if (!port) {
             connectHost();
         } else {
             send({ id: `probe-${nextId++}`, cmd: { type: "list" } }).then((r) => setHostAlive(!!r));
         }
+    }
+    if (msg?.type === "ripdl_hunt_query") {
+        // activeTab is granted by the popup click, so the active page URL
+        // is readable *while the user is looking at the popup* — never
+        // resident, never pushed elsewhere.
+        (async () => {
+            let pageUrl = "";
+            let tabId = -1;
+            try {
+                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                pageUrl = tab?.url || "";
+                tabId = typeof tab?.id === "number" ? tab.id : -1;
+            } catch {
+                // No tab access: offer only from generic heuristics.
+            }
+            const media = tabId >= 0 ? mediaForTab(tabId) : [];
+            const videoish = videoishPage(pageUrl);
+            sendResponse({ pageUrl, videoish, media });
+        })();
+        return true; // async reply
+    }
+    if (msg?.type === "ripdl_send" && msg.cmd && typeof msg.cmd.type === "string") {
+        // Popup-initiated task add (hunt buttons). Same rejection contract:
+        // not accepted -> the popup shows the daemon-unreachable state.
+        (async () => {
+            const resp = await send({ id: `pop-${nextId++}`, cmd: msg.cmd });
+            sendResponse({ ok: resp?.reply?.type === "added" });
+            if (!resp) setHostAlive(false);
+            else if (!hostAlive) setHostAlive(true);
+        })();
+        return true;
     }
 });
 
@@ -143,15 +244,24 @@ function remember(details) {
     }
 }
 
-// Response sizes, for the service-worker download match.
+// Response sizes, for the service-worker download match; content-type
+// video/audio sightings feed the popup's hunt offer.
 chrome.webRequest.onHeadersReceived.addListener(
     (details) => {
         const rec = reqByRequestId.get(details.requestId);
-        if (!rec) return;
-        for (const h of details.responseHeaders || []) {
-            if (h.name.toLowerCase() === "content-length") {
-                const n = Number(h.value);
-                if (Number.isFinite(n)) rec.contentLength = n;
+        if (rec) {
+            for (const h of details.responseHeaders || []) {
+                const name = h.name.toLowerCase();
+                if (name === "content-length") {
+                    const n = Number(h.value);
+                    if (Number.isFinite(n)) rec.contentLength = n;
+                }
+            }
+            const ct = (details.responseHeaders || [])
+                .find((h) => h.name.toLowerCase() === "content-type")
+                ?.value || "";
+            if (ct.startsWith("video/") || ct.startsWith("audio/")) {
+                rememberMedia(details.tabId, details.url);
             }
         }
     },
@@ -160,12 +270,18 @@ chrome.webRequest.onHeadersReceived.addListener(
 );
 
 chrome.webRequest.onSendHeaders.addListener(
-    remember,
+    (details) => {
+        remember(details);
+        if (MEDIA_EXT_RE.test(details.url)) rememberMedia(details.tabId, details.url);
+    },
     { urls: ["<all_urls>"] },
     chrome.runtime.getManifest().manifest_version === 3
         ? ["requestHeaders", "extraHeaders"]
         : ["requestHeaders"]
 );
+
+// Dead tabs shouldn't squat on the media budget.
+chrome.tabs.onRemoved.addListener((tabId) => mediaByTab.delete(tabId));
 
 /** Cookies only reach the daemon through explicit opt-in + permission. */
 async function cookiesForIfShared(url) {

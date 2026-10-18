@@ -45,6 +45,79 @@ shareCookiesEl.addEventListener("change", async () => {
 
 document.getElementById("probe").addEventListener("click", probeDaemon);
 
+/* --- hunt offer: video/stream detection for the active page ------------ */
+
+const huntEl = document.getElementById("hunt");
+const huntMediaEl = document.getElementById("hunt-media");
+const shortUrl = (u) => {
+    try {
+        const p = new URL(u);
+        return p.hostname + p.pathname;
+    } catch {
+        return u;
+    }
+};
+
+function markQueued(btn, text) {
+    btn.textContent = text || "queued ✓";
+    btn.disabled = true;
+    setTimeout(() => { btn.textContent = text || "queued ✓"; }, 1200);
+}
+
+async function sendTask(cmd) {
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: "ripdl_send", cmd });
+        return resp?.ok === true;
+    } catch {
+        return false;
+    }
+}
+
+chrome.runtime.sendMessage({ type: "ripdl_hunt_query" }, (hunt) => {
+    if (chrome.runtime.lastError || !hunt) return;  // SW restart race: retry via storage later
+    const { pageUrl, videoish, media } = hunt;
+    if (!videoish && media.length === 0) return;    // nothing to offer: popup stays quiet
+
+    huntEl.classList.remove("hidden");
+    if (videoish) {
+        const pageBtn = document.getElementById("hunt-page");
+        pageBtn.addEventListener("click", async () => {
+            pageBtn.disabled = true;
+            const ok = await sendTask({ type: "add", url: pageUrl, dest_dir: null, headers: {}, kind: "video" });
+            pageBtn.disabled = false;
+            markQueued(pageBtn, ok ? "queued for yt-dlp ✓" : "daemon unreachable ✗");
+            if (!ok) setTimeout(() => { pageBtn.textContent = "Download page as video (yt-dlp)"; }, 2400);
+        });
+    } else {
+        document.getElementById("hunt-page").classList.add("hidden");
+    }
+
+    for (const m of media.slice(-5)) {
+        const row = document.createElement("div");
+        row.className = "hunt-media-row";
+        const urlText = document.createElement("div");
+        urlText.className = "hunt-url";
+        urlText.textContent = shortUrl(m.url);
+        const btn = document.createElement("button");
+        btn.className = "hunt-file-btn";
+        btn.textContent = "Download media file";
+        btn.addEventListener("click", async () => {
+            btn.disabled = true;
+            const ok = await sendTask({ type: "add", url: m.url, dest_dir: null, headers: {} });
+            btn.disabled = false;
+            markQueued(btn, ok ? "queued ✓" : "daemon unreachable ✗");
+        });
+        row.append(urlText, btn);
+        huntMediaEl.appendChild(row);
+    }
+    if (videoish && media.length === 0) {
+        const note = document.createElement("div");
+        note.className = "hunt-note";
+        note.textContent = "video page detected — yt-dlp will find the streams";
+        huntEl.appendChild(note);
+    }
+});
+
 // Ask the SW for fresh liveness; it mirrors it into storage.
 chrome.runtime.sendMessage({ type: "ripdl_light_probe" }).catch(() => {});
 probeDaemon();

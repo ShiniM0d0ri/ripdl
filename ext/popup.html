@@ -9,6 +9,15 @@
     .hint { color: #666; font-size: 11px; margin-top: 8px; line-height: 1.4; }
     #status.ok { color: #2e7d32; }
     #status.down { color: #b06000; }
+    #hunt { margin-top: 10px; padding-top: 6px; border-top: 1px solid #ddd; }
+    #hunt.hidden { display: none; }
+    #hunt-title { font-weight: 600; font-size: 12px; color: #555; margin: 2px 0; }
+    .hunt-btn { display: block; width: 100%; margin: 4px 0; padding: 4px 6px;
+                font: 12px system-ui, sans-serif; cursor: pointer; }
+    .hunt-url { font-size: 10px; color: #777; word-break: break-all; }
+    .hunt-media-row { margin: 6px 0; }
+    .hunt-file-btn { width: 100%; padding: 3px 6px; font: 11px system-ui, sans-serif; cursor: pointer; }
+    .hunt-note { font-size: 11px; color: #2e7d32; margin-top: 4px; }
   </style>
 </head>
 <body>
@@ -24,6 +33,11 @@
   <div class="row">
     <label for="shareCookies">Share cookies (opt-in)</label>
     <input type="checkbox" id="shareCookies">
+  </div>
+  <div id="hunt" class="hidden">
+    <div id="hunt-title">video / stream detected</div>
+    <button id="hunt-page" class="hunt-btn">Download page as video (yt-dlp)</button>
+    <div id="hunt-media"></div>
   </div>
   <div class="hint">
     Cookies are shared only with the local ripdl daemon and only for the

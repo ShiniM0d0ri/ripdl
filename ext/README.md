@@ -1,4 +1,4 @@
-# ripdl WebExtension (skeleton)
+# ripdl WebExtension
 
 MV3, no content scripts, no telemetry, no cookie harvesting.
 
@@ -41,6 +41,19 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
   travel only to the local daemon, only attached to the downloads you fire.
 - The daemon owns all policy. Nothing is hardcoded here by design.
 
+## Hunt offers (video popup)
+
+- Open the popup on a video/stream page (YouTube, Bilibili, Twitch...) and
+  a "Download page as video" button appears - it queues a *video* task the
+  daemon runs through the `yt-dlp` sidecar.
+- Direct media the page actually streamed (containers by content-type or
+  file extension, observed in the same webRequest listeners capture uses)
+  shows up as one-click "Download media file" rows (top 5, newest last).
+- Detection is permission-minimal: no content scripts, no resident page
+  access. The page URL is read once via `activeTab`, which Chrome grants
+  only while the popup is open. Media sightings live in the worker's
+  memory for 15 minutes and vanish with it.
+
 ## Deliberately not present (yet)
 
 - Referer rewrite of fallback reissues during daemon death: not needed by
@@ -48,4 +61,3 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
   download (offer-first), so the browser item is never canceled for a task
   the daemon didn't commit to. If the daemon dies after accepting, the task
   is resumable from the daemon side.
-- Video/stream sniffing (a later, opt-in "hunt" mode).
