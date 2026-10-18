@@ -38,6 +38,10 @@ pub struct DaemonSettings {
     /// bandwidth. Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bond_interfaces: Option<bool>,
+    /// GUI preference (the daemon just persists it): check GitHub for a
+    /// newer release when the app starts. Default on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
 }
 
 impl DaemonSettings {
@@ -100,6 +104,11 @@ impl DaemonSettings {
         self.bond_interfaces.unwrap_or(false)
     }
 
+    /// Startup update checks on/off (default on).
+    pub fn update_check(&self) -> bool {
+        self.update_check.unwrap_or(true)
+    }
+
     /// Apply a partial update: every `Some(x)` in `patch` wins; `None`
     /// leaves the current value untouched. Useful for CLI-style
     /// single-key edits on top of the live values.
@@ -127,6 +136,9 @@ impl DaemonSettings {
         }
         if patch.bond_interfaces.is_some() {
             self.bond_interfaces = patch.bond_interfaces;
+        }
+        if patch.update_check.is_some() {
+            self.update_check = patch.update_check;
         }
     }
 }
@@ -188,6 +200,9 @@ pub enum Command {
     },
     /// Current daemon-wide settings (config.json contents).
     GetConfig,
+    /// Ask GitHub whether a newer release exists than the running build.
+    /// One direct api.github.com GET; never automatic, no telemetry.
+    CheckUpdate,
     /// Replace the daemon settings wholesale (omitted fields = default).
     /// Persisted to `<data_dir>/config.json`; `max_concurrent` applies
     /// live, the rest take effect on the next task start.
@@ -219,6 +234,10 @@ pub enum Reply {
     /// Current daemon-wide settings.
     Config {
         settings: DaemonSettings,
+    },
+    /// Result of a `CheckUpdate` probe.
+    Update {
+        info: crate::update::UpdateInfo,
     },
     Ok,
     Error {

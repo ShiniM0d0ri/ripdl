@@ -131,12 +131,16 @@ enum Cmd {
         /// `key=value` pairs to change (e.g. `max_concurrent=4`); omit to
         /// just show the current settings. Valid keys: max_concurrent,
         /// max_segments, min_segment_size, max_speed_bytes (0 = uncapped),
-        /// default_download_dir, ytdlp_path, hide_to_tray (true|false).
+        /// default_download_dir, ytdlp_path, hide_to_tray, bond_interfaces,
+        /// update_check (true|false).
         #[arg(value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
     /// Stop the daemon.
     Stop,
+    /// Check GitHub for a newer ripdl release and print the release page
+    /// URL if one exists. Never downloads anything; needs no daemon.
+    Update,
     /// Register this binary as the browser's native messaging host
     /// (`ripdl host` mode triggers when Chrome passes an extension origin).
     RegisterHost {
@@ -306,12 +310,34 @@ async fn main() -> anyhow::Result<()> {
                         settings.bond_interfaces =
                             Some(val.parse().context("bond_interfaces needs true|false")?)
                     }
+                    "update_check" => {
+                        settings.update_check =
+                            Some(val.parse().context("update_check needs true|false")?)
+                    }
                     other => bail!("unknown setting {other:?} (see: ripdl config --help)"),
                 }
             }
             rpc(Command::SetConfig { settings }).await
         }
         Cmd::Stop => rpc(Command::Shutdown).await,
+        Cmd::Update => {
+            let info =
+                ripdl_core::update::fetch_latest().await.context("update check failed")?;
+            if info.update_available {
+                println!("installed: {}  latest: {}", info.current, info.latest);
+                println!("new release: {}", info.url);
+                if let Some(published_at) = info.published_at.as_deref() {
+                    println!("published: {published_at}");
+                }
+                println!("get the Windows setup (`ripdl-v{}-x86_64-windows-setup.exe`) and run it over the old install", info.latest);
+            } else {
+                println!(
+                    "ripdl {} is up to date (latest release: {})",
+                    info.current, info.latest
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -377,6 +403,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             );
             println!("hide_to_tray:         {}", settings.hide_to_tray.unwrap_or(true));
             println!("bond_interfaces:      {}", settings.bond_interfaces.unwrap_or(false));
+            println!("update_check:         {}", settings.update_check.unwrap_or(true));
         }
         Reply::TorrentDetails { details } => {
             println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));
@@ -437,6 +464,16 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                 if let Some(err) = t.error {
                     println!("  error: {err}");
                 }
+            }
+        }
+        Reply::Update { info } => {
+            // Normally reached only via `ripdl update`, which bypasses the
+            // daemon; the daemon path can still answer a stray CheckUpdate.
+            if info.update_available {
+                println!("update available: {} -> {}", info.current, info.latest);
+                println!("get it: {}", info.url);
+            } else {
+                println!("ripdl {} is up to date", info.current);
             }
         }
     }

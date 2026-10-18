@@ -38,6 +38,9 @@ pub enum Error {
     #[error("hunt error: {0}")]
     Hunt(String),
 
+    #[error("update check failed: {0}")]
+    Update(String),
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }

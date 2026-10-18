@@ -346,6 +346,7 @@ impl Daemon {
             }
             Command::GetConfig => self.cmd_get_config(req.id),
             Command::SetConfig { settings } => self.cmd_set_config(req.id, settings).await,
+            Command::CheckUpdate => self.cmd_check_update(req.id).await,
         }
     }
 
@@ -353,6 +354,21 @@ impl Daemon {
         Response {
             id: req_id,
             reply: Reply::Config { settings: self.conf() },
+        }
+    }
+
+    /// One GitHub-releases probe on behalf of a frontend (GUI startup /
+    /// Help menu). Information only: never downloads, never self-replaces.
+    async fn cmd_check_update(self: &Arc<Self>, req_id: u64) -> Response {
+        match ripdl_core::update::fetch_latest().await {
+            Ok(info) => Response {
+                id: req_id,
+                reply: Reply::Update { info },
+            },
+            Err(e) => Response {
+                id: req_id,
+                reply: Reply::Error { message: e.to_string() },
+            },
         }
     }
 
