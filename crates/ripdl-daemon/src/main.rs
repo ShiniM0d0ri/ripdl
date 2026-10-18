@@ -380,9 +380,12 @@ impl Daemon {
     async fn cmd_update_install(self: &Arc<Self>, req_id: u64, silent: bool) -> Response {
         match self.run_update_install(silent).await {
             Ok(()) => Response { id: req_id, reply: Reply::Ok },
+            // The full context chain: "installer download failed: sums
+            // unreachable: ..." beats a one-line diagnosis that hides the
+            // actual cause.
             Err(e) => Response {
                 id: req_id,
-                reply: Reply::Error { message: e.to_string() },
+                reply: Reply::Error { message: format!("{e:#}") },
             },
         }
     }
