@@ -20,6 +20,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The workspace check compiles ripdl-gui (Tauri shell), which needs
+      # webkit2gtk/gtk dev headers on Linux.
+      - name: Install GUI build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
       - name: Check (all targets)
         run: cargo check --workspace --all-targets
 
