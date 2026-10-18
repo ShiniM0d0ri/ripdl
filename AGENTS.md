@@ -76,6 +76,13 @@ the single-stream path.
   `ripdl-browser-extension-vX.Y.Z.zip` + `SHA256SUMS.txt` in the release
   job. Cut releases by bumping the workspace version, then:
   `git tag -a vX.Y.Z; git push origin vX.Y.Z`.
+  Proven against v0.2.0 (2026-10-18): release published with all 7 assets.
+  Gotchas folded in: CLI bin is `ripdl` (packaging must not invent names),
+  `crates/ripdl-gui/icons/icon.png` is required (tauri-build embeds it on
+  non-Windows), nfpm placeholders are `sed`-resolved in the workflow
+  (don't rely on its env expansion), nfpm needs `--packager deb/rpm` when
+  `--target` is a directory, and Inno wants
+  `ArchitecturesInstallIn64BitMode` (bare `Architectures` is invalid).
 
 ## Resume-sidecar format
 
