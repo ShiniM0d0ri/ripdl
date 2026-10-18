@@ -95,8 +95,7 @@ struct Daemon {
     torrents: tokio::sync::Mutex<Option<Arc<ripdl_core::torrent::TorrentSession>>>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
-    /// Update-install lock: two concurrent setups would fight over the
-    /// same .part file. compare_exchange'd around run_update_install.
+    /// Set during an install fetch (concurrent ones would share a .part).
     update_busy: std::sync::atomic::AtomicBool,
 }
 
@@ -362,8 +361,7 @@ impl Daemon {
         }
     }
 
-    /// One GitHub-releases probe on behalf of a frontend (GUI startup /
-    /// Help menu). Information only: never downloads, never self-replaces.
+    /// GitHub probe on behalf of a frontend. Information only.
     async fn cmd_check_update(self: &Arc<Self>, req_id: u64) -> Response {
         match ripdl_core::update::fetch_latest().await {
             Ok(info) => Response {
@@ -377,8 +375,8 @@ impl Daemon {
         }
     }
 
-    /// Explicit install: SHA256-verified setup.exe download then launch.
-    /// `silent` = unattended (/VERYSILENT) for the opt-in auto path.
+    /// Verified setup download + launch. `silent` = unattended
+    /// (`/VERYSILENT`, the opt-in auto path).
     async fn cmd_update_install(self: &Arc<Self>, req_id: u64, silent: bool) -> Response {
         match self.run_update_install(silent).await {
             Ok(()) => Response { id: req_id, reply: Reply::Ok },
@@ -1431,8 +1429,7 @@ async fn real_main() -> Result<()> {
     let config = DaemonConfig::load(&config_path);
     let daemon = Arc::new(Daemon::new(queue_path, config_path, config).context("init daemon")?);
     daemon.boot_resume().context("resume queue")?;
-    // Opt-in fully-automatic updates: after the queue settles, check and
-    // (SHA256-verified) install a newer release unattended.
+    // Opt-in unattended updates; silent on failure (checked again next boot).
     if daemon.conf().update_check() && daemon.conf().update_auto_install() {
         let d = daemon.clone();
         tokio::spawn(async move {

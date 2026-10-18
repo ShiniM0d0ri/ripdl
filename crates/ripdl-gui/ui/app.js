@@ -543,8 +543,7 @@ $("#btn-resume-all").onclick = resumeAll;
 $("#btn-stop-all").onclick = stopAll;
 $("#btn-clear-done").onclick = clearDone;
 
-/* Update check (GitHub releases). Information only - the GUI never
-   downloads or installs anything; the user gets a banner and decides. */
+/* Update check: banner + Help menu; installs go through the daemon. */
 const RELEASES_URL = "https://github.com/ShiniM0d0ri/ripdl/releases";
 
 function openReleases() {
@@ -556,8 +555,7 @@ async function runUpdateCheck(initial) {
     try {
         info = await invokeSafe("check_update");
     } catch (e) {
-        // Startup checks stay silent (offline is normal, not an error);
-        // Help > Check for Updates reports the reason instead.
+        // Startup checks stay silent; menu-triggered ones report why.
         if (!initial) flashErr(String(e).replace(/^.*error: /, ""));
         return;
     }
@@ -571,9 +569,8 @@ async function runUpdateCheck(initial) {
     }
 }
 
-// One-click upgrade: daemon downloads the SHA256-verified setup.exe and
-// launches it; the installer closes this GUI on the way to replacing us,
-// so the last visible act here is the banner text.
+// One-click upgrade: installer closes this GUI while replacing it, so the
+// last visible act here is the banner text.
 async function installUpdate() {
     const el = $("#update-text");
     el.textContent = "Downloading & verifying the new setup\u2026";
@@ -590,17 +587,16 @@ $("#update-open").onclick = openReleases;
 $("#update-install").onclick = installUpdate;
 $("#update-dismiss").onclick = () => $("#update-banner").classList.add("hidden");
 
-// Once per GUI launch, gated by the settings switches (checks on by
-// default; full auto-install off by default). Errors are deliberately
-// invisible here.
+// Once per launch: silent check (default on) + opt-in auto-install.
+// Failures here are deliberately invisible.
 (async () => {
     try {
         const s = await invokeSafe("get_config");
         if (s.update_check ?? true) {
             runUpdateCheck(true);
-            // Opt-in fully automatic path: the daemon downloads & runs the
-            // verified installer unattended. The daemon's own boot path may
-            // have raced ahead; "already latest" is a silent no-op there.
+            // Daemon booted with the same setting does this itself; this
+            // covers a daemon predating the setting. "Already latest" is a
+            // silent no-op daemon-side.
             if (s.update_auto_install ?? false) {
                 invokeSafe("install_update").catch(() => {});
             }

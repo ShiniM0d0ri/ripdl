@@ -186,8 +186,7 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-/// Update check through the daemon (one api.github.com GET, information
-/// only — the GUI never downloads or installs anything itself).
+/// Update check through the daemon.
 #[tauri::command]
 async fn check_update() -> Result<ripdl_core::update::UpdateInfo, String> {
     match rpc(Command::CheckUpdate).await? {
@@ -197,9 +196,7 @@ async fn check_update() -> Result<ripdl_core::update::UpdateInfo, String> {
     }
 }
 
-/// One-click upgrade: the daemon downloads the SHA256-verified setup.exe
-/// and launches it; the installer then replaces ripdl in place (and stops
-/// this GUI as part of that).
+/// One-click upgrade: daemon downloads the verified setup and runs it.
 #[tauri::command]
 async fn install_update() -> Result<(), String> {
     expect_ok(rpc(Command::UpdateInstall).await?)

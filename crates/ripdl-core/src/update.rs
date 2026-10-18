@@ -1,18 +1,11 @@
-//! Update checker: "is there a newer release on GitHub?"
+//! Update checker + verified installer-fetch.
 //!
-//! One direct HTTPS GET to `api.github.com` whenever a frontend asks for it
-//! (GUI startup / Help menu, `ripdl update`). That request carries no
-//! identifying data (no cookies, no machine fingerprint — just a generic
-//! User-Agent and the endpoint path), and there is no telemetry channel of
-//! any kind.
-//!
-//! There is also an explicit install path (`UpdateInstall` RPC,
-//! `ripdl update --install`, GUI banner button): the Windows setup.exe is
-//! downloaded into `<data_dir>/update/`, verified against the release's
-//! `SHA256SUMS.txt` from GitHub, and then launched so Inno Setup replaces
-//! the old install in place (the installer itself stops the running
-//! daemon/GUI first). Nothing here runs without either a click or the
-//! explicit `update_auto_install` setting.
+//! Checks are one plain `api.github.com` GET per request (`CheckUpdate`
+//! RPC, `ripdl update`, GUI startup) — no cookies, no fingerprint, no
+//! telemetry. `UpdateInstall` additionally downloads the Windows
+//! setup.exe into `<data_dir>/update/`, verifies it against the release's
+//! `SHA256SUMS.txt`, and launches Inno Setup to replace the running app.
+//! Nothing runs without a click or the opted-in `update_auto_install`.
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -25,28 +18,25 @@ use crate::error::{Error, Result};
 
 /// GitHub repo whose Releases drive the check.
 pub const RELEASE_REPO: &str = "ShiniM0d0ri/ripdl";
-/// Human-visible releases page (the "open page" action targets this).
+/// Human-visible releases page.
 pub const RELEASES_PAGE: &str = "https://github.com/ShiniM0d0ri/ripdl/releases";
 
 const API_LATEST: &str =
     "https://api.github.com/repos/ShiniM0d0ri/ripdl/releases/latest";
 
-/// Where installers live until Inno Setup runs them: `<data_dir>/update/`.
+/// Installers land in `<data_dir>/update/`.
 pub fn update_dir(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("update")
 }
 
-/// Refuse absurdly large downloads (a tampered pointer pointing at, say, a
-/// movie should fail loudly, not fill the disk).
+/// Tampered-asset failure mode is "refuse", not "fill the disk".
 const MAX_SETUP_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The version this binary was built from (workspace `Cargo.toml`; every
-/// crate shares it, so the GUI and CLI agree with the daemon).
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// One downloadable asset attached to the release (subset we need).
+/// One release asset (the fields we use).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateAsset {
     #[serde(default)]
@@ -58,8 +48,6 @@ pub struct UpdateAsset {
 }
 
 impl UpdateAsset {
-    /// The installer asset for this platform: the Inno setup.exe on
-    /// Windows (never the portable zip, never another OS's build).
     fn is_windows_setup(&self) -> bool {
         self.name.ends_with("-x86_64-windows-setup.exe")
     }
@@ -68,14 +56,12 @@ impl UpdateAsset {
     }
 }
 
-/// What we read back from GitHub's release JSON (subset).
 #[derive(Debug, Clone, Deserialize)]
 struct GithubRelease {
     tag_name: String,
     html_url: String,
     #[serde(default)]
     published_at: Option<String>,
-    /// Markdown notes; may be long, frontends truncate or drop it.
     #[serde(default)]
     body: Option<String>,
     #[serde(default)]
@@ -85,31 +71,30 @@ struct GithubRelease {
 /// One check result, as every frontend renders it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
-    /// Version the running binary reports.
     pub current: String,
     /// Latest tagged release, `v` prefix stripped.
     pub latest: String,
-    /// Release page URL for the latest release.
     pub url: String,
-    /// ISO-8601 publish timestamp straight from GitHub (may be absent).
+    #[serde(default)]
     pub published_at: Option<String>,
-    /// Markdown release notes (may be absent).
+    #[serde(default)]
     pub notes: Option<String>,
     /// `latest` is strictly newer than `current`.
     pub update_available: bool,
-    /// The Windows installer asset for this release, when attached.
+    /// Windows installer asset, when attached.
+    #[serde(default)]
     pub setup: Option<UpdateAsset>,
-    /// SHA256SUMS.txt asset, when attached (checksum source for `setup`).
+    /// Checksum source for `setup`, when attached.
+    #[serde(default)]
     pub sha256: Option<UpdateAsset>,
 }
 
-/// Check the pinned repo's latest stable release against the running build.
+/// Latest stable release of the pinned repo vs the running build.
 pub async fn fetch_latest() -> Result<UpdateInfo> {
     fetch_latest_from(API_LATEST, current_version()).await
 }
 
-/// Endpoint-injected variant so tests can hit a local mock instead of
-/// GitHub, and so the checker never becomes a hidden network call.
+/// Endpoint-injected so tests can hit a local mock.
 pub async fn fetch_latest_from(endpoint: &str, current: &str) -> Result<UpdateInfo> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -126,7 +111,7 @@ pub async fn fetch_latest_from(endpoint: &str, current: &str) -> Result<UpdateIn
         .map_err(|e| Error::Update(format!("github unreachable: {e}")))?;
     if !resp.status().is_success() {
         return Err(Error::Update(format!(
-            "github api returned {} (tries a rate limit? retry later)",
+            "github api returned {} (rate limited? retry later)",
             resp.status().as_u16()
         )));
     }
@@ -153,10 +138,9 @@ pub async fn fetch_latest_from(endpoint: &str, current: &str) -> Result<UpdateIn
     })
 }
 
-/// Compare two dotted versions by segment ("0.4.10" > "0.3.1", "0.10" >
-/// "0.9", "0.4" == "0.4.0"). Pre-release suffixes order below the plain
-/// release ("1.0.0-rc1" < "1.0.0"); junk segments digest as zero so an
-/// oddball tag never crashes the float.
+/// Dotted compare: "0.4.10" > "0.3.1", "0.10" > "0.9", "0.4" == "0.4.0".
+/// Pre-releases order below the plain release ("1.0.0-rc1" < "1.0.0");
+/// junk segments digest as zero.
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let (a_num, a_pre) = split_prerelease(a.trim());
     let (b_num, b_pre) = split_prerelease(b.trim());
@@ -166,7 +150,7 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
     }
     match (a_pre.is_empty(), b_pre.is_empty()) {
         (true, true) => Ordering::Equal,
-        // Same numbers: the real release outranks any pre-release.
+        // Same numbers: the release outranks any pre-release.
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
         (false, false) => a_pre.cmp(b_pre),
@@ -181,11 +165,10 @@ fn split_prerelease(v: &str) -> (&str, &str) {
 }
 
 fn cmp_dotted(a: &str, b: &str) -> Ordering {
-    // Missing segments count as zero: "0.4" == "0.4.0".
+    // Missing segments are zero ("0.4" == "0.4.0"); trailing zeros are
+    // dropped first ("1.0" == "1").
     let mut va: Vec<u64> = a.split('.').map(numeric_prefix).collect();
     let mut vb: Vec<u64> = b.split('.').map(numeric_prefix).collect();
-    // Trailing zeros never carry meaning; trimming keeps the resize trick
-    // honest ("1.0" == "1").
     while va.last() == Some(&0) {
         va.pop();
     }
@@ -236,13 +219,10 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Download the release's installer into `dest_dir` and verify it against
-/// `SHA256SUMS.txt` (both straight from GitHub). A previously-downloaded
-/// copy whose hash matches the sums is reused (resume of a completed
-/// download, no repeat traffic).
-///
-/// Note the download endpoint is on github.com (not the JSON api), but the
-/// same kind of plain, dataless GET.
+/// Download the Windows setup into `dest_dir`. When a SHA256SUMS asset is
+/// given, the filename must be listed there and the digest must match.
+/// A previously downloaded copy (same name + size, the directory only
+/// retains hash-verified files) is reused without re-downloading.
 pub async fn download_setup(
     dest_dir: &std::path::Path,
     setup: &UpdateAsset,
@@ -250,7 +230,7 @@ pub async fn download_setup(
 ) -> Result<PathBuf> {
     use sha2::{Digest, Sha256};
 
-    // Path-safety: the name lands inside dest_dir unescaped.
+    // Path-safety: the name is joined into dest_dir unescaped.
     let suspicious = setup.name.is_empty()
         || setup.name.contains("..")
         || setup.name.contains('/')
@@ -263,10 +243,7 @@ pub async fn download_setup(
     std::fs::create_dir_all(dest_dir).map_err(Error::Io)?;
     let dest = dest_dir.join(&setup.name);
 
-    // Already there from a previous verified download? reuse it without
-    // touching the network. A file can only reach this directory through
-    // download_setup's hash gate, so an exact size match is an adequate
-    // stamp; the sums below are re-read anyway whenever we redownload.
+    // Fast reuse path: exact name+size match on an existing file.
     if setup.size > 0 {
         if let Ok(md) = std::fs::metadata(&dest) {
             if md.len() == setup.size {
@@ -281,7 +258,8 @@ pub async fn download_setup(
         .build()
         .map_err(|e| Error::Update(format!("http client: {e}")))?;
 
-    // Expected digest, straight lines: fetch SHA256SUMS.txt and look ours up.
+    // Expected digest from SHA256SUMS.txt. Missing sums for a filename the
+    // sums file was expected to cover = refuse, never install blind.
     let mut expected = None;
     if let Some(sums) = sums {
         let text = client
@@ -304,9 +282,8 @@ pub async fn download_setup(
         }
     }
 
-    // A stale file with the same size but the wrong content is impossible
-    // to distinguish without the digest (which we have here) — verify the
-    // existing bytes before overwriting, or fall through to redownload.
+    // Same size but wrong content is possible for a size-only reuse miss:
+    // verify bytes against the digest when one is known.
     if let (Some(want), Ok(bytes)) = (&expected, std::fs::read(&dest)) {
         if hex(&Sha256::digest(&bytes)) == *want {
             return Ok(dest);
@@ -327,8 +304,8 @@ pub async fn download_setup(
         }
     }
 
-    // Stream to a temp name, then rename: a half-downloaded file must never
-    // be mistaken for an installer simply because it happens to exist.
+    // Atomic: stream to `.part`, then rename, so a half download can not
+    // be mistaken for a complete installer by the size-based reuse path.
     let tmp = dest.with_extension("part");
     let mut file = tokio::fs::File::create(&tmp).await.map_err(Error::Io)?;
     let mut received: u64 = 0;
@@ -359,7 +336,6 @@ pub async fn download_setup(
             )));
         }
     }
-    // Cheap pre-rename size gate (the hash check above is the real one).
     if setup.size > 0 && received != setup.size {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(Error::Update(format!(
@@ -371,12 +347,9 @@ pub async fn download_setup(
     Ok(dest)
 }
 
-/// Launch the downloaded installer so Inno Setup replaces the old install
-/// (it stops the running daemon/GUI itself). `silent` = full unattended
-/// upgrade (`/VERYSILENT /NORESTART`), used by the `update_auto_install`
-/// path; the only visible step left there is the UAC prompt. Returns as
-/// soon as the installer process has started.
-#[must_use]
+/// Launch the downloaded installer (Inno Setup stops the running app and
+/// replaces it in place itself). `silent` = `/VERYSILENT /NORESTART`, the
+/// unattended auto-install path; only the UAC prompt shows.
 pub fn run_installer(path: &std::path::Path, silent: bool) -> Result<()> {
     #[cfg(windows)]
     {
@@ -400,9 +373,7 @@ pub fn run_installer(path: &std::path::Path, silent: bool) -> Result<()> {
     }
 }
 
-/// Delete installers older than a week from `<data_dir>/update/`, plus any
-/// leftover `.part` (a half download is never resurrected; the next
-/// install just re-downloads).
+/// Remove installers older than a week and loose `.part` files.
 pub fn prune_update_dir(update_dir: &std::path::Path) {
     let Some(entries) = std::fs::read_dir(update_dir).ok() else {
         return;
@@ -451,7 +422,6 @@ mod tests {
         assert_eq!(compare_versions("garbage", "garbage"), Equal);
     }
 
-    /// Local mock of GitHub's release endpoint: one canned JSON reply.
     #[tokio::test]
     async fn check_against_mock() {
         let body = r#"{
@@ -487,7 +457,6 @@ mod tests {
         assert_eq!(info.notes.as_deref(), Some("Test notes"));
     }
 
-    /// Same test, bound for the "already latest" path — one listener shot.
     #[tokio::test]
     async fn check_already_latest() {
         let body = r#"{"tag_name":"v0.3.1","html_url":"https://x/0.3.1"}"#;
@@ -509,7 +478,6 @@ mod tests {
         assert!(!info.update_available);
     }
 
-    /// The release picker: setup.exe and SHA256SUMS only.
     #[test]
     fn asset_picking() {
         let assets = vec![
@@ -526,8 +494,7 @@ mod tests {
 
     #[test]
     fn sums_parse() {
-        let text = format!(
-            "{}  ripdl-v0.4.0-x86_64-windows-setup.exe\n\
+        let text = format!(            "{}  ripdl-v0.4.0-x86_64-windows-setup.exe\n\
              bad-line-without-hash\n\
              {}  portabl.*zip\n",
             "a".repeat(64),
@@ -539,9 +506,6 @@ mod tests {
         assert_eq!(m.len(), 2); // junk line filtered (wrong digest length)
     }
 
-    /// Full download path against mocks: sums listing the true digest,
-    /// then the setup bytes; a second call must reuse the verified file
-    /// without touching the network again.
     #[tokio::test]
     async fn download_verifies_and_reuses() {
         use sha2::{Digest, Sha256};
@@ -556,7 +520,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            // Accept exactly two GETs: sums first, then the setup file.
+            // Sums first, then the setup file.
             for (snippet, payload) in
                 [("/SHA256SUMS.txt", sums), ("windows-setup.exe", body_s)]
             {
@@ -588,8 +552,7 @@ mod tests {
         server.await.unwrap();
         assert_eq!(std::fs::read(&got).unwrap(), body);
 
-        // Reuse: correct file already on disk, so this must not need the
-        // (now closed) mock server.
+        // Reuse: on-disk file matches, no second run against the mock.
         let again = download_setup(&dir, &setup, Some(&sums_asset)).await.unwrap();
         assert_eq!(again, got);
         let _ = std::fs::remove_dir_all(&dir);

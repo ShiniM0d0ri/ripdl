@@ -38,14 +38,11 @@ pub struct DaemonSettings {
     /// bandwidth. Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bond_interfaces: Option<bool>,
-    /// GUI preference (the daemon just persists it): check GitHub for a
-    /// newer release when the app starts. Default on.
+    /// Check GitHub for updates at GUI startup. Default on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
-    /// When a startup check finds a newer release AND this is on: download
-    /// the SHA256-verified Windows setup.exe and run it unattended
-    /// (`/VERYSILENT`); only the UAC prompt shows. Default off — new
-    /// releases install on one explicit click unless the user opts in.
+    /// With `update_check`: install found updates unattended
+    /// (`/VERYSILENT`; only the UAC prompt shows). Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_auto_install: Option<bool>,
 }
@@ -214,13 +211,9 @@ pub enum Command {
     },
     /// Current daemon-wide settings (config.json contents).
     GetConfig,
-    /// Ask GitHub whether a newer release exists than the running build.
-    /// One direct api.github.com GET; never automatic, no telemetry.
+    /// Query GitHub for a newer release.
     CheckUpdate,
-    /// Download the latest release's Windows setup.exe (SHA256-verified
-    /// against the release's SHA256SUMS.txt) and run it, upgrading in
-    /// place. Only reached via an explicit click or the
-    /// `update_auto_install` opt-in setting.
+    /// SHA256-verified setup download + unattended (or visible) install.
     UpdateInstall,
     /// Replace the daemon settings wholesale (omitted fields = default).
     /// Persisted to `<data_dir>/config.json`; `max_concurrent` applies
@@ -254,7 +247,7 @@ pub enum Reply {
     Config {
         settings: DaemonSettings,
     },
-    /// Result of a `CheckUpdate` probe.
+    /// Result of a `CheckUpdate`.
     Update {
         info: crate::update::UpdateInfo,
     },
