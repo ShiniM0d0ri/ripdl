@@ -1,27 +1,27 @@
-# Tag-push release: build both platforms, package binaries + extension,
-# attach to an auto-generated GitHub Release.
+# Tag-push release. Also runnable with workflow_dispatch for a dry run:
+# builds and packages everything, uploads named artifacts for inspection,
+# but does NOT create a GitHub Release (that only happens on tag pushes).
+#
+# Artifact names (single version source: workspace Cargo.toml version):
+#   ripdl-vX.Y.Z-x86_64-windows-portable.zip   (CLI + daemon + GUI + ext/)
+#   ripdl-vX.Y.Z-x86_64-windows-setup.exe      (Inno Setup installer)
+#   ripdl-vX.Y.Z-x86_64-linux.tar.gz           (CLI + daemon + GUI + ext/)
+#   ripdl_X.Y.Z_amd64.deb / ripdl-X.Y.Z-1.x86_64.rpm
+#   ripdl-browser-extension-vX.Y.Z.zip         (ext/ alone, for "load unpacked")
+#   SHA256SUMS.txt
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            artifact: zip
-          - os: ubuntu-latest
-            triple: x86_64-unknown-linux-gnu
-            artifact: tar.gz
-    runs-on: ${{ matrix.os }}
+  windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -29,29 +29,151 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Resolve release version
+        id: ver
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          V=$(cargo metadata -q --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "ripdl-core") | .version')
+          if [ "${{ github.event_name }}" = "push" ] && [ "$V" != "${TAG#v}" ]; then
+            echo "tag $TAG does not match workspace version $V - aborting"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
       - name: Build release binaries
         run: cargo build --release
 
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+      - name: Package portable zip
         shell: pwsh
         run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $stage = "ripdl-v$v"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target\release\ripgrep.exe $stage\
+          Copy-Item target\release\ripdl-daemon.exe $stage\
+          Copy-Item target\release\ripdl-gui.exe $stage\
+          Copy-Item ext "$stage\ext" -Recurse
+          Copy-Item LICENSE-MIT, LICENSE-APACHE $stage\
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/ripdl.exe dist/
-          Copy-Item target/release/ripdl-daemon.exe dist/
-          Copy-Item ext dist/ext -Recurse
-          Compress-Archive -Path dist/* -DestinationPath "ripdl-${{ github.ref_name }}-${{ matrix.triple }}.zip"
+          Compress-Archive -Path $stage -DestinationPath "dist\ripdl-v$v-x86_64-windows-portable.zip"
+          Remove-Item $stage -Recurse -Force
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+      - name: Build setup.exe (Inno Setup)
+        shell: pwsh
         run: |
-          mkdir -p dist/ext
-          cp target/release/ripdl target/release/ripdl-daemon dist/
-          cp -r ext/. dist/ext/
-          tar -czf "ripdl-${{ github.ref_name }}-${{ matrix.triple }}.tar.gz" -C dist .
+          $v = "${{ steps.ver.outputs.version }}"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup -y }
+          & $iscc "/DAPP_VERSION=$v" "packaging\windows\ripdl.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: dist/*
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install GUI build deps + packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev jq zip
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          TAG="${{ github.ref_name }}"
+          V=$(cargo metadata -q --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "ripdl-core") | .version')
+          if [ "${{ github.event_name }}" = "push" ] && [ "$V" != "${TAG#v}" ]; then
+            echo "tag $TAG does not match workspace version $V - aborting"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Package portable tar.gz
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          mkdir -p "ripdl-v$V"
+          cp target/release/ripgrep target/release/ripdl-daemon target/release/ripdl-gui "ripdl-v$V/"
+          cp -r ext "ripdl-v$V/ext"
+          cp README.md LICENSE-MIT LICENSE-APACHE "ripdl-v$V/"
+          tar -czf "ripdl-v$V-x86_64-linux.tar.gz" -C . "ripdl-v$V"
+          rm -rf "ripdl-v$V"
+          mkdir -p dist && mv "ripdl-v$V-x86_64-linux.tar.gz" dist/
+
+      - name: Build deb + rpm (nfpm)
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.36.1
+          export RIPDL_VERSION="$V"
+          export RIPDL_BIN="$PWD/target/release"
+          export RIPDL_SRC="$PWD"
+          "$(go env GOPATH)/bin/nfpm" package --config packaging/linux/nfpm.yaml --target dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: dist/*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [windows, linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Package the browser extension + checksums
+        run: |
+          V=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          mkdir -p dist/ripdl
+          cp -r ext/. dist/ripdl/
+          (cd dist && zip -rq "ripdl-browser-extension-v$V.zip" ripdl)
+          rm -rf dist/ripdl
+          (cd dist && sha256sum ripdl-* > SHA256SUMS.txt)
+
+      - name: Named artifacts (dry-run inspection)
+        run: ls -la dist/
 
       - name: Attach to release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: ripdl-*
+          files: dist/*
           generate_release_notes: true
+          body: |
+            **Windows**: `...-windows-setup.exe` installs ripdl (the GUI
+            auto-spawns the daemon on first run). `...-windows-portable.zip`
+            is unzip-and-run - no admin needed.
+
+            **Linux**: the `.deb` / `.rpm` install CLI + daemon + GUI with
+            runtime dependencies declared. Portable tar users need the GUI
+            runtime installed for the window to start
+            (`libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3`).
+            The CLI and daemon alone need nothing beyond libc.
+
+            **Browser extension**: `ripdl-browser-extension-*.zip` - unzip and
+            load it via chrome://extensions > Developer mode > Load unpacked
+            (see ext/README.md inside the zip).

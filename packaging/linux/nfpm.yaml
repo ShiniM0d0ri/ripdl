@@ -1,0 +1,51 @@
+# ripdl Linux packages (deb + rpm) built with nfpm in the release workflow.
+# Versions resolve at package time: $RIPDL_VERSION (semver, no v prefix),
+# $RIPDL_BIN (directory with the release binaries).
+name: ripdl
+arch: amd64
+platform: linux
+version: "${RIPDL_VERSION}"
+section: default
+priority: optional
+maintainer: "ripdl <https://github.com/ShiniM0d0ri/ripdl>"
+description: |-
+  ripdl - free, ad-free, multi-segment download manager.
+
+  Multi-segment HTTP engine with sidecar resume, retry/backoff and a
+  shared speed limiter; a daemon that owns a persistent queue with
+  scheduling; torrent support via librqbit; an IDM-style GUI; and a
+  browser-capture bridge for Chrome (see ext/ after installation).
+homepage: https://github.com/ShiniM0d0ri/ripdl
+license: MIT OR Apache-2.0
+contents:
+  - src: "${RIPDL_BIN}/ripgrep"
+    dst: /usr/bin/ripgrep
+  - src: "${RIPDL_BIN}/ripdl-daemon"
+    dst: /usr/bin/ripdl-daemon
+  - src: "${RIPDL_BIN}/ripdl-gui"
+    dst: /usr/bin/ripdl-gui
+  - src: "${RIPDL_SRC}/README.md"
+    dst: /usr/share/doc/ripdl/README.md
+  - src: "${RIPDL_SRC}/LICENSE-MIT"
+    dst: /usr/share/licenses/ripdl/LICENSE-MIT
+  - src: "${RIPDL_SRC}/LICENSE-APACHE"
+    dst: /usr/share/licenses/ripdl/LICENSE-APACHE
+# The GUI links webkit2gtk-4.1 (tauri) and uses appindicator for the tray;
+# the engine and daemon only need libc. yt-dlp powers hunt-mode video
+# downloads when present.
+overrides:
+  deb:
+    depends:
+      - libc6
+      - libgtk-3-0
+      - libwebkit2gtk-4.1-0
+      - libayatana-appindicator3-1
+    recommends:
+      - yt-dlp
+  rpm:
+    depends:
+      - gtk3
+      - webkit2gtk4.1
+      - libayatana-appindicator-gtk3
+    recommends:
+      - yt-dlp

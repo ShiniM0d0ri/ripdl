@@ -67,10 +67,14 @@ the single-stream path.
 
 - `.github/workflows/ci.yml`: on every push/PR, `cargo check` + offline
   `cargo test` on windows-latest and ubuntu-latest.
-- `.github/workflows/release.yml`: on tag `v*` → release builds for
-  `x86_64-pc-windows-msvc` (zip: ripdl.exe, ripdl-daemon.exe, `ext/`) and
-  `x86_64-unknown-linux-gnu` (tar.gz), attached to an auto-generated GitHub
-  Release. Cut releases by pushing an annotated tag:
+- `.github/workflows/release.yml`: on tag `v*` (plus `workflow_dispatch`
+  dry run - packages everything, no release). Version source = workspace
+  Cargo.toml (tag must match). Artifacts: `ripdl-vX.Y.Z-x86_64-windows-`
+  `{portable.zip,setup.exe}` (Inno script `packaging/windows/ripdl.iss`,
+  Sources relative to repo root), `ripdl-vX.Y.Z-x86_64-linux.tar.gz`,
+  deb+rpm via nfpm (`packaging/linux/nfpm.yaml`, installed with go),
+  `ripdl-browser-extension-vX.Y.Z.zip` + `SHA256SUMS.txt` in the release
+  job. Cut releases by bumping the workspace version, then:
   `git tag -a vX.Y.Z; git push origin vX.Y.Z`.
 
 ## Resume-sidecar format
