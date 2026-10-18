@@ -87,20 +87,19 @@ end;
 // Program Files would break; a foreign key (another app's host under the
 // same key name with a different manifest) must survive.
 procedure RemoveNativeHostRegistrations;
-const
-  Root = 'org.ripdl.host';
-  Subkeys: array[1..3] of String = (
-    'Software\Google\Chrome\NativeMessagingHosts',
-    'Software\Microsoft\Edge\NativeMessagingHosts',
-    'Software\BraveSoftware\Brave\NativeMessagingHosts'
-  );
 var
+  Subkeys: array[1..3] of String;
   I: Integer;
   Key, Manifest: String;
 begin
+  Subkeys[1] := 'Software\Google\Chrome\NativeMessagingHosts';
+  Subkeys[2] := 'Software\Microsoft\Edge\NativeMessagingHosts';
+  Subkeys[3] := 'Software\BraveSoftware\Brave\NativeMessagingHosts';
   for I := Low(Subkeys) to High(Subkeys) do
   begin
-    Key := Subkeys[I] + '\' + Root;
+    { The default value is the manifest path; only delete ripdl's own
+      registration, never a foreign host sharing the key name. }
+    Key := Subkeys[I] + '\' + 'org.ripdl.host';
     if RegQueryStringValue(HKCU, Key, '', Manifest) then
       if Pos('ripdl', LowerCase(Manifest)) > 0 then
         RegDeleteKeyIncludingSubkeys(HKCU, Key);
