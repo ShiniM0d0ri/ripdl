@@ -9,7 +9,7 @@
 use ripdl_core::bridge;
 use ripdl_core::categories::categorize;
 use ripdl_core::engine::percent_decode_lossy;
-use ripdl_core::rpc::{Command, Reply, Request, Response, TaskInfo};
+use ripdl_core::rpc::{Command, DaemonSettings, Reply, Request, Response, TaskInfo};
 use ripdl_core::transport;
 use ripdl_core::task::TaskKind;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -265,6 +265,46 @@ fn download_root_path() -> String {
     download_root().to_string_lossy().into_owned()
 }
 
+/// Current daemon settings (config.json contents).
+#[tauri::command]
+async fn get_config() -> Result<DaemonSettings, String> {
+    match rpc(Command::GetConfig).await? {
+        Reply::Config { settings } => Ok(settings),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+/// Replace the daemon settings (validation happens daemon-side; the reply
+/// carries the normalized values). Also flips the tray preference live.
+#[tauri::command]
+async fn set_config(
+    settings: DaemonSettings,
+    state: tauri::State<'_, GuiPrefs>,
+) -> Result<DaemonSettings, String> {
+    let saved = match rpc(Command::SetConfig { settings }).await? {
+        Reply::Config { settings } => settings,
+        other => Err(format!("unexpected daemon reply: {other:?}"))?,
+    };
+    state
+        .hide_to_tray
+        .store(saved.hide_to_tray.unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
+    Ok(saved)
+}
+
+/// Live tray preference read by the close handler (avoid an async config
+/// roundtrip inside the window event). Managed; defaults true and is
+/// synced from the daemon settings at startup / on save.
+struct GuiPrefs {
+    hide_to_tray: std::sync::atomic::AtomicBool,
+}
+
+impl Default for GuiPrefs {
+    fn default() -> Self {
+        // Hide-to-tray on close until the user's config says otherwise.
+        Self { hide_to_tray: std::sync::atomic::AtomicBool::new(true) }
+    }
+}
+
 fn expect_ok(reply: Reply) -> Result<(), String> {
     match reply {
         Reply::Ok => Ok(()),
@@ -275,6 +315,7 @@ fn expect_ok(reply: Reply) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .manage(GuiPrefs::default())
         .invoke_handler(tauri::generate_handler![
             list_tasks,
             add_task,
@@ -287,8 +328,83 @@ fn main() {
             pick_file,
             torrent_details,
             open_path,
-            download_root_path
+            download_root_path,
+            get_config,
+            set_config
         ])
+        .setup(|app| {
+            use tauri::Manager;
+
+            // Sync the tray preference from the daemon settings.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(Reply::Config { settings }) = rpc(Command::GetConfig).await {
+                    if let Some(prefs) = handle.try_state::<GuiPrefs>() {
+                        prefs.hide_to_tray.store(
+                            settings.hide_to_tray.unwrap_or(true),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+            });
+
+            // Tray icon: left click shows the window; menu has Show / Exit.
+            let show_item =
+                tauri::menu::MenuItem::with_id(app, "tray-show", "Show ripdl", true, None::<&str>)?;
+            let quit_item =
+                tauri::menu::MenuItem::with_id(app, "tray-quit", "Exit", true, None::<&str>)?;
+            let tray_menu = tauri::menu::Menu::with_items(app, &[&show_item, &quit_item])?;
+            let mut tray = tauri::tray::TrayIconBuilder::with_id("ripdl-tray")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, ev| match ev.id().as_ref() {
+                    "tray-show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "tray-quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, ev| {
+                    // Left click = show the window (like IDM/FDM).
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = ev
+                    {
+                        if let Some(w) = tray.app_handle().get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            use tauri::Manager;
+            // Close minimizes to the tray by default (the daemon keeps
+            // running either way; Quit lives in the tray menu).
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let hide = window
+                    .app_handle()
+                    .try_state::<GuiPrefs>()
+                    .is_some_and(|p| p.hide_to_tray.load(std::sync::atomic::Ordering::Relaxed));
+                if hide && window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running ripdl gui");
 }

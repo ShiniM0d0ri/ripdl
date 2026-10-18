@@ -21,3 +21,4 @@ tauri-build = "2"
 
 [dependencies.tauri]
 version = "2"
+features = ["tray-icon"]

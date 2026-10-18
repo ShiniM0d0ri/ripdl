@@ -256,3 +256,59 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
 
 /* Sidebar torrent category color tweak */
 .side-item[data-cat="torrents"] .count { color: #6c7; }
+
+/* Settings button pushed to the toolbar's right end. */
+.tb-btn.right { margin-left: auto; }
+
+/* Settings dialog */
+#set-backdrop {
+    position: fixed; inset: 0; z-index: 80;
+    background: #0006;
+    display: flex; align-items: center; justify-content: center;
+}
+#set {
+    background: #fff; border: 1px solid #c3c9cf; border-radius: 6px;
+    box-shadow: 0 12px 40px #0005;
+    width: min(520px, 90vw);
+    display: flex; flex-direction: column;
+    padding: 14px 16px; gap: 10px;
+}
+.set-title {
+    display: flex; align-items: center;
+    font-weight: 600; font-size: 14px; color: #333c44;
+}
+.set-title em { font-weight: 400; font-style: normal; color: #889; font-size: 11.5px; margin-left: 6px; flex: 1; }
+#set-close {
+    border: none; background: none; font-size: 18px; cursor: pointer; color: #667;
+    padding: 0 6px; border-radius: 4px;
+}
+#set-close:hover { background: #eef1f4; }
+#set-body { display: flex; flex-direction: column; gap: 7px; }
+.set-row {
+    display: grid; grid-template-columns: 190px 1fr 92px;
+    align-items: center; gap: 8px;
+}
+.set-row label { font-size: 12px; color: #39424c; }
+.set-row input {
+    width: 100%; padding: 5px 8px;
+    border: 1px solid #c3c9cf; border-radius: 4px;
+    font: 12px "Segoe UI", sans-serif; color: inherit;
+    user-select: text;
+    box-sizing: border-box; justify-self: stretch;
+}
+.set-row input.chk-box { width: auto; justify-self: start; }
+.set-row button {
+    padding: 5px 10px; border-radius: 4px; border: 1px solid #c3c9cf;
+    background: linear-gradient(#fdfdfd, #eef0f2); cursor: pointer; font: inherit;
+    white-space: nowrap;
+}
+.set-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.set-actions button {
+    padding: 6px 16px; border-radius: 4px; border: 1px solid #c3c9cf;
+    background: linear-gradient(#fdfdfd, #eef0f2); cursor: pointer; font: inherit;
+}
+.set-actions .primary {
+    background: linear-gradient(#3f8dca, #2f6fa5); color: #fff; border-color: #2f6fa5;
+    font-weight: 600;
+}
+#set-err { color: #c23b3b; font-size: 12px; }

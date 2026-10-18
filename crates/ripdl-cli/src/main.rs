@@ -107,6 +107,15 @@ enum Cmd {
     /// Change a torrent task's per-file selection: file indices
     /// comma-separated (`0,2,3`) or `all`.
     Select { id: String, files: String },
+    /// Show the daemon's settings (config.json contents).
+    Config {
+        /// `key=value` pairs to change (e.g. `max_concurrent=4`); omit to
+        /// just show the current settings. Valid keys: max_concurrent,
+        /// max_segments, min_segment_size, max_speed_bytes (0 = uncapped),
+        /// default_download_dir, ytdlp_path, hide_to_tray (true|false).
+        #[arg(value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
     /// Stop the daemon.
     Stop,
     /// Register this binary as the browser's native messaging host
@@ -230,12 +239,61 @@ async fn main() -> anyhow::Result<()> {
             };
             rpc(Command::UpdateTorrentSelection { id, only_files }).await
         }
+        Cmd::Config { set } => {
+            if set.is_empty() {
+                return rpc(Command::GetConfig).await;
+            }
+            // Partial edits: fetch the live values and patch on top, then
+            // send the whole settings object back (full-replace semantics).
+            let mut settings = match rpc_reply(Command::GetConfig).await? {
+                Reply::Config { settings } => settings,
+                other => bail!("unexpected daemon reply: {other:?}"),
+            };
+            for pair in set {
+                let (key, raw) = pair
+                    .trim()
+                    .split_once('=')
+                    .with_context(|| format!("expected key=value, got {pair:?}"))?;
+                let val = raw.trim();
+                match key.trim() {
+                    "max_concurrent" => {
+                        settings.max_concurrent = Some(val.parse().context("max_concurrent needs a number (1..)")?)
+                    }
+                    "max_segments" => {
+                        settings.max_segments = Some(val.parse().context("max_segments needs a number (1..)")?)
+                    }
+                    "min_segment_size" => {
+                        settings.min_segment_size = Some(val.parse().context("min_segment_size needs a number (1..)")?)
+                    }
+                    "max_speed_bytes" | "max_speed" => {
+                        let n = if val == "0" || val.eq_ignore_ascii_case("unlimited") {
+                            0
+                        } else {
+                            parse_speed(val).context("max_speed: 0, or e.g. 2MiB")?
+                        };
+                        settings.max_speed_bytes = Some(n);
+                    }
+                    "default_download_dir" => settings.default_download_dir = Some(PathBuf::from(val)),
+                    "ytdlp_path" => settings.ytdlp_path = Some(val.to_string()),
+                    "hide_to_tray" => {
+                        settings.hide_to_tray = Some(val.parse().context("hide_to_tray needs true|false")?)
+                    }
+                    other => bail!("unknown setting {other:?} (see: ripdl config --help)"),
+                }
+            }
+            rpc(Command::SetConfig { settings }).await
+        }
         Cmd::Stop => rpc(Command::Shutdown).await,
     }
 }
 
 /// One-shot RPC client: connect, send, print the reply.
 async fn rpc(cmd: Command) -> anyhow::Result<()> {
+    print_reply(rpc_reply(cmd).await?)
+}
+
+/// Transport only: connect, send, decode the reply without printing.
+async fn rpc_reply(cmd: Command) -> anyhow::Result<Reply> {
     let mut stream = ripdl_core::transport::connect_daemon()
         .await
         .context("daemon not running (start it with: ripdl-daemon)")?;
@@ -251,11 +309,46 @@ async fn rpc(cmd: Command) -> anyhow::Result<()> {
         .await?
         .context("daemon closed the connection without a reply")?;
     let resp: Response = serde_json::from_str(&resp_line).context("bad reply from daemon")?;
-
     match resp.reply {
+        Reply::Error { message } => bail!("{message}"),
+        other => Ok(other),
+    }
+}
+
+fn print_reply(reply: Reply) -> anyhow::Result<()> {
+    match reply {
         Reply::Ok => println!("ok"),
         Reply::Added { id } => println!("queued: {id}"),
         Reply::Error { message } => bail!("{message}"),
+        Reply::Config { settings } => {
+            println!("max_concurrent:       {}", settings.max_concurrent.unwrap_or(3));
+            println!("max_segments:         {}", settings.max_segments.unwrap_or(8));
+            println!(
+                "min_segment_size:     {}",
+                humans(settings.min_segment_size.unwrap_or(1024 * 1024))
+            );
+            println!(
+                "max_speed:            {}",
+                settings
+                    .max_speed_bytes
+                    .filter(|&b| b > 0)
+                    .map(humans)
+                    .unwrap_or_else(|| "unlimited".to_string())
+            );
+            println!(
+                "default_download_dir: {}",
+                settings
+                    .default_download_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(user Downloads)".to_string())
+            );
+            println!(
+                "ytdlp_path:           {}",
+                settings.ytdlp_path.as_deref().unwrap_or("yt-dlp")
+            );
+            println!("hide_to_tray:         {}", settings.hide_to_tray.unwrap_or(true));
+        }
         Reply::TorrentDetails { details } => {
             println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));
             println!("hash: {}", details.info_hash);
@@ -515,9 +608,10 @@ fn parse_speed(s: &str) -> anyhow::Result<u64> {
     let cut = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
     let mult = match s[cut.len()..].trim() {
         "" => 1u64,
-        "k" => 1024,
-        "m" => 1024 * 1024,
-        "g" => 1024 * 1024 * 1024,
+        // Accept the friendly spellings too: kb/kib/k, miB/mib/m, etc.
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
         other => bail!("unknown speed suffix '{other}' (use k, m, or g)"),
     };
     let v: f64 = cut.trim().parse().context("invalid speed number")?;

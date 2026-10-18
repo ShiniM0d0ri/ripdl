@@ -107,7 +107,11 @@ In progress: P2 GUI polish — basic file management landed (per-task "Save to"
 with native browse, per-row location display, open file/folder via Explorer
 `/select`, `remove_task(delete_files)` with sidecar-aware disk cleanup,
 `rm --files` CLI flag, GUI render-on-change, spawn rate limit in the bridge);
-remaining P2: settings panel (daemon config) + tray.
+settings panel + tray landed: `GetConfig`/`SetConfig` RPC (core
+`DaemonSettings`, full-replace, `config.json` persisted, concurrency
+resizes the runner semaphore live), GUI Settings dialog (toolbar gear),
+tray icon with close-to-tray (`hide_to_tray` preference in config.json).
+Remaining P2: nothing major.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

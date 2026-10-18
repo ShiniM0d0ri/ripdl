@@ -26,6 +26,9 @@
     <button id="btn-clear-done" class="tb-btn" title="Remove completed tasks from the list (files stay on disk)">
       <span class="tb-ico gray">&#10005;</span><span>Clear Done</span>
     </button>
+    <button id="btn-settings" class="tb-btn right" title="Settings (daemon config)">
+      <span class="tb-ico blue">&#9881;</span><span>Settings</span>
+    </button>
   </div>
 
   <div id="body">
@@ -117,6 +120,30 @@
         <button id="tdg-apply" class="hidden" disabled>Apply selection</button>
       </div>
       <div id="tdg-body"></div>
+    </div>
+  </div>
+
+  <!-- Settings dialog -->
+  <div id="set-backdrop" class="hidden">
+    <div id="set">
+      <div class="set-title">Settings<em> daemon-wide (config.json)</em><button id="set-close">&times;</button></div>
+      <div id="set-body">
+        <div class="set-row"><label for="set-conc">Concurrent downloads</label><input id="set-conc" type="number" min="1" max="64" /></div>
+        <div class="set-row"><label for="set-segs">Max segments per download</label><input id="set-segs" type="number" min="1" max="64" /></div>
+        <div class="set-row"><label for="set-minseg">Min segment size</label><input id="set-minseg" type="text" placeholder="e.g. 4MiB (1048576)" /></div>
+        <div class="set-row"><label for="set-speed">Speed cap (shared)</label><input id="set-speed" type="text" placeholder="e.g. 2MiB, empty = unlimited" /></div>
+        <div class="set-row"><label for="set-dir">Default download folder</label>
+          <input id="set-dir" type="text" placeholder="(user Downloads)" />
+          <button id="set-dir-browse">Browse&hellip;</button>
+        </div>
+        <div class="set-row"><label for="set-ytdlp">yt-dlp path</label><input id="set-ytdlp" type="text" placeholder="yt-dlp (on PATH)" /></div>
+        <div class="set-row"><label for="set-tray">Minimize to tray on close</label><input id="set-tray" type="checkbox" class="chk-box" /></div>
+      </div>
+      <div class="set-actions">
+        <button id="set-cancel">Cancel</button>
+        <button id="set-ok" class="primary">Save</button>
+      </div>
+      <div id="set-err" class="hidden"></div>
     </div>
   </div>
 

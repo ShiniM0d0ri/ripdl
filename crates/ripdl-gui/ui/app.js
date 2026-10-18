@@ -351,6 +351,7 @@ async function poll() {
 }
 
 function renderStatusbar() {
+    if (Date.now() < statusFlashUntil) return; // flashing a message
     const running = tasks.filter((t) => ["running", "queued"].includes(t.state)).length;
     const totalSpeed = tasks.reduce((s, t) => s + (t.speed_bps || 0), 0);
     $("#st-counts").textContent = `${running} active · ${tasks.length} in list`;
@@ -410,8 +411,128 @@ $("#dlg-cancel").onclick = () => $("#dlg-backdrop").classList.add("hidden");
 $("#dlg-ok").onclick = submitAdd;
 $("#dlg-url").onkeydown = (ev) => { if (ev.key === "Enter") submitAdd(); };
 $("#dlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) $("#dlg-backdrop").classList.add("hidden"); };
+
+/* Settings dialog (daemon-wide config) */
+const SET_INPUTS = ["#set-conc", "#set-segs", "#set-minseg", "#set-speed", "#set-dir", "#set-ytdlp"];
+
+function flashStatus(msg, color) {
+    const st = $("#st-counts");
+    st.textContent = msg;
+    st.style.color = color || "#2e7d32";
+    // Poll re-renders the status bar every second; suppress it until the
+    // flash has had time to be readable.
+    statusFlashUntil = Date.now() + 3500;
+    setTimeout(() => { st.style.color = ""; }, 3500);
+}
+let statusFlashUntil = 0;
+
+// Loose byte parser for the settings fields: "4MiB", "2 MB", "1048576",
+// "500k"... Empty input = no value; junk = NaN.
+function parseBytesLoose(str) {
+    const s = String(str).trim().toLowerCase();
+    if (!s) return undefined;
+    const m = s.match(/^([\d.]+)\s*(k|m|g|t)?i?b?$/);
+    if (!m) return NaN;
+    const n = parseFloat(m[1]);
+    if (!Number.isFinite(n) || n < 0) return NaN;
+    const mult = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 }[m[2] || ""];
+    if (mult === undefined) return NaN;
+    return Math.round(n * mult);
+}
+
+function bytesForEdit(v) {
+    // humans() renders "1.0 MiB", which parseBytesLoose reads back exactly.
+    return v == null ? "" : humans(v);
+}
+
+async function openSettings() {
+    const err = $("#set-err");
+    err.classList.add("hidden");
+    SET_INPUTS.forEach((sel) => { $(sel).value = ""; });
+    $("#set-tray").checked = true;
+    try {
+        const s = await invokeSafe("get_config");
+        $("#set-conc").value = s.max_concurrent ?? "";
+        $("#set-segs").value = s.max_segments ?? "";
+        $("#set-minseg").value = bytesForEdit(s.min_segment_size);
+        $("#set-speed").value = bytesForEdit(s.max_speed_bytes);
+        $("#set-dir").value = s.default_download_dir ?? "";
+        $("#set-ytdlp").value = s.ytdlp_path ?? "";
+        $("#set-tray").checked = s.hide_to_tray ?? true;
+        $("#set-backdrop").classList.remove("hidden");
+        $("#set-conc").focus();
+    } catch (e) {
+        err.textContent = String(e).replace(/^.*error: /, "");
+        err.classList.remove("hidden");
+    }
+}
+
+function closeSettings() {
+    $("#set-backdrop").classList.add("hidden");
+}
+
+async function saveSettings() {
+    const err = $("#set-err");
+    err.classList.add("hidden");
+    const reject = (msg) => { err.textContent = msg; err.classList.remove("hidden"); };
+    const num = (el) => {
+        const raw = el.value.trim();
+        if (raw === "") return undefined;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : NaN;
+    };
+    const conc = num($("#set-conc"));
+    const segs = num($("#set-segs"));
+    const minseg = parseBytesLoose($("#set-minseg").value);
+    const speed = parseBytesLoose($("#set-speed").value);
+    if (Number.isNaN(conc) || Number.isNaN(segs)) return reject("concurrency / segments need numbers");
+    if (Number.isNaN(minseg) || Number.isNaN(speed)) return reject("segment size / speed need bytes (e.g. 4MiB) or zero/empty");
+    if (conc !== undefined && conc < 1) return reject("concurrent downloads must be at least 1");
+    if (segs !== undefined && segs < 1) return reject("max segments must be at least 1");
+    if (minseg !== undefined && minseg < 1) return reject("min segment size must be at least 1");
+    const dir = $("#set-dir").value.trim();
+    // Full-replace semantics: cleared fields become absent -> daemon defaults.
+    const payload = {
+        max_concurrent: conc,
+        max_segments: segs,
+        min_segment_size: minseg,
+        max_speed_bytes: speed,
+        default_download_dir: dir === "" ? undefined : dir,
+        ytdlp_path: $("#set-ytdlp").value.trim() || undefined,
+        hide_to_tray: $("#set-tray").checked,
+    };
+    try {
+        await invokeSafe("set_config", { settings: payload });
+        closeSettings();
+        flashStatus("settings saved");
+    } catch (e) {
+        reject(String(e).replace(/^.*error: /, ""));
+    }
+}
+
+$("#btn-settings").onclick = openSettings;
+$("#set-cancel").onclick = closeSettings;
+$("#set-close").onclick = closeSettings;
+$("#set-ok").onclick = saveSettings;
+$("#set-dir-browse").onclick = async () => {
+    try {
+        const picked = await invokeSafe("pick_dir");
+        if (picked) $("#set-dir").value = picked;
+    } catch (e) {
+        flashErr(String(e));
+    }
+};
+$("#set-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeSettings(); };
+$("#set-backdrop").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
+$("#set-ytdlp").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
+$("#set-dir").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
+
 document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") { $("#dlg-backdrop").classList.add("hidden"); closeDetails(); }
+    if (ev.key === "Escape") {
+        $("#dlg-backdrop").classList.add("hidden");
+        closeDetails();
+        closeSettings();
+    }
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "n") {
         ev.preventDefault();
         openAddDialog();

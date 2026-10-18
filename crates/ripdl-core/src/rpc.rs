@@ -7,6 +7,107 @@ use crate::task::TaskState;
 /// Default daemon RPC port (TCP, localhost only).
 pub const DEFAULT_PORT: u16 = 5593;
 
+/// Daemon-wide settings (`<data_dir>/config.json`). Every field is optional
+/// so any partial file works: absent fields fall back to built-in defaults.
+/// Shared with all frontends: CLI and GUI both send/receive this verbatim;
+/// the daemon persists it back unchanged (so frontend-only fields like
+/// `hide_to_tray` round-trip too).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_segments: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_segment_size: Option<u64>,
+    /// Bytes per second shared cap; `None` = uncapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_speed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_download_dir: Option<PathBuf>,
+    /// Where the yt-dlp sidecar lives for video tasks. Bare names resolve
+    /// through `PATH`; unset means the literal name `yt-dlp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ytdlp_path: Option<String>,
+    /// GUI preference (the daemon just persists it): closing the window
+    /// minimizes to the tray instead of exiting. Default on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hide_to_tray: Option<bool>,
+}
+
+impl DaemonSettings {
+    /// Missing file = defaults; unreadable file = warn + defaults (never
+    /// rewritten, so a typo doesn't clobber the user's edits).
+    /// Lives here (not in the daemon) so frontends can read the same file.
+    pub fn load(path: &std::path::Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| Self::default()),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Persist the settings (pretty JSON through `atomic_write_json`).
+    pub fn save(&self, path: &std::path::Path) -> crate::error::Result<()> {
+        crate::atomic_write_json(path, self)
+    }
+
+    /// Queue-wide concurrent-download cap (built-in default 3).
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent.unwrap_or(3).max(1)
+    }
+
+    pub fn max_segments(&self) -> usize {
+        self.max_segments
+            .unwrap_or(crate::engine::EngineConfig::default().max_segments)
+    }
+
+    pub fn min_segment_size(&self) -> u64 {
+        self.min_segment_size
+            .unwrap_or(crate::engine::EngineConfig::default().min_segment_size)
+    }
+
+    /// Bytes/second cap; `0` in the file means "unlimited" (a zero
+    /// token-bucket rate would stall the download forever).
+    pub fn max_speed(&self) -> Option<u64> {
+        self.max_speed_bytes.filter(|&b| b > 0)
+    }
+
+    /// The sidecar entry point for video tasks: explicit config path or
+    /// PATH fallback.
+    pub fn ytdlp_path(&self) -> String {
+        self.ytdlp_path
+            .clone()
+            .unwrap_or_else(|| "yt-dlp".to_string())
+    }
+
+    /// Apply a partial update: every `Some(x)` in `patch` wins; `None`
+    /// leaves the current value untouched. Useful for CLI-style
+    /// single-key edits on top of the live values.
+    pub fn apply(&mut self, patch: Self) {
+        if patch.max_concurrent.is_some() {
+            self.max_concurrent = patch.max_concurrent;
+        }
+        if patch.max_segments.is_some() {
+            self.max_segments = patch.max_segments;
+        }
+        if patch.min_segment_size.is_some() {
+            self.min_segment_size = patch.min_segment_size;
+        }
+        if patch.max_speed_bytes.is_some() {
+            self.max_speed_bytes = patch.max_speed_bytes;
+        }
+        if patch.default_download_dir.is_some() {
+            self.default_download_dir = patch.default_download_dir;
+        }
+        if patch.ytdlp_path.is_some() {
+            self.ytdlp_path = patch.ytdlp_path;
+        }
+        if patch.hide_to_tray.is_some() {
+            self.hide_to_tray = patch.hide_to_tray;
+        }
+    }
+}
+
 /// A client request. One JSON object per line on the connection.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -62,6 +163,14 @@ pub enum Command {
         #[serde(default)]
         delete_files: bool,
     },
+    /// Current daemon-wide settings (config.json contents).
+    GetConfig,
+    /// Replace the daemon settings wholesale (omitted fields = default).
+    /// Persisted to `<data_dir>/config.json`; `max_concurrent` applies
+    /// live, the rest take effect on the next task start.
+    SetConfig {
+        settings: DaemonSettings,
+    },
     Shutdown,
 }
 
@@ -83,6 +192,10 @@ pub enum Reply {
     },
     TorrentDetails {
         details: crate::torrent::TorrentDetailsSnapshot,
+    },
+    /// Current daemon-wide settings.
+    Config {
+        settings: DaemonSettings,
     },
     Ok,
     Error {

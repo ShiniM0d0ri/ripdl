@@ -75,7 +75,11 @@ struct ProgressTrack {
 struct Daemon {
     port: u16,
     queue_path: PathBuf,
-    config: DaemonConfig,
+    /// Where the settings file lives (kept so SetConfig can persist).
+    config_path: PathBuf,
+    /// Settings are swapped from SetConfig and only read elsewhere; a
+    /// mutex keeps the swap sound under the many Arc aliases.
+    config: Mutex<DaemonConfig>,
     records: Mutex<Vec<TaskRecord>>,
     progress: Mutex<HashMap<String, ProgressTrack>>,
     runtime: Mutex<HashMap<String, TaskRuntime>>,
@@ -87,56 +91,14 @@ struct Daemon {
     sem: Arc<tokio::sync::Semaphore>,
 }
 
-/// Daemon policy from `<data_dir>/config.json`. Every field is optional so
-/// any partial file works: absent fields fall back to built-in defaults.
-#[derive(Debug, Default, serde::Deserialize)]
-struct DaemonConfig {
-    max_concurrent: Option<usize>,
-    max_segments: Option<usize>,
-    min_segment_size: Option<u64>,
-    max_speed_bytes: Option<u64>,
-    default_download_dir: Option<PathBuf>,
-    /// Where the yt-dlp sidecar lives for video tasks. Bare names resolve
-    /// through `PATH`; unset means the literal name `yt-dlp`.
-    ytdlp_path: Option<String>,
-}
-
-impl DaemonConfig {
-    /// Missing file = defaults; unreadable file = warn + defaults (never
-    /// rewritten, so a typo doesn't clobber the user's edits).
-    fn load(path: &std::path::Path) -> Self {
-        match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, path = %path.display(), "config file unreadable; using defaults");
-                Self::default()
-            }),
-            Err(_) => Self::default(),
-        }
-    }
-
-    fn max_concurrent(&self) -> usize {
-        self.max_concurrent.unwrap_or(3).max(1)
-    }
-
-    fn max_segments(&self) -> usize {
-        self.max_segments.unwrap_or(EngineConfig::default().max_segments)
-    }
-
-    fn min_segment_size(&self) -> u64 {
-        self.min_segment_size.unwrap_or(EngineConfig::default().min_segment_size)
-    }
-
-    /// The sidecar entry point for video tasks: explicit config path or
-    /// PATH fallback.
-    fn ytdlp_path(&self) -> String {
-        self.ytdlp_path
-            .clone()
-            .unwrap_or_else(|| "yt-dlp".to_string())
-    }
-}
+/// Daemon policy from `<data_dir>/config.json`. Shared type with all
+/// frontends (`ripdl_core::rpc::DaemonSettings`); accessors (load/save/
+/// defaults) live on the core type so every frontend reads the same file
+/// the same way.
+type DaemonConfig = ripdl_core::rpc::DaemonSettings;
 
 impl Daemon {
-    fn new(queue_path: PathBuf, config: DaemonConfig) -> Result<Self> {
+    fn new(queue_path: PathBuf, config_path: PathBuf, config: DaemonConfig) -> Result<Self> {
         let max_concurrent = config.max_concurrent();
         let records = match std::fs::read(&queue_path) {
             Ok(bytes) => serde_json::from_slice::<QueueFile>(&bytes)
@@ -152,7 +114,8 @@ impl Daemon {
         Ok(Self {
             port: DEFAULT_PORT,
             queue_path,
-            config,
+            config_path,
+            config: Mutex::new(config),
             records: Mutex::new(records),
             progress: Mutex::new(HashMap::new()),
             runtime: Mutex::new(HashMap::new()),
@@ -363,7 +326,74 @@ impl Daemon {
                 self.shutdown.notify_waiters();
                 Response { id: req.id, reply: Reply::Ok }
             }
+            Command::GetConfig => self.cmd_get_config(req.id),
+            Command::SetConfig { settings } => self.cmd_set_config(req.id, settings).await,
         }
+    }
+
+    fn cmd_get_config(self: &Arc<Self>, req_id: u64) -> Response {
+        Response {
+            id: req_id,
+            reply: Reply::Config { settings: self.conf() },
+        }
+    }
+
+    /// Replace the settings wholesale, persist them, and live-apply the
+    /// queue-wide knob (concurrency). Per-task knobs (segments, speed) are
+    /// read at runner start, so they kick in on the next task.
+    async fn cmd_set_config(self: &Arc<Self>, req_id: u64, mut settings: DaemonConfig) -> Response {
+        let err = |m: &str| Response {
+            id: req_id,
+            reply: Reply::Error { message: m.to_string() },
+        };
+        if settings.max_concurrent == Some(0) {
+            return err("max_concurrent must be at least 1");
+        }
+        if settings.max_segments == Some(0) {
+            return err("max_segments must be at least 1");
+        }
+        if settings.min_segment_size == Some(0) {
+            // A zero byte split denominator would kill the planner.
+            return err("min_segment_size must be at least 1");
+        }
+        // Frontends may send 0 for "unlimited"; normalize before persisting.
+        if settings.max_speed_bytes == Some(0) {
+            settings.max_speed_bytes = None;
+        }
+        // Settings file is the source of truth: only swap the live config
+        // after the save succeeded.
+        if let Err(e) = settings.save(&self.config_path) {
+            return err(&format!("saving config failed: {e}"));
+        }
+        let old_max = self.conf().max_concurrent();
+        *self.config.lock().unwrap() = settings;
+        let new_max = self.conf().max_concurrent();
+        match new_max.checked_sub(old_max) {
+            Some(grow) if grow > 0 => self.sem.add_permits(grow),
+            Some(_) => {}
+            None => {
+                // Shrink: own freed permits and forget them (blocks this
+                // reply at most until running tasks release; the permits
+                // exist only if running < old_max).
+                let sem = self.sem.clone();
+                let take = (old_max - new_max) as u32;
+                tokio::spawn(async move {
+                    if let Ok(perm) = sem.acquire_many(take).await {
+                        perm.forget();
+                    }
+                });
+            }
+        }
+        tracing::info!(%new_max, "settings updated");
+        Response {
+            id: req_id,
+            reply: Reply::Config { settings: self.conf() },
+        }
+    }
+
+    /// Snapshot of the current settings for read paths.
+    fn conf(&self) -> DaemonConfig {
+        self.config.lock().unwrap().clone()
     }
 
     fn cmd_add(
@@ -379,7 +409,7 @@ impl Daemon {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
         let dest_dir = dest_dir
-            .or_else(|| self.config.default_download_dir.clone())
+            .or_else(|| self.conf().default_download_dir.clone())
             .or_else(default_download_dir);
         // Idempotency: the same URL, tool and destination must not
         // double-download into one file (sidecar trample = corrupt output).
@@ -731,7 +761,7 @@ impl Daemon {
                 TaskKind::Video => {
                     let cfg = ripdl_core::hunt::HuntConfig {
                         id: rec.id.clone(),
-                        program: this.config.ytdlp_path(),
+                        program: this.conf().ytdlp_path(),
                         url: rec.url.clone(),
                         dest_dir: rec.dest_dir.clone().unwrap_or_default(),
                         headers: rec.headers.clone(),
@@ -747,7 +777,7 @@ impl Daemon {
                         let mut guard = this.torrents.lock().await;
                         if guard.is_none() {
                             let root = this
-                                .config
+                                .conf()
                                 .default_download_dir
                                 .clone()
                                 .or_else(default_download_dir)
@@ -767,7 +797,7 @@ impl Daemon {
                         id: rec.id.clone(),
                         payload: rec.url.clone(),
                         dest_dir: rec.dest_dir.clone().unwrap_or_else(|| {
-                            this.config
+                            this.conf()
                                 .default_download_dir
                                 .clone()
                                 .or_else(default_download_dir)
@@ -808,9 +838,9 @@ impl Daemon {
                     // override. Both the probe and every segment carry them.
                     let engine = {
                         let cfg = EngineConfig {
-                            max_segments: this.config.max_segments(),
-                            min_segment_size: this.config.min_segment_size(),
-                            max_speed: this.config.max_speed_bytes,
+                            max_segments: this.conf().max_segments(),
+                            min_segment_size: this.conf().min_segment_size(),
+                            max_speed: this.conf().max_speed(),
                             headers: rec.headers.clone(),
                             ..EngineConfig::default()
                         };
@@ -1121,6 +1151,26 @@ mod tests {
     }
 
     #[test]
+    fn config_save_roundtrip_and_zero_speed_meaning() {
+        let tmp = std::env::temp_dir().join(format!("ripdl-cfgtest-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("config.json");
+        let cfg = DaemonConfig {
+            max_concurrent: Some(5),
+            max_speed_bytes: Some(0),
+            hide_to_tray: Some(false),
+            default_download_dir: Some(PathBuf::from("D:\\dl")),
+            ..Default::default()
+        };
+        cfg.save(&path).unwrap();
+        let loaded = DaemonConfig::load(&path);
+        assert_eq!(loaded, cfg);
+        // `0` stays 0 on disk but reads back as "unlimited" for the engine.
+        assert_eq!(loaded.max_speed(), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn delete_artifacts_removes_output_sidecar_and_partials() {
         let tmp = std::env::temp_dir().join(format!("ripdl-deltest-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
@@ -1204,8 +1254,9 @@ async fn real_main() -> Result<()> {
     std::fs::create_dir_all(&data_dir).context("create data directory")?;
     let queue_path = data_dir.join("queue.json");
 
-    let config = DaemonConfig::load(&data_dir.join("config.json"));
-    let daemon = Arc::new(Daemon::new(queue_path, config).context("init daemon")?);
+    let config_path = data_dir.join("config.json");
+    let config = DaemonConfig::load(&config_path);
+    let daemon = Arc::new(Daemon::new(queue_path, config_path, config).context("init daemon")?);
     daemon.boot_resume().context("resume queue")?;
     daemon.run().await
 }

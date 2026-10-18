@@ -61,8 +61,14 @@ Guiding rules:
       file/folder, remove-with-files (`Remove { delete_files }`, sidecar-aware,
       `rm --files` in the CLI); GUI rows re-render only on real changes and
       daemon auto-spawn is rate-limited
-- [ ] Settings: category folders, segment count, concurrency
-- [ ] System tray + minimize-to-tray
+- [x] Settings: daemon-wide dialog over `config.json` (concurrency,
+      segments, min segment size, shared speed cap with byte/suffix
+      parsing, default download folder with native browser, yt-dlp path,
+      hide-to-tray); RPC `GetConfig`/`SetConfig`, `ripdl config
+      [key=value ...]`, concurrency applies live, the rest on next task
+- [x] System tray + minimize-to-tray (Tauri tray icon: left click shows,
+      menu "Show ripdl"/"Exit"; close minimizes to tray unless
+      `hide_to_tray=false`; preference lives in config.json)
 
 ## P3 - torrent support (via librqbit, Apache-2.0 — never a GPL client)
 
