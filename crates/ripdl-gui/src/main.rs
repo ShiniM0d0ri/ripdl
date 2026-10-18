@@ -112,7 +112,7 @@ async fn add_task(url: String, category: Option<String>, dest_dir: Option<String
         TaskKind::Http
     };
     match rpc(Command::Add {
-        url: url.clone(),
+        url,
         dest_dir: Some(dest),
         headers: Default::default(),
         start_at: None,

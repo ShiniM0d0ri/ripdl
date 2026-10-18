@@ -5,6 +5,11 @@ const { invoke } = window.__TAURI__.core;
 
 const $ = (sel) => document.querySelector(sel);
 
+// Static skeleton, queried once (used by every 500ms poll tick).
+const TBODY = document.getElementById("task-rows");
+const ST_COUNTS = document.getElementById("st-counts");
+const ST_SPEED = document.getElementById("st-speed");
+
 const CATEGORY_EXT = {
     video: ["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v", "mpg", "mpeg"],
     music: ["mp3", "flac", "wav", "aac", "ogg", "m4a", "opus", "wma", "mid"],
@@ -59,10 +64,20 @@ function categoryOf(name) {
     return EXT_CAT[ext(name)] || "other";
 }
 
+// The basename behind a URL, memoized: structKey/inCurrentView/render recompute
+// the same value several times per poll tick; split+decode never changes.
+const nameCache = new Map();
+
 function urlName(url) {
-    let base = splitPath(url.split(/[?#]/)[0]).pop() || url;
-    try { base = decodeURIComponent(base); } catch (_) { /* keep raw */ }
-    return base || url;
+    let cached = nameCache.get(url);
+    if (cached === undefined) {
+        let base = splitPath(url.split(/[?#]/)[0]).pop() || url;
+        try { base = decodeURIComponent(base); } catch (_) { /* keep raw */ }
+        cached = base || url;
+        if (nameCache.size > 1000) nameCache.clear();
+        nameCache.set(url, cached);
+    }
+    return cached;
 }
 
 // Windows Explorer-style basename: handles both separators.
@@ -178,9 +193,6 @@ function renderSidebar(counts) {
       <div class="side-item ${cat === currentCategory ? "active" : ""}" data-cat="${cat}">
         <span>${CAT_LABEL[cat]}</span><span class="count">${counts[cat] ?? 0}</span>
       </div>`).join("");
-    $("#side-items").querySelectorAll(".side-item").forEach((el) => {
-        el.onclick = () => { currentCategory = el.dataset.cat; lastStructKey = null; render(); };
-    });
 }
 
 function inCurrentView(t) {
@@ -209,17 +221,18 @@ let rowCache = new Map();
 // (icons, state label, buttons, error text) is structural and untouched.
 function refreshVolatile(t) {
     const tr = rowCache.get(t.id);
-    if (!tr || !tr.cells) return;
-    const state = stateLabel(t);
-    t.cells[2].textContent = sizeText(t);
-    t.cells[4].textContent = etaOf(t) || "-";
-    t.cells[5].textContent = t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
+    // tr.cells: HTMLTableRowElement's live cell collection (columns: name,
+    // status, size, progress, eta, speed, actions).
+    if (!tr || tr.cells.length < 6) return;
+    tr.cells[2].textContent = sizeText(t);
+    tr.cells[4].textContent = etaOf(t) || "-";
+    tr.cells[5].textContent = t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
     const pct = percentOf(t);
     if (pct == null) return; // pc-less layout is structural (no-total cases)
     const fill = tr.querySelector(".prog-fill");
     const pctSpan = tr.querySelector(".pct");
     if (fill) fill.style.width = `${Math.min(100, pct).toFixed(1)}%`;
-    if (pctSpan) pctSpan.textContent = `${pctText(pct, state)}%`;
+    if (pctSpan) pctSpan.textContent = `${pctText(pct, stateLabel(t))}%`;
 }
 
 function statusbarText() {
@@ -272,44 +285,52 @@ function render() {
         </tr>`;
     }).join("");
 
-    // Handlers live on the tbody (delegation) so re-renders mid-click
-    // don't swallow double-clicks / context menus. Selection toggles a
-    // class in place instead of re-rendering (a re-render replaces the
-    // row node, which swallows the browser's dblclick).
-    const tbody = $("#task-rows");
-    tbody.onclick = (ev) => {
-        const tr = ev.target.closest("tr");
-        if (!tr) return;
-        selectedId = tr.dataset.id;
-        tbody.querySelectorAll("tr").forEach((x) => x.classList.toggle("selected", x === tr));
-    };
-    tbody.ondblclick = (ev) => {
-        const tr = ev.target.closest("tr");
-        if (!tr) return;
-        selectedId = tr.dataset.id;
-        renderKeepSelection();
-        openDetails(tr.dataset.id);
-    };
-    tbody.oncontextmenu = (ev) => {
-        const tr = ev.target.closest("tr");
-        if (!tr) return;
-        ev.preventDefault();
-        selectedId = tr.dataset.id;
-        renderKeepSelection();
-        showCtx(ev.clientX, ev.clientY);
-    };
-    $("#task-table").querySelectorAll(".row-btn").forEach((btn) => {
-        btn.onclick = (ev) => { ev.stopPropagation(); doTaskAction(btn.dataset.act, btn.dataset.id); };
-    });
+    // Handlers below live on the tbody once (delegation, set up at init):
+    // re-renders don't touch them, so mid-click replaces can't swallow
+    // clicks/dblclicks/context menus and rows need no per-render binding.
 
     rowCache = new Map();
-    for (const tr of tbody.children) rowCache.set(tr.dataset.id, tr);
+    for (const tr of rows.children) rowCache.set(tr.dataset.id, tr);
 
-    const [countsTxt, speedTxt] = statusbarText();
-    const c = $("#st-counts"), s = $("#st-speed");
-    if (c.textContent !== countsTxt) c.textContent = countsTxt;
-    if (s.textContent !== speedTxt) s.textContent = speedTxt;
+    renderStatusbar();
 }
+
+// One-time event wiring for the task table + sidebar (survives every
+// repaint; .row-btn actions ride the same delegation).
+TBODY.onclick = (ev) => {
+    const btn = ev.target.closest(".row-btn");
+    if (btn) {
+        ev.stopPropagation();
+        doTaskAction(btn.dataset.act, btn.dataset.id);
+        return;
+    }
+    const tr = ev.target.closest("tr");
+    if (!tr) return;
+    selectedId = tr.dataset.id;
+    TBODY.querySelectorAll("tr").forEach((x) => x.classList.toggle("selected", x === tr));
+};
+TBODY.ondblclick = (ev) => {
+    const tr = ev.target.closest("tr");
+    if (!tr) return;
+    selectedId = tr.dataset.id;
+    renderKeepSelection();
+    openDetails(tr.dataset.id);
+};
+TBODY.oncontextmenu = (ev) => {
+    const tr = ev.target.closest("tr");
+    if (!tr) return;
+    ev.preventDefault();
+    selectedId = tr.dataset.id;
+    renderKeepSelection();
+    showCtx(ev.clientX, ev.clientY);
+};
+$("#side-items").onclick = (ev) => {
+    const el = ev.target.closest(".side-item");
+    if (!el) return;
+    currentCategory = el.dataset.cat;
+    lastStructKey = null;
+    render();
+};
 
 // Rerender without invalidating the selection highlight (implicit: selectedId survives).
 function renderKeepSelection() { render(); }
@@ -378,7 +399,7 @@ async function doTaskAction(act, id) {
 }
 
 function flashErr(msg) {
-    const st = $("#st-counts");
+    const st = ST_COUNTS;
     st.textContent = msg;
     st.style.color = "#b02a2a";
     // Same suppression window as flashStatus: without it the 500ms status
@@ -399,6 +420,8 @@ async function poll() {
     try {
         const list = await invoke("list_tasks");
         tasks = list;
+        // Selection must not outlive its task (ghost context-menu actions).
+        if (selectedId && !tasks.some((t) => t.id === selectedId)) selectedId = null;
         setConn(true);
         // Structural changes (task set, state, name, errors) repaint the
         // tbody + sidebar; bytes-only changes update cells in place - no DOM
@@ -431,9 +454,8 @@ document.addEventListener("visibilitychange", schedulePoll);
 function renderStatusbar() {
     if (Date.now() < statusFlashUntil) return; // flashing a message
     const [countsTxt, speedTxt] = statusbarText();
-    const c = $("#st-counts"), s = $("#st-speed");
-    if (c.textContent !== countsTxt) c.textContent = countsTxt;
-    if (s.textContent !== speedTxt) s.textContent = speedTxt;
+    if (ST_COUNTS.textContent !== countsTxt) ST_COUNTS.textContent = countsTxt;
+    if (ST_SPEED.textContent !== speedTxt) ST_SPEED.textContent = speedTxt;
 }
 
 /* Toolbar */
@@ -530,7 +552,6 @@ function openAddDialog(presetUrl) {
     $("#dlg-backdrop").classList.remove("hidden");
     $("#dlg-url").focus();
 }
-$("#dlg-cat").onchange = () => {};
 $("#dlg-dest").oninput = () => { dlgDestTouched = true; };
 $("#dlg-browse").onclick = async () => {
     try {
@@ -552,7 +573,7 @@ $("#dlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) $("#d
 const SET_INPUTS = ["#set-conc", "#set-segs", "#set-minseg", "#set-speed", "#set-dir", "#set-ytdlp"];
 
 function flashStatus(msg, color) {
-    const st = $("#st-counts");
+    const st = ST_COUNTS;
     st.textContent = msg;
     st.style.color = color || "#2e7d32";
     // Poll re-renders the status bar every second; suppress it until the
