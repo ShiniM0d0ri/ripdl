@@ -540,15 +540,50 @@ async fn segment_attempt(
     let mut stream = req.send().await?.error_for_status()?.bytes_stream();
     let mut pos = seg.start + seg.done;
     let mut seg_done = seg.done;
-    let mut buf: Vec<u8> = Vec::with_capacity(SEGMENT_BUF + 1024);
+    // Ping-pong buffers: one fills from the network while the other is being
+    // written on the blocking pool. Network and disk overlap instead of
+    // serialize ("read 256 KiB, wait for the disk, repeat").
+    let mut bufs: [Vec<u8>; 2] = [
+        Vec::with_capacity(SEGMENT_BUF + 1024),
+        Vec::with_capacity(SEGMENT_BUF + 1024),
+    ];
+    let mut cur = 0;
+    let mut inflight: Option<tokio::task::JoinHandle<(std::fs::File, Vec<u8>, usize)>> = None;
 
+    // Flushed bytes advance only when durably on disk (join), but the
+    // headline counter moves at park time: a failed write aborts the task
+    // anyway, and progress display sidecars resume from the durable
+    // cells.done, never from this counter.
+    macro_rules! await_write {
+        () => {
+            if let Some(task) = inflight.take() {
+                let (handle, block, flushed) = task.await.expect("blocking pool join");
+                if flushed != block.len() {
+                    return Err(std::io::Error::other("segment file write failed").into());
+                }
+                // Durable counters move only when the bytes are on disk.
+                pos += flushed as u64;
+                seg_done += flushed as u64;
+                cells.lock().expect("state cells")[seg.index].done = seg_done;
+
+                file = Some(handle);
+                bufs[1 - cur] = block;
+                bufs[1 - cur].clear();
+            }
+        };
+    }
+
+    // Flush the current buffer: join the previous write (it holds the file
+    // handle), then park this block on the blocking pool.
     macro_rules! flush {
         () => {
-            if !buf.is_empty() {
+            if !bufs[cur].is_empty() {
+                await_write!();
                 let mut handle = file.take().expect("segment file handle");
-                let block = std::mem::take(&mut buf);
+                let block = std::mem::take(&mut bufs[cur]);
                 let pos_abs = pos;
-                let (handle, block, flushed) = tokio::task::spawn_blocking(move || {
+                let len = block.len();
+                let task = tokio::task::spawn_blocking(move || {
                     use std::io::{Seek, SeekFrom, Write};
                     let mut flushed = 0usize;
                     if handle.seek(SeekFrom::Start(pos_abs)).is_ok()
@@ -557,28 +592,34 @@ async fn segment_attempt(
                         flushed = block.len();
                     }
                     (handle, block, flushed)
-                })
-                .await
-                .expect("blocking pool join");
-
-                if flushed != block.len() {
-                    return Err(std::io::Error::other("segment file write failed").into());
-                }
-                pos += flushed as u64;
-                seg_done += flushed as u64;
-                downloaded.fetch_add(flushed as u64, Ordering::Relaxed);
-                cells.lock().expect("state cells")[seg.index].done = seg_done;
-
-                file = Some(handle);
-                buf = block;
-                buf.clear();
+                });
+                inflight = Some(task);
+                downloaded.fetch_add(len as u64, Ordering::Relaxed);
+                cur = 1 - cur;
             }
         };
     }
 
     loop {
         let chunk = tokio::select! {
-            _ = token.cancelled() => return Err(Error::Cancelled),
+            _ = token.cancelled() => {
+                // Pause/retry with a parked write: join it so the sidecar
+                // captures every fully-written block (resume must not
+                // re-copy bytes that are already on disk). A failed join
+                // here can only leave LESS progress durable - harmless.
+                if let Some(task) = inflight.take() {
+                    if let Ok((handle, block, flushed)) = task.await {
+                        if flushed == block.len() {
+                            pos += flushed as u64;
+                            seg_done += flushed as u64;
+                            cells.lock().expect("state cells")[seg.index].done = seg_done;
+                            file = Some(handle);
+                            let _ = &file;
+                        }
+                    }
+                }
+                return Err(Error::Cancelled);
+            }
             chunk = stream.next() => match chunk {
                 Some(c) => c?,
                 None => break,
@@ -589,17 +630,19 @@ async fn segment_attempt(
         limiter.acquire(chunk.len() as u64).await;
 
         // Flush before an extension that would exceed the preallocated
-        // capacity: a realloc here doubles the buffer and memcpy's the whole
-        // ~256 KiB block - every flush.
-        if buf.capacity() - buf.len() < chunk.len() {
+        // capacity: a realloc here would memcpy the whole ~256 KiB block.
+        if bufs[cur].capacity() - bufs[cur].len() < chunk.len() {
             flush!();
         }
-        buf.extend_from_slice(&chunk);
-        if buf.len() >= SEGMENT_BUF {
+        bufs[cur].extend_from_slice(&chunk);
+        if bufs[cur].len() >= SEGMENT_BUF {
             flush!();
         }
     }
     flush!();
+    // The final block may still be writing: wait for it before reporting the
+    // segment done (its counters move in the join).
+    await_write!();
 
     // Server ended the stream early: count as a retryable transport fault.
     if seg.end != UNBOUNDED && seg_done < seg.end + 1 - seg.start {
