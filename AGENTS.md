@@ -94,14 +94,16 @@ bytes.
 
 ## Current status
 
-Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-17:
+Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-18:
 P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
 persistent queue, buffered writes, shared speed limiter, header/auth/cookie
 pass-through, Content-Disposition naming, duplicate-URL idempotency,
 scheduler (`--after`/`--at` with delayed runner start), named pipe transport
 (pipe-first client + dual listeners; TCP kept as fallback; unix socket on
 non-Windows), daemon config file (`config.json`: max_concurrent,
-max_segments, min_segment_size, max_speed_bytes, default_download_dir),
+max_segments, min_segment_size, max_speed_bytes, default_download_dir,
+bond_interfaces — NIC bonding, segments bind per uplink interface via
+`ripdl_core::engine::nic` + `Bond::Auto`/`Addresses`; per-task `--bond`),
 hunt mode (video/stream tasks via the `yt-dlp` sidecar: `add --video`,
 `ytdlp_path` config key, percent-based progress, pause = kill sidecar,
 resume = re-invoke which continues `.part` files).

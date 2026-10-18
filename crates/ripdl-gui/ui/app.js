@@ -450,6 +450,7 @@ async function openSettings() {
     err.classList.add("hidden");
     SET_INPUTS.forEach((sel) => { $(sel).value = ""; });
     $("#set-tray").checked = true;
+    $("#set-bond").checked = false;
     try {
         const s = await invokeSafe("get_config");
         $("#set-conc").value = s.max_concurrent ?? "";
@@ -459,6 +460,7 @@ async function openSettings() {
         $("#set-dir").value = s.default_download_dir ?? "";
         $("#set-ytdlp").value = s.ytdlp_path ?? "";
         $("#set-tray").checked = s.hide_to_tray ?? true;
+        $("#set-bond").checked = s.bond_interfaces ?? false;
         $("#set-backdrop").classList.remove("hidden");
         $("#set-conc").focus();
     } catch (e) {
@@ -500,6 +502,7 @@ async function saveSettings() {
         default_download_dir: dir === "" ? undefined : dir,
         ytdlp_path: $("#set-ytdlp").value.trim() || undefined,
         hide_to_tray: $("#set-tray").checked,
+        bond_interfaces: $("#set-bond").checked,
     };
     try {
         await invokeSafe("set_config", { settings: payload });

@@ -1,7 +1,9 @@
 mod limiter;
+mod nic;
 mod planner;
 pub mod retry;
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,6 +12,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+pub use nic::{bonded_nics, UplinkNic};
 pub use planner::{percent_decode_lossy, PlanInfo};
 
 use crate::error::{Error, Result};
@@ -21,6 +24,28 @@ const UNBOUNDED: u64 = u64::MAX;
 /// Write buffer per segment: syscalls drop ~64x and disks can't stall the
 /// network pipeline.
 const SEGMENT_BUF: usize = 256 * 1024;
+
+/// How download segments choose their local (source) network interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bond {
+    /// OS routing decides for every connection (single-uplink default).
+    Off,
+    /// Spread segments over discovered interfaces: the OS-default uplink
+    /// stays on the unbound client, one bound client per additional
+    /// interface. Activates when at least one extra interface exists.
+    Auto,
+    /// Explicit override: bind every segment to these local addresses
+    /// (cycling), no unbound client at all. One address = everything
+    /// through that interface. Tests and manual pinning.
+    Addresses(Vec<IpAddr>),
+}
+
+impl Bond {
+    /// `true` when bonding is disabled (plain OS routing).
+    pub fn is_off(&self) -> bool {
+        matches!(self, Bond::Off)
+    }
+}
 
 /// Tunables for the download engine.
 #[derive(Debug, Clone)]
@@ -36,6 +61,8 @@ pub struct EngineConfig {
     /// Extra request headers sent by probe + every segment (cookies,
     /// referer, auth...). Later entries may replace same-named ones.
     pub headers: std::collections::HashMap<String, String>,
+    /// NIC bonding (see [`Bond`]). Default [`Bond::Off`].
+    pub bond: Bond,
 }
 
 impl Default for EngineConfig {
@@ -47,6 +74,7 @@ impl Default for EngineConfig {
             user_agent: concat!("ripdl/", env!("CARGO_PKG_VERSION")).to_string(),
             max_speed: None,
             headers: std::collections::HashMap::new(),
+            bond: Bond::Off,
         }
     }
 }
@@ -59,12 +87,22 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self> {
+        let limiter = std::sync::Arc::new(limiter::Limiter::new(cfg.max_speed));
+        let client = Self::http_client(&cfg, None)?;
+        Ok(Self { client, cfg, limiter })
+    }
+
+    /// Build a reqwest client with the engine's identity (user agent,
+    /// pass-through headers), optionally pinned to a local interface
+    /// address for NIC bonding. All clients are equivalent for requests;
+    /// only the socket binding differs.
+    fn http_client(cfg: &EngineConfig, local: Option<IpAddr>) -> Result<reqwest::Client> {
         // If the user supplies their own User-Agent header, it must win over
         // the built-in one, so only set the default when they don't.
         let has_user_ua = cfg.headers.keys().any(|k| k.to_ascii_lowercase() == "user-agent");
         let mut builder = reqwest::Client::builder();
         if !has_user_ua {
-            builder = builder.user_agent(cfg.user_agent.clone());
+            builder = builder.user_agent(&cfg.user_agent);
         }
         let mut default_headers = reqwest::header::HeaderMap::new();
         for (k, v) in &cfg.headers {
@@ -76,9 +114,11 @@ impl Engine {
             })?;
             default_headers.insert(name, value);
         }
-        let client = builder.default_headers(default_headers).build()?;
-        let limiter = std::sync::Arc::new(limiter::Limiter::new(cfg.max_speed));
-        Ok(Self { client, cfg, limiter })
+        builder = builder.default_headers(default_headers);
+        if let Some(ip) = local {
+            builder = builder.local_address(ip);
+        }
+        Ok(builder.build()?)
     }
 
     /// Probe a URL and return the plan without downloading.
@@ -144,9 +184,22 @@ impl Engine {
         let finished = Arc::new(AtomicBool::new(false));
 
         // Spawn one task per segment; each writes at its own file offset.
+        // NIC bonding (see `Bond`): when active, segments cycle through
+        // per-interface clients; a segment whose interface ultimately
+        // fails gets one last-ditch attempt over the OS default route.
+        let segment_clients = self.bond_clients();
+
         let mut handles = Vec::with_capacity(segments.len());
         for seg in segments {
-            let client = self.client.clone();
+            let (client, os_route_fallback) = if segment_clients.is_empty() {
+                (self.client.clone(), None)
+            } else {
+                let (c, is_primary) = &segment_clients[seg.index % segment_clients.len()];
+                (
+                    c.clone(),
+                    (!is_primary).then(|| self.client.clone()),
+                )
+            };
             let url = url.to_string();
             let etag = info.etag.clone();
             let retry_cfg = self.cfg.retry.clone();
@@ -159,10 +212,40 @@ impl Engine {
             handles.push(tokio::spawn({
                 let limiter = self.limiter.clone();
                 async move {
-                    let r = run_segment(
-                        client, url, etag, seg, retry_cfg, cells, dest, downloaded, limiter, token,
+                    let mut r = run_segment(
+                        &client,
+                        &url,
+                        etag.as_deref(),
+                        seg.clone(),
+                        retry_cfg.clone(),
+                        cells.clone(),
+                        dest.clone(),
+                        downloaded.clone(),
+                        limiter.clone(),
+                        token.clone(),
                     )
                     .await;
+                    if r.is_err() && !matches!(r, Err(Error::Cancelled)) {
+                        if let Some(primary) = os_route_fallback {
+                            tracing::warn!(
+                                index = seg.index,
+                                "bonded interface failed; one attempt over the OS default route"
+                            );
+                            r = run_segment(
+                                &primary,
+                                &url,
+                                etag.as_deref(),
+                                seg,
+                                retry_cfg,
+                                cells,
+                                dest,
+                                downloaded,
+                                limiter,
+                                token,
+                            )
+                            .await;
+                        }
+                    }
                     active.fetch_sub(1, Ordering::SeqCst);
                     r
                 }
@@ -277,6 +360,54 @@ impl Engine {
         let _ = std::fs::remove_file(&state_path);
         Ok(dest)
     }
+
+    /// Per-interface segment clients according to `cfg.bond`. Empty result
+    /// = every segment uses the unbound primary client (plain mode).
+    ///
+    /// Binding is best-effort: an interface whose client fails to build is
+    /// skipped with a warning, and if *nothing* binds, plain mode wins.
+    ///
+    /// `Auto` keeps the OS-default interface on the unbound client and
+    /// binds one client per additional interface; with fewer than two
+    /// discovered paths there is nothing to combine, so this returns empty.
+    fn bond_clients(&self) -> Vec<(reqwest::Client, bool)> {
+        let mut out: Vec<(reqwest::Client, bool)> = Vec::new();
+        match &self.cfg.bond {
+            Bond::Off => {}
+            Bond::Addresses(addrs) => {
+                for ip in addrs {
+                    match Self::http_client(&self.cfg, Some(*ip)) {
+                        Ok(c) => out.push((c, false)),
+                        Err(e) => tracing::warn!(ip = %ip, error = %e, "cannot bind to address"),
+                    }
+                }
+            }
+            Bond::Auto => {
+                let nics = nic::bonded_nics();
+                out.push((self.client.clone(), true));
+                for n in nics.iter().filter(|n| !n.is_default_route) {
+                    match Self::http_client(&self.cfg, Some(IpAddr::V4(n.addr))) {
+                        Ok(c) => {
+                            tracing::info!(name = %n.name, addr = %n.addr, "bonding extra uplink");
+                            out.push((c, false));
+                        }
+                        Err(e) => {
+                            tracing::warn!(name = %n.name, addr = %n.addr, error = %e, "cannot bind to interface")
+                        }
+                    }
+                }
+                let extra = out.len() - 1;
+                if extra == 0 {
+                    tracing::info!(
+                        uplinks = nics.len(),
+                        "bonding: no extra interfaces besides the default route; OS routing only"
+                    );
+                    out.clear();
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Fetch one byte range (or the whole body when `end == UNBOUNDED`) with
@@ -286,9 +417,9 @@ impl Engine {
 ///
 /// TODO(perf): move sync writes into `spawn_blocking` once we profile.
 async fn run_segment(
-    client: reqwest::Client,
-    url: String,
-    etag: Option<String>,
+    client: &reqwest::Client,
+    url: &str,
+    etag: Option<&str>,
     initial: SegmentState,
     retry_cfg: retry::RetryConfig,
     cells: Arc<Mutex<Vec<SegmentState>>>,
@@ -319,7 +450,7 @@ async fn run_segment(
         }
 
         match segment_attempt(
-            &client, &url, etag.as_deref(), &seg, &cells, &dest, &downloaded, &limiter, &token,
+            client, url, etag, &seg, &cells, &dest, &downloaded, &limiter, &token,
         )
         .await
         {

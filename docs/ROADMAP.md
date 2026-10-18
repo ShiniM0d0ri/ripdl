@@ -159,6 +159,16 @@ M3.4 - tests / verification:
 
 ## P5 - ship it
 
-- [ ] Packaging: winget / scoop / msi, portable zip
+- [x] Packaging: GitHub Release pipeline (portable zip + Inno setup.exe,
+      tar.gz + deb/rpm, extension zip + SHA256SUMS) - proven v0.2.0
+- [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n
+
+## P6 - speed & reach
+
+- [x] NIC bonding: combine bandwidth of every uplink interface (Wi-Fi +
+      Ethernet + tethering) by binding segments per interface
+      (`bond_interfaces` in config.json / `ripdl download --bond` / GUI
+      settings; per-IP server caps bypassed, VPN tunnels excluded)
+- [ ] Segment visibility in the GUI (active connections + ranges per task)

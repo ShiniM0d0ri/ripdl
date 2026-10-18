@@ -71,6 +71,10 @@ struct ServerState {
     headers_seen: Mutex<Vec<String>>,
     /// Every ranged GET's "a-b" request, in connection order.
     ranges_seen: Mutex<Vec<String>>,
+    /// Source IP of every ranged GET connection (as `"ip"`), in order —
+    /// proves which local interfaces the client actually routed through
+    /// (NIC bonding assertion).
+    peers_seen: Mutex<Vec<String>>,
 }
 
 async fn spawn_server(state: Arc<ServerState>) -> String {
@@ -190,6 +194,9 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
             let b = b.unwrap_or(state.total - 1).min(state.total - 1);
             let len = b - a + 1;
             state.ranges_seen.lock().unwrap().push(format!("{a}-{b}"));
+            if let Ok(peer) = sock.peer_addr() {
+                state.peers_seen.lock().unwrap().push(peer.ip().to_string());
+            }
             let resp = format!(
                 "HTTP/1.1 206 Partial Content\r\netag: {etag}\r\naccept-ranges: bytes\r\ncontent-range: bytes {a}-{b}/{}\r\ncontent-length: {len}\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\n",
                 state.total
@@ -304,6 +311,7 @@ async fn multi_segment_exact_bytes() {
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -326,6 +334,95 @@ async fn multi_segment_exact_bytes() {
     );
 }
 
+/// NIC bonding (explicit addresses): every segment must cycle through the
+/// two bound loopback addresses (Windows/Linux treat 127.0.0.0/8 as local)
+/// and the file must still land byte-exact. The server records each ranged
+/// GET's source IP, which is how we observe the binding took effect.
+#[tokio::test]
+async fn bonded_segments_cycle_interfaces() {
+    let state = Arc::new(ServerState {
+        total: 512 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::net::IpAddr::from([127, 0, 0, 2]),
+        ]),
+        retry: RetryConfig::default(),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("bonded engine");
+    let tmp = temp_dir("bonded");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("bonded download ok");
+
+    verify(&dest, 512 * KIB);
+    let mut peers = state.peers_seen.lock().unwrap().clone();
+    peers.sort();
+    peers.dedup();
+    assert!(
+        peers.contains(&"127.0.0.1".to_string()) && peers.contains(&"127.0.0.2".to_string()),
+        "expected ranged GETs from both bound addresses, saw {peers:?}"
+    );
+}
+
+/// Bonding configured but only one (non-default) path: the engine keeps
+/// OS routing (a single interface offers nothing to combine) and the
+/// download still completes byte-exact.
+#[tokio::test]
+async fn bonded_single_extra_address_still_binds() {
+    let state = Arc::new(ServerState {
+        total: 256 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![std::net::IpAddr::from([127, 0, 0, 2])]),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("single-bound engine");
+    let tmp = temp_dir("bonded1");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download ok");
+    verify(&dest, 256 * KIB);
+    let peers = state.peers_seen.lock().unwrap().clone();
+    assert!(!peers.is_empty());
+    assert!(
+        peers.iter().all(|p| p == "127.0.0.2"),
+        "all ranged GETs must come from the explicitly bound address, saw {peers:?}"
+    );
+}
+
 /// One segment connection is killed 16 KiB in. The engine must recover via
 /// its internal retry (ShortSegment / transport error path) and still serve
 /// every byte exactly.
@@ -342,6 +439,7 @@ async fn dropped_connection_recovered_by_retry() {
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -370,6 +468,7 @@ async fn no_ranges_falls_back_to_single_stream() {
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -407,6 +506,7 @@ async fn pause_resumes_from_sidecar() {
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -486,6 +586,7 @@ async fn speed_limit_paces_download() {
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -537,6 +638,7 @@ async fn speed_limit_applies_to_single_stream() {
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -583,6 +685,7 @@ async fn stale_etag_forces_fresh_restart() {
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -657,6 +760,7 @@ async fn carries_headers_and_uses_cd_filename() {
         content_disposition: Some("attachment; filename*=UTF-8''ripdl%20%C3%A9tude.bin".to_string()),
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 

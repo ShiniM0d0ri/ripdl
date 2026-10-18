@@ -33,6 +33,11 @@ pub struct DaemonSettings {
     /// minimizes to the tray instead of exiting. Default on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hide_to_tray: Option<bool>,
+    /// NIC bonding: spread each download's segments across every uplink
+    /// interface (Wi-Fi + Ethernet + tethering...), combining their
+    /// bandwidth. Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond_interfaces: Option<bool>,
 }
 
 impl DaemonSettings {
@@ -80,6 +85,11 @@ impl DaemonSettings {
             .unwrap_or_else(|| "yt-dlp".to_string())
     }
 
+    /// NIC bonding on/off for new tasks (default off).
+    pub fn bond_interfaces(&self) -> bool {
+        self.bond_interfaces.unwrap_or(false)
+    }
+
     /// Apply a partial update: every `Some(x)` in `patch` wins; `None`
     /// leaves the current value untouched. Useful for CLI-style
     /// single-key edits on top of the live values.
@@ -104,6 +114,9 @@ impl DaemonSettings {
         }
         if patch.hide_to_tray.is_some() {
             self.hide_to_tray = patch.hide_to_tray;
+        }
+        if patch.bond_interfaces.is_some() {
+            self.bond_interfaces = patch.bond_interfaces;
         }
     }
 }

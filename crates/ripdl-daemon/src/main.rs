@@ -842,6 +842,11 @@ impl Daemon {
                             min_segment_size: this.conf().min_segment_size(),
                             max_speed: this.conf().max_speed(),
                             headers: rec.headers.clone(),
+                            bond: if this.conf().bond_interfaces() {
+                                ripdl_core::Bond::Auto
+                            } else {
+                                ripdl_core::Bond::Off
+                            },
                             ..EngineConfig::default()
                         };
                         match Engine::new(cfg) {

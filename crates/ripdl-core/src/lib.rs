@@ -16,7 +16,7 @@ pub mod torrent;
 pub mod transport;
 pub mod util;
 
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Bond, Engine, EngineConfig};
 pub use error::{Error, Result};
 pub use task::TaskState;
 pub use util::atomic_write_json;

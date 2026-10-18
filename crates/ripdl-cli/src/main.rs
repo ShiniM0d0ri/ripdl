@@ -49,6 +49,11 @@ enum Cmd {
         /// Shorthand for --header "User-Agent: <value>".
         #[arg(short = 'u', long = "user-agent")]
         user_agent: Option<String>,
+        /// Spread this download's segments over every internet-connected
+        /// interface (Wi-Fi + Ethernet + tethering...) to combine their
+        /// bandwidth.
+        #[arg(long)]
+        bond: bool,
     },
     /// Show what the engine plans for a URL (size, ranges, filename).
     Info { url: String },
@@ -149,13 +154,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Download { url, out, segments, max_speed, header, referer, cookie, user_agent } => {
+        Cmd::Download { url, out, segments, max_speed, header, referer, cookie, user_agent, bond } => {
             let mut cfg = EngineConfig::default();
             if let Some(n) = segments {
                 cfg.max_segments = n;
             }
             if let Some(s) = max_speed {
                 cfg.max_speed = Some(parse_speed(&s)?);
+            }
+            if bond {
+                cfg.bond = ripdl_core::Bond::Auto;
             }
             cfg.headers = collect_headers(&header, referer, cookie, user_agent)?;
             let engine = Arc::new(Engine::new(cfg)?);
@@ -278,6 +286,10 @@ async fn main() -> anyhow::Result<()> {
                     "hide_to_tray" => {
                         settings.hide_to_tray = Some(val.parse().context("hide_to_tray needs true|false")?)
                     }
+                    "bond_interfaces" => {
+                        settings.bond_interfaces =
+                            Some(val.parse().context("bond_interfaces needs true|false")?)
+                    }
                     other => bail!("unknown setting {other:?} (see: ripdl config --help)"),
                 }
             }
@@ -348,6 +360,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                 settings.ytdlp_path.as_deref().unwrap_or("yt-dlp")
             );
             println!("hide_to_tray:         {}", settings.hide_to_tray.unwrap_or(true));
+            println!("bond_interfaces:      {}", settings.bond_interfaces.unwrap_or(false));
         }
         Reply::TorrentDetails { details } => {
             println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));
