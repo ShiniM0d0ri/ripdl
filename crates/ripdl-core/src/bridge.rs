@@ -369,6 +369,7 @@ mod tests {
                 headers: Default::default(),
                 start_at: None,
                 kind: Default::default(),
+                sequential: Default::default(),
             },
         )
         .unwrap();

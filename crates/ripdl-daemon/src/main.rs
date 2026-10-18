@@ -47,6 +47,13 @@ struct TaskRecord {
     info_hash: Option<String>,
     #[serde(default)]
     torrent_name: Option<String>,
+    /// Torrent-only: streaming order (front-to-back piece fetching).
+    #[serde(default)]
+    sequential: bool,
+    /// Torrent-only: per-file selection (None = everything), persisted so
+    /// resume/boot-restore replays it.
+    #[serde(default)]
+    only_files: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -339,15 +346,18 @@ impl Daemon {
 
     async fn dispatch(self: &Arc<Self>, req: Request) -> Response {
         match req.cmd {
-            Command::Add { url, dest_dir, headers, start_at, kind } => {
-                self.cmd_add(req.id, url, dest_dir, headers, start_at, kind)
+            Command::Add { url, dest_dir, headers, start_at, kind, sequential } => {
+                self.cmd_add(req.id, url, dest_dir, headers, start_at, kind, sequential)
             }
             Command::List => self.cmd_list(req.id),
             Command::Details { id } => self.cmd_torrent_details(req.id, &id).await,
+            Command::UpdateTorrentSelection { id, only_files } => {
+                self.cmd_update_selection(req.id, &id, only_files).await
+            }
             Command::Pause { id } => self.cmd_pause(req.id, &id),
             Command::Resume { id } => self.cmd_resume(req.id, &id),
             Command::Remove { id, delete_files } => {
-                self.cmd_remove(req.id, &id, delete_files)
+                self.cmd_remove(req.id, &id, delete_files).await
             }
             Command::Shutdown => {
                 self.shutdown.notify_waiters();
@@ -364,6 +374,7 @@ impl Daemon {
         headers: std::collections::HashMap<String, String>,
         start_at: Option<i64>,
         kind: TaskKind,
+        sequential: bool,
     ) -> Response {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
@@ -381,6 +392,21 @@ impl Daemon {
                     reply: Reply::Added { id },
                 };
             }
+            // Torrents additionally dedupe across destinations: the daemon
+            // runs ONE rqbit session where a payload maps to a single
+            // ManagedTorrent (one output folder), so two same-payload tasks
+            // would fight over the same handle - share the existing task.
+            if kind == TaskKind::Torrent {
+                if let Some(r) = records
+                    .iter()
+                    .find(|r| r.kind == TaskKind::Torrent && r.url.trim() == url.trim())
+                {
+                    return Response {
+                        id: req_id,
+                        reply: Reply::Added { id: r.id.clone() },
+                    };
+                }
+            }
         }
         let id = uuid::Uuid::new_v4().to_string();
         let rec = TaskRecord {
@@ -397,6 +423,8 @@ impl Daemon {
             total: None,
             info_hash: None,
             torrent_name: None,
+            sequential,
+            only_files: None,
         };
         {
             let mut records = self.records.lock().unwrap();
@@ -448,6 +476,67 @@ impl Daemon {
         Response { id: req_id, reply }
     }
 
+    /// Change a torrent task's per-file selection: push it into the live
+    /// session (works mid-flight, drives the picker) and persist it into
+    /// the record so resume/boot-restore replays the same selection.
+    async fn cmd_update_selection(
+        self: &Arc<Self>,
+        req_id: u64,
+        id: &str,
+        only_files: Option<Vec<usize>>,
+    ) -> Response {
+        let reply: Result<Reply, String> = async {
+            // Sort + dedup to make the persisted form stable/canonical.
+            let canonical = only_files.as_ref().map(|v| {
+                let mut v = v.clone();
+                v.sort_unstable();
+                v.dedup();
+                v
+            });
+            let record = {
+                let mut records = self.records.lock().unwrap();
+                let r = records
+                    .iter_mut()
+                    .find(|r| r.id == id)
+                    .ok_or_else(|| "task not found".to_string())?;
+                if r.kind != TaskKind::Torrent {
+                    return Err("task is not a torrent".into());
+                }
+                r.only_files = canonical.clone();
+                r.clone()
+            };
+            let snapshot = self.records.lock().unwrap().clone();
+            let _ = self.persist(&snapshot);
+            if record.state == TaskState::Completed {
+                // Not in the session (it may even not be running): the
+                // recorded selection is enough - the next resume replays it.
+                return Ok(Reply::Ok);
+            }
+            let session = {
+                let guard = self.torrents.lock().await;
+                match guard.as_ref() {
+                    Some(s) => Arc::clone(s),
+                    None => return Err("torrent session not running".into()),
+                }
+            };
+            let hash = record
+                .info_hash
+                .clone()
+                .ok_or_else(|| "torrent not yet resolved (no metadata yet?)".to_string())?;
+            session
+                .set_selected_files(&hash, canonical)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Reply::Ok)
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
+    }
+
     fn cmd_list(&self, req_id: u64) -> Response {
         let records = self.records.lock().unwrap().clone();
         let progress = self.progress.lock().unwrap();
@@ -474,6 +563,8 @@ impl Daemon {
                     dest_file: r.dest_file.clone(),
                     name: r.torrent_name.clone(),
                     info_hash: r.info_hash.clone(),
+                    sequential: r.sequential,
+                    only_files: r.only_files.clone(),
                 }
             })
             .collect();
@@ -536,7 +627,7 @@ impl Daemon {
         }
     }
 
-    fn cmd_remove(self: &Arc<Self>, req_id: u64, id: &str, delete_files: bool) -> Response {
+    async fn cmd_remove(self: &Arc<Self>, req_id: u64, id: &str, delete_files: bool) -> Response {
         let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
         if let Some(t) = token {
             t.cancel();
@@ -557,6 +648,24 @@ impl Daemon {
             tracing::info!(id = id, files = removed.len(), "deleted task files");
         }
         self.progress.lock().unwrap().remove(id);
+        // Release the task's ManagedTorrent from the shared session. Without
+        // this a stale handle (old output folder, possibly wiped files)
+        // hijacks the next add of the same payload via AlreadyManaged.
+        let hash = evicted
+            .info_hash
+            .clone()
+            .or_else(|| {
+                if evicted.kind == TaskKind::Torrent {
+                    ripdl_core::torrent::magnet_info_hash(&evicted.url)
+                } else {
+                    None
+                }
+            });
+        if let Some(session) = self.torrents.lock().await.as_ref() {
+            if let Some(hash) = hash {
+                session.forget_by_hash(&hash).await;
+            }
+        }
         Response { id: req_id, reply: Reply::Ok }
     }
 
@@ -664,7 +773,8 @@ impl Daemon {
                                 .or_else(default_download_dir)
                                 .unwrap_or_else(|| PathBuf::from("."))
                         }),
-                        only_files: None,
+                        only_files: rec.only_files.clone(),
+                        sequential: rec.sequential,
                     };
                     ripdl_core::torrent::download(&session, &cfg, &token, on_progress, {
                         // Identity lands here the moment the engine manages
@@ -938,6 +1048,8 @@ mod tests {
             headers: std::collections::HashMap::new(),
             start_at: None,
             kind: TaskKind::Http,
+            sequential: false,
+            only_files: None,
             dest_file: None,
             downloaded: 0,
             total: None,
@@ -1037,6 +1149,8 @@ mod tests {
             headers: Default::default(),
             start_at: None,
             kind: TaskKind::Http,
+            sequential: false,
+            only_files: None,
             dest_file: Some(out.clone()),
             downloaded: 4,
             total: Some(4),
@@ -1068,6 +1182,8 @@ mod tests {
             headers: Default::default(),
             start_at: None,
             kind: TaskKind::Http,
+            sequential: false,
+            only_files: None,
             dest_file: None,
             downloaded: 0,
             total: None,

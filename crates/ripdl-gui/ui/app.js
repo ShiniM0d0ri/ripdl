@@ -386,6 +386,7 @@ function openAddDialog(presetUrl) {
     $("#dlg-url").value = presetUrl || "";
     $("#dlg-err").classList.add("hidden");
     $("#dlg-hunt").checked = false;
+    $("#dlg-seq").checked = false;
     $("#dlg-cat").value = "auto";
     dlgDestTouched = false;
     $("#dlg-dest").value = "";
@@ -421,14 +422,13 @@ document.addEventListener("keydown", (ev) => {
     }
 });
 
-// Pick a .torrent from disk (dialog) and hand it to the daemon; the daemon
-// routes it by kind, save-to defaults to the downloads root.
+// Pick a .torrent from disk and route it through the add dialog: that keeps
+// one entry point (and lets the user check "sequential" before queuing).
 async function pickTorrent() {
     try {
         const file = await invokeSafe("pick_file");
         if (!file) return;
-        await invokeSafe("add_task", { url: file, category: null, destDir: null });
-        await poll();
+        openAddDialog(file);
     } catch (e) {
         flashErr(String(e).replace(/^.*error: /, ""));
     }
@@ -438,12 +438,25 @@ async function pickTorrent() {
 let detailsTaskId = null;
 let detailsTab = "files";
 let detailsTimer = null;
+// Files-tab selection the user changed since the last Apply: file index ->
+// wanted. Kept separate from the daemon state so the 2s auto-refresh never
+// clobbers checks the user just made.
+let pendingSel = null;
+let lastDetails = null;
+let filesRenderKey = "";
+
+function wantsFile(idx, fallback) {
+    return pendingSel && pendingSel.has(idx) ? pendingSel.get(idx) : fallback;
+}
 
 async function openDetails(id) {
     const t = findTask(id);
     if (!t || t.kind !== "torrent") return;
     detailsTaskId = id;
     detailsTab = "files";
+    filesRenderKey = "";
+    pendingSel = null;
+    lastDetails = null;
     for (const el of document.querySelectorAll("#tdg-tabs .tdg-tab")) {
         el.classList.toggle("active", el.dataset.tab === "files");
     }
@@ -459,6 +472,8 @@ async function openDetails(id) {
 
 function closeDetails() {
     detailsTaskId = null;
+    pendingSel = null;
+    lastDetails = null;
     clearInterval(detailsTimer);
     $("#tdg-backdrop").classList.add("hidden");
 }
@@ -468,6 +483,7 @@ $("#tdg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) close
 document.querySelectorAll("#tdg-tabs .tdg-tab").forEach((el) => {
     el.onclick = () => {
         detailsTab = el.dataset.tab;
+        filesRenderKey = ""; // body content swapped; next Files view re-renders
         document.querySelectorAll("#tdg-tabs .tdg-tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === detailsTab));
         refreshDetails();
     };
@@ -475,38 +491,73 @@ document.querySelectorAll("#tdg-tabs .tdg-tab").forEach((el) => {
 
 async function refreshDetails() {
     if (!detailsTaskId) return;
+    // Title from the task list first: available even when the snapshot
+    // fetch fails (e.g. paused session resets don't blank the dialog).
+    const t = findTask(detailsTaskId);
+    $("#tdg-name").textContent = (t && t.name) || "";
     let d;
     try {
         d = await invokeSafe("torrent_details", { id: detailsTaskId });
     } catch (e) {
         $("#tdg-body").innerHTML = `<div class="trk-off">${escapeHtml(String(e).replace(/^.*error: /, ""))}</div>`;
+        $("#tdg-apply").classList.add("hidden");
+        lastDetails = null;
         return;
     }
-    const t = findTask(detailsTaskId);
     const name = (t && t.name) || d.name || "(unknown)";
     $("#tdg-name").textContent = name;
     const pct = d.total > 0 ? ((d.downloaded / d.total) * 100).toFixed(1) : "0";
     $("#tdg-summary").textContent =
         `${pct}% / ${humans(d.downloaded)} / ${humans(d.total)} / ${d.finished ? "finished" : d.paused ? "paused" : "running"}` +
+        (t && t.sequential ? " / sequential" : "") +
         `\n${d.info_hash}` +
         (d.root ? `\n${d.root}` : "");
+    lastDetails = d;
 
     const body = $("#tdg-body");
+    // Files tab: render the table once and update cells in place on the
+    // 2s refresh; a full innerHTML rewrite every 2s races real/synthetic
+    // clicks (mousedown on one node, mouseup on its replaced clone) and
+    // swallows checkbox toggles.
     if (detailsTab === "files") {
-        const rows = d.files.map((f) => {
-            const p = f.size > 0 ? Math.min(100, (f.downloaded / f.size) * 100) : 100;
-            return `<tr>
-              <td>${f.included ? "yes" : "no"}</td>
+        const key = `${detailsTaskId}|${d.files.length}|${d.files.map((f) => (f.included ? 1 : 0)).join("")}`;
+        const fullRender = filesRenderKey !== key;
+        filesRenderKey = key;
+        if (fullRender) {
+            const rows = d.files.map((f, i) => {
+                const p = f.size > 0 ? Math.min(100, (f.downloaded / f.size) * 100) : 100;
+                return `<tr>
+              <td><input type="checkbox" class="tdg-file-chk" data-idx="${i}" ${wantsFile(i, f.included) ? "checked" : ""} /></td>
               <td title="${escapeHtml(f.name)}">${escapeHtml(baseName(f.name) || f.name)}</td>
               <td class="num">${humans(f.size)}</td>
               <td class="num">${p.toFixed(0)}%</td>
               <td><div class="file-bar"><div class="file-fill" style="width:${p.toFixed(1)}%"></div></div></td>
             </tr>`;
-        }).join("");
-        body.innerHTML = `
+            }).join("");
+            body.innerHTML = `
           <table><thead><tr><th>Want</th><th>Name</th><th>Size</th><th>Done</th><th></th></tr></thead>
           <tbody>${rows}</tbody></table>`;
-    } else if (detailsTab === "peers") {
+        } else {
+            // In-place: progress cells, bars, checkbox state (pending wins).
+            body.querySelectorAll("tbody tr").forEach((tr, i) => {
+                const f = d.files[i];
+                if (!f) return;
+                const p = f.size > 0 ? Math.min(100, (f.downloaded / f.size) * 100) : 100;
+                tr.children[3].textContent = `${p.toFixed(0)}%`;
+                tr.querySelector(".file-fill").style.width = `${p.toFixed(1)}%`;
+                const chk = tr.querySelector(".tdg-file-chk");
+                if (chk && document.activeElement !== chk) {
+                    chk.checked = wantsFile(i, f.included);
+                }
+            });
+        }
+        const apply = $("#tdg-apply");
+        apply.classList.remove("hidden");
+        apply.disabled = !pendingSel || pendingSel.size === 0;
+    } else {
+        $("#tdg-apply").classList.add("hidden");
+    }
+    if (detailsTab === "peers") {
         const rows = d.peers.map((p) => `
           <tr>
             <td>${escapeHtml(p.addr)}</td>
@@ -518,7 +569,7 @@ async function refreshDetails() {
         body.innerHTML = `
           <table><thead><tr><th>Address</th><th>Client</th><th>State</th><th>Downloaded</th><th>Uploaded</th></tr></thead>
           <tbody>${rows}</tbody></table>`;
-    } else {
+    } else if (detailsTab === "trackers") {
         const rows = d.trackers.map((u) => `<tr><td>${escapeHtml(u)}</td></tr>`).join("");
         body.innerHTML = d.trackers.length
             ? `<table><thead><tr><th>URL</th></tr></thead><tbody>${rows}</tbody></table>`
@@ -533,7 +584,12 @@ async function submitAdd() {
     try {
         const dest = $("#dlg-dest").value.trim();
         if ($("#dlg-hunt").checked) await invokeSafe("add_video_task", { url, destDir: dest || null });
-        else await invokeSafe("add_task", { url, category: $("#dlg-cat").value, destDir: dest || null });
+        else await invokeSafe("add_task", {
+            url,
+            category: $("#dlg-cat").value,
+            destDir: dest || null,
+            sequential: $("#dlg-seq").checked,
+        });
         $("#dlg-backdrop").classList.add("hidden");
         await poll();
     } catch (e) {
@@ -544,6 +600,50 @@ async function submitAdd() {
         $("#dlg-ok").disabled = false;
     }
 }
+
+// Files-tab selection: checkbox changes are parked in `pendingSel` until
+// Apply pushes them to the daemon; rows re-render every 2s without losing it.
+$("#tdg-body").addEventListener("change", (ev) => {
+    if (!ev.target.classList.contains("tdg-file-chk")) return;
+    const idx = Number(ev.target.dataset.idx);
+    if (!Number.isInteger(idx)) return;
+    if (!pendingSel) pendingSel = new Map();
+    pendingSel.set(idx, ev.target.checked);
+    // Drop entries that equal the latest served state (all-clean => no Apply).
+    if (lastDetails && lastDetails.files[idx] &&
+        lastDetails.files[idx].included === ev.target.checked) {
+        pendingSel.delete(idx);
+    }
+    $("#tdg-apply").disabled = !pendingSel || pendingSel.size === 0;
+});
+
+// Clicking anywhere in the Want cell toggles the checkbox (the native 13px
+// input is a tiny hit target).
+$("#tdg-body").addEventListener("click", (ev) => {
+    if (ev.target.classList.contains("tdg-file-chk")) return;
+    const cell = ev.target.closest("td");
+    if (!cell) return;
+    const chk = cell.querySelector(".tdg-file-chk");
+    if (chk) chk.click();
+});
+
+$("#tdg-apply").onclick = async () => {
+    if (!detailsTaskId || !lastDetails) return;
+    const files = lastDetails.files;
+    if (!files.length) return;
+    const wanted = files.map((f, i) => (wantsFile(i, f.included) ? i : -1)).filter((i) => i >= 0);
+    // Every file wanted = no only_files at all (the "everything" encoding).
+    const everything = wanted.length === files.length;
+    $("#tdg-apply").disabled = true;
+    try {
+        await invokeSafe("update_selection", { id: detailsTaskId, onlyFiles: everything ? null : wanted });
+        pendingSel = null;
+        await refreshDetails();
+    } catch (e) {
+        flashErr(String(e).replace(/^.*error: /, ""));
+        $("#tdg-apply").disabled = !pendingSel || pendingSel.size === 0;
+    }
+};
 
 setConn(false);
 poll().then(() => {

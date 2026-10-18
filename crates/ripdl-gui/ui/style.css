@@ -234,6 +234,9 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
     background: #fff; border-color: #dfe3e8; color: #1c2a38;
     font-weight: 600;
 }
+#tdg-toolrow { padding: 6px 14px; }
+#tdg-apply { font-size: 12px; padding: 4px 12px; }
+#tdg-apply:disabled { opacity: 0.45; }
 #tdg-body {
     flex: 1; overflow: auto; border-top: 1px solid #dfe3e8;
     padding: 8px 14px 12px; font-size: 12px;

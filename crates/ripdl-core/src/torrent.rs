@@ -31,6 +31,10 @@ pub struct TorrentConfig {
     pub dest_dir: PathBuf,
     /// Only fetch these file indices (None = everything).
     pub only_files: Option<Vec<usize>>,
+    /// Sequential mode: a background drain keeps an open stream walking the
+    /// files in order, which makes librqbit's picker prioritize pieces at
+    /// the read position (usable playback before the download completes).
+    pub sequential: bool,
 }
 
 /// Disk artifacts of a finished torrent: the torrent's root (the file
@@ -163,6 +167,52 @@ fn metainfo_name(bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Info-hash from a magnet URI's `xt=urn:btih:` parameter (hex or base32
+/// encoded, v1 only). Lets callers identify a payload before the session
+/// resolves metadata.
+pub fn magnet_info_hash(payload: &str) -> Option<String> {
+    if !payload.starts_with("magnet:") {
+        return None;
+    }
+    for pair in payload.split('&') {
+        let core = pair.trim().strip_prefix("magnet:?").unwrap_or(pair.trim());
+        let Some(xt) = core.strip_prefix("xt=urn:btih:") else {
+            continue;
+        };
+        if xt.len() == 40 && xt.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(xt.to_ascii_lowercase());
+        }
+        // rfct base32 variant: 32 chars, decode -> 20 bytes -> hex
+        if xt.len() == 32 && xt.chars().all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit())
+        {
+            return base32_to_hex(xt);
+        }
+    }
+    None
+}
+
+/// RFC 4648 base32 (case-insensitive, no padding) to lowercase hex.
+fn base32_to_hex(s: &str) -> Option<String> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let upper = s.to_ascii_uppercase();
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(40);
+    for c in upper.bytes() {
+        let idx = ALPHABET.iter().position(|a| *a == c)?;
+        acc = (acc << 5) | idx as u32;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    if out.len() != 20 {
+        return None;
+    }
+    Some(out.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Magnet `dn=` display name, percent-decoded and sanitized for use as a
 /// folder name. A display name, not a guarantee - but good enough for the
 /// dedicated sub-folder (and usually identical to the real name).
@@ -281,6 +331,11 @@ impl TorrentSession {
         // combined task-owned root directly.
         let mut opts = AddTorrentOptions {
             output_folder: Some(root.to_string_lossy().into_owned()),
+            // Reuse files already on disk (resume/boot-restore/partial data):
+            // with the default (false) rqbit refuses to open existing files
+            // and the task fails with "error creating a new file". Overwrite
+            // + piece hash-check is the correct resume semantic.
+            overwrite: true,
             ..AddTorrentOptions::default()
         };
         if let Some(files) = &cfg.only_files {
@@ -309,9 +364,54 @@ impl TorrentSession {
             .await;
     }
 
+    /// Drop a torrent from the session (files stay on disk; the daemon's
+    /// delete_files path owns disk cleanup). Needed when a task is removed:
+    /// a stale managed handle would otherwise hijack the next add of the
+    /// same payload (`AlreadyManaged` keeps the OLD output folder).
+    pub async fn forget_by_hash(&self, info_hash_hex: &str) {
+        let Some(handle) = self.find(info_hash_hex) else { return };
+        let _ = self
+            .session
+            .delete(librqbit::api::TorrentIdOrHash::Id(handle.id()), false)
+            .await;
+    }
+
     /// librqbit pause: verified piece state survives on disk, unpause resumes.
     pub async fn pause(&self, h: &Arc<ManagedTorrent>) {
         let _ = self.session.pause(h).await;
+    }
+
+    /// Change which files the torrent fetches. `None` selects everything.
+    /// Works live and while paused; drives the picker, not existing data.
+    pub async fn set_selected_files(
+        &self,
+        info_hash_hex: &str,
+        files: Option<Vec<usize>>,
+    ) -> Result<()> {
+        // Resolve "select all" through the torrent's metadata file count
+        // (metadata missing = nothing to expand into; fail loudly rather
+        // than silently deselecting everything).
+        let handle = self.find(info_hash_hex)
+            .ok_or_else(|| Error::State(format!("no managed torrent with hash {info_hash_hex}")))?;
+        let wanted = match files {
+            None => handle
+                .with_metadata(|meta| (0..meta.file_infos.len()).collect::<Vec<usize>>())
+                .map_err(|_| {
+                    Error::State("torrent metadata not resolved yet".into())
+                })?,
+            Some(v) => v,
+        };
+        let set: std::collections::HashSet<usize> = wanted.into_iter().collect();
+        self.session.update_only_files(&handle, &set).await?;
+        Ok(())
+    }
+
+    fn find(&self, info_hash_hex: &str) -> Option<Arc<ManagedTorrent>> {
+        self.session.with_torrents(|torrents| {
+            torrents
+                .map(|(_, t)| Arc::clone(t))
+                .find(|t| t.info_hash().as_string() == info_hash_hex)
+        })
     }
 
     /// Snapshot hash of every managed torrent, keyed by info-hash. Frontends
@@ -426,6 +526,17 @@ pub async fn download(
         root: ensured.root.clone(),
     });
 
+    // Sequential mode: keep a drains task alive for the whole run; it is
+    // aborted wherever this loop exits (finish, cancel, error).
+    let _drain = if cfg.sequential {
+        Some(AbortOnDrop(tokio::spawn(sequential_drain(
+            ensured.handle.clone(),
+            token.clone(),
+        ))))
+    } else {
+        None
+    };
+
     loop {
         if token.is_cancelled() {
             // piece state survives on disk; unpause will resume cheaply
@@ -456,6 +567,80 @@ enum TorrentPhaseKind {
     Fetching,
     Active,
     Failed(String),
+}
+
+/// Aborts the sequential drain task whenever the download loop exits - the
+/// drain has no natural end while files are still wanted and would linger.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Sequential download: walk the selected files in metadata order, one
+/// open librqbit stream at a time, reading through to EOF. The open stream
+/// registers the read position as the picker's priority, so pieces arrive
+/// front-to-back instead of rarest-first - the file head becomes playable
+/// long before the whole task completes. The FileStream read itself blocks
+/// on piece availability (waker fires when a piece lands), so the drain
+/// self-throttles to the actual download speed and never re-downloads:
+/// pieces already on disk are plain disk reads.
+async fn sequential_drain(handle: Arc<ManagedTorrent>, token: CancellationToken) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; 256 * 1024];
+    'outer: loop {
+        if token.is_cancelled() {
+            return;
+        }
+        // Metadata first: magnets spend their opening stretch without it.
+        let ids = match handle.with_metadata(|meta| {
+            let n = meta.file_infos.len();
+            match handle.only_files() {
+                Some(wanted) => wanted,
+                None => (0..n).collect(),
+            }
+        }) {
+            Ok(ids) => ids,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        for id in ids {
+            if token.is_cancelled() {
+                return;
+            }
+            let stream = match handle.clone().stream(id).await {
+                Ok(s) => s,
+                Err(_) => {
+                    // Torrent dropped from the session (remove/stop) - the
+                    // caller's loop will exit on its own; stop draining.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue 'outer;
+                }
+            };
+            // Pin (rerouted reads need it; also sidesteps any Unpin
+            // requirement since librqbit doesn't export the type).
+            tokio::pin!(stream);
+            loop {
+                if token.is_cancelled() {
+                    return;
+                }
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        return; // FileStream:Drop removes the stream's priority
+                    }
+                    read = stream.read(&mut buf) => match read {
+                        Ok(0) => break, // EOF: next file
+                        Ok(_) => {}
+                        Err(_) => break, // stream error: retry the walk
+                    },
+                }
+            }
+        }
+    }
 }
 
 fn classify(st: &TorrentStats) -> TorrentPhaseKind {
@@ -587,6 +772,9 @@ mod tests {
             payload: torfile.to_string_lossy().into_owned(),
             dest_dir: dest.clone(),
             only_files: None,
+            // Sequential mode on: exercises the streaming drain's piece
+            // priority alongside the normal sampler loop.
+            sequential: true,
         };
         let token = CancellationToken::new();
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -621,6 +809,36 @@ mod tests {
 
         seed_session.stop().await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn magnet_info_hash_hex_and_base32() {
+        assert_eq!(
+            magnet_info_hash(
+                "magnet:?xt=urn:btih:08ADA5A7A6183AAE1E09D831DF6748D566095A10&dn=Sintel"
+            )
+            .as_deref(),
+            Some("08ada5a7a6183aae1e09d831df6748d566095a10")
+        );
+        // Same hash, rfct base32 encoding (Sintel's, via standard
+        // RFC 4648 MSB-first chunking).
+        let got = magnet_info_hash("magnet:?xt=urn:btih:BCW2LJ5GDA5K4HQJ3AY56Z2I2VTASWQQ")
+            .expect("base32 variant must decode");
+        assert_eq!(got.len(), 40, "len {}", got.len());
+        assert_eq!(
+            got.as_bytes(),
+            "08ada5a7a6183aae1e09d831df6748d566095a10".as_bytes(),
+            "base32 decode bytes: {:?}",
+            got.as_bytes()
+        );
+        // dn-only / other-param variants must not trip the xt search.
+        assert_eq!(
+            magnet_info_hash("magnet:?dn=x&xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10")
+                .as_deref(),
+            Some("08ada5a7a6183aae1e09d831df6748d566095a10")
+        );
+        assert_eq!(magnet_info_hash("magnet:?dn=only-dn"), None);
+        assert_eq!(magnet_info_hash("https://x/f.zip"), None);
     }
 
     #[test]

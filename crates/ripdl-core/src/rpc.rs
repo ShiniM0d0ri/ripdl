@@ -33,11 +33,21 @@ pub enum Command {
         /// Tool routing: `http` (default) or `video` (yt-dlp sidecar).
         #[serde(default)]
         kind: crate::task::TaskKind,
+        /// Torrent-only: fetch pieces front-to-back (streaming order).
+        #[serde(default)]
+        sequential: bool,
     },
     /// Details for one task's torrent: files/peers/trackers snapshot.
     /// Errors if the task is not a torrent or the session lost it.
     Details {
         id: String,
+    },
+    /// Change a torrent task's per-file selection. `None` selects every
+    /// file; works live and while paused. The choice is persisted and
+    /// survives daemon restarts and resumes.
+    UpdateTorrentSelection {
+        id: String,
+        only_files: Option<Vec<usize>>,
     },
     List,
     Pause {
@@ -115,4 +125,10 @@ pub struct TaskInfo {
     /// Torrent identity (recorded as soon as the engine manages it).
     #[serde(default)]
     pub info_hash: Option<String>,
+    /// Torrent-only: pieces arrive in streaming (front-to-back) order.
+    #[serde(default)]
+    pub sequential: bool,
+    /// Torrent-only: current per-file selection (None = everything).
+    #[serde(default)]
+    pub only_files: Option<Vec<usize>>,
 }

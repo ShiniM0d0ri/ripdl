@@ -84,6 +84,10 @@ enum Cmd {
         /// are auto-detected; this flag forces it otherwise.
         #[arg(long = "torrent")]
         torrent: bool,
+        /// Torrent-only: fetch pieces front-to-back (streaming order, so
+        /// the file head plays before the whole task completes).
+        #[arg(long = "sequential")]
+        sequential: bool,
     },
     /// List tasks known to the daemon.
     Ls,
@@ -100,6 +104,9 @@ enum Cmd {
     },
     /// Torrent details for one task: files, peers, trackers.
     Details { id: String },
+    /// Change a torrent task's per-file selection: file indices
+    /// comma-separated (`0,2,3`) or `all`.
+    Select { id: String, files: String },
     /// Stop the daemon.
     Stop,
     /// Register this binary as the browser's native messaging host
@@ -183,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{info:#?}");
             Ok(())
         }
-        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video, torrent } => {
+        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video, torrent, sequential } => {
             let start_at = match (&after, &at) {
                 (Some(_), Some(_)) => bail!("use --after or --at, not both"),
                 (Some(delay), None) => Some(now_unix() + parse_after(delay)? as i64),
@@ -200,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 ripdl_core::task::TaskKind::Http
             };
-            rpc(Command::Add { url, dest_dir: dest, headers, start_at, kind }).await
+            rpc(Command::Add { url, dest_dir: dest, headers, start_at, kind, sequential }).await
         }
         Cmd::RegisterHost { ext_id, host } => register_host(&ext_id, &host),
         Cmd::Ls => rpc(Command::List).await,
@@ -208,6 +215,21 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
         Cmd::Details { id } => rpc(Command::Details { id }).await,
+        Cmd::Select { id, files } => {
+            let only_files = if files.trim().eq_ignore_ascii_case("all") {
+                None
+            } else {
+                let mut v = Vec::new();
+                for part in files.split(',') {
+                    let part = part.trim();
+                    let idx: usize =
+                        part.parse().with_context(|| format!("bad file index {part:?}"))?;
+                    v.push(idx);
+                }
+                Some(v)
+            };
+            rpc(Command::UpdateTorrentSelection { id, only_files }).await
+        }
         Cmd::Stop => rpc(Command::Shutdown).await,
     }
 }

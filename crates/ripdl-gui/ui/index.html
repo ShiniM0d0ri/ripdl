@@ -77,6 +77,7 @@
           <option value="other">Other (no subfolder)</option>
         </select>
         <label class="chk"><input type="checkbox" id="dlg-hunt" /> Video/stream page (hunt via yt-dlp)</label>
+        <label class="chk"><input type="checkbox" id="dlg-seq" /> Torrent: sequential download (play while downloading)</label>
       </div>
       <div class="dlg-row">
         <label for="dlg-dest">Save to</label>
@@ -111,6 +112,9 @@
         <span class="tdg-tab active" data-tab="files">Files</span>
         <span class="tdg-tab" data-tab="peers">Peers</span>
         <span class="tdg-tab" data-tab="trackers">Trackers</span>
+      </div>
+      <div id="tdg-toolrow">
+        <button id="tdg-apply" class="hidden" disabled>Apply selection</button>
       </div>
       <div id="tdg-body"></div>
     </div>

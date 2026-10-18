@@ -97,10 +97,16 @@ M3.2 - daemon + CLI:
 - [x] `dest_file` = the torrent's root folder; `delete_files` removes the
       whole folder via `remove_dir_all` (per-task root, never the dest
       root); completed torrent size = recursive folder sum
-- [ ] RPC `TorrentDetails { id }` → `{ name, info_hash, size, files
-      [{index,name,size,wanted}], peers [{addr,client,flags,down,up,progress}],
+- [x] RPC `TorrentDetails { id }` → `{ name, info_hash, size, files
+      [{index,name,size,included}], peers [{addr,client,state,down,up}],
       trackers }`
 - [x] CLI: `add` auto-detects torrent payloads (+ explicit `--torrent`)
+- [x] Sequential download mode: `--sequential` flag → `TorrentConfig`
+      streaming drain keeps one open `FileStream` per file (metadata order)
+      so the piece picker follows the read position; persisted on the
+      record and replayed on resume/boot
+- [x] CLI `select <id> all|0,2,3` + RPC `UpdateTorrentSelection`;
+      `only_files` persisted and replayed
 
 M3.3 - GUI merge (HTTP + torrent in one grid):
 - [x] Row model: kind-specific status (metadata phase when a magnet still
@@ -112,7 +118,10 @@ M3.3 - GUI merge (HTTP + torrent in one grid):
 - [x] Toolbar: "Add Torrent" (native file picker, Ctrl+T); Add-URL dialog
       auto-detects magnet/.torrent and routes to the torrent engine
 - [x] Sidebar "Torrents" (kind filter, not extension)
-- [ ] Files tab "Apply" checkbox editing -> `update_only_files`
+- [x] Files tab "Apply" checkbox editing -> `update_only_files` (want
+      checkboxes park in pending state until Apply pushes
+      `UpdateTorrentSelection`; whole-Want-cell click toggles; paused/
+      completed tasks persist without a live-session push)
 
 M3.4 - tests / verification:
 - [x] Offline integration: in-proc seeder ↔ leecher over localhost with a
@@ -122,7 +131,13 @@ M3.4 - tests / verification:
 - [x] Live: real-world legal torrent (Sintel): 8 MiB/s swarm fill,
       mid-flight pause/resume at 61%, correct folder + counters completed,
       `rm --files` wipes the task-owned folder
-- [ ] Pause/resume across daemon restart (boot-resume re-verify path)
+- [x] Live GUI: Files-tab want checkboxes -> Apply (CLI `details` shows
+      `included=no`, `only_files` persisted in queue.json, resume finishes
+      with the excluded files still unwanted)
+- [x] Pause/resume across daemon restart (fresh-session re-verify: existing
+      files on disk previously failed the add with "error creating a new
+      file"; `AddTorrentOptions.overwrite = true` makes the re-add
+      hash-check and resume them)
 - [ ] Clean-room check: behavior parity notes only, no copying from
       qBittorrent/FDM code or assets; findings → docs/rea-findings.md
 

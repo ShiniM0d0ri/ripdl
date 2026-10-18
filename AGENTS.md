@@ -114,7 +114,11 @@ librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 folder, same Progress stream + pause/resume/cancel as HTTP, CLI auto-detect
 (`--torrent`), GUI add auto-routes torrents; M3.3 GUI merge landed (Add
 Torrent picker, torrent rows/details dialog with Files/Peers/Trackers);
-the remaining P3 thread is per-file selection (update_only_files).
+per-file selection + sequential landed end-to-end (M3.3 Files-tab want
+checkboxes -> Apply -> `UpdateTorrentSelection`, `--sequential` streaming
+drain in `ripdl-core::torrent`, both persisted and replayed; resume of
+existing on-disk files fixed via `AddTorrentOptions.overwrite = true`);
+remaining P3: none beyond backlog items below.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish,

@@ -94,7 +94,7 @@ async fn list_tasks() -> Result<Vec<TaskInfo>, String> {
 /// Queue a URL. `dest_dir` overrides the location entirely (the Add dialog
 /// passes an explicit user choice); otherwise category rules apply.
 #[tauri::command]
-async fn add_task(url: String, category: Option<String>, dest_dir: Option<String>) -> Result<String, String> {
+async fn add_task(url: String, category: Option<String>, dest_dir: Option<String>, sequential: Option<bool>) -> Result<String, String> {
     let dest = match dest_dir {
         Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
         _ => {
@@ -112,11 +112,12 @@ async fn add_task(url: String, category: Option<String>, dest_dir: Option<String
         TaskKind::Http
     };
     match rpc(Command::Add {
-        url,
+        url: url.clone(),
         dest_dir: Some(dest),
         headers: Default::default(),
         start_at: None,
         kind,
+        sequential: sequential.unwrap_or(false),
     })
     .await?
     {
@@ -139,6 +140,7 @@ async fn add_video_task(url: String, dest_dir: Option<String>) -> Result<String,
         headers: Default::default(),
         start_at: None,
         kind: TaskKind::Video,
+        sequential: false,
     })
     .await?
     {
@@ -155,6 +157,13 @@ async fn pause_task(id: String) -> Result<(), String> {
 #[tauri::command]
 async fn resume_task(id: String) -> Result<(), String> {
     expect_ok(rpc(Command::Resume { id }).await?)
+}
+
+/// Change a torrent task's per-file selection (`only_files` = None
+/// selects everything; works mid-flight and persists across restarts).
+#[tauri::command]
+async fn update_selection(id: String, only_files: Option<Vec<usize>>) -> Result<(), String> {
+    expect_ok(rpc(Command::UpdateTorrentSelection { id, only_files }).await?)
 }
 
 /// Remove the queue record; `delete_files` also erases the downloaded
@@ -272,6 +281,7 @@ fn main() {
             add_video_task,
             pause_task,
             resume_task,
+            update_selection,
             remove_task,
             pick_dir,
             pick_file,
