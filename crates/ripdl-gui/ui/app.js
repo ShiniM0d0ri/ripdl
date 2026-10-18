@@ -30,13 +30,12 @@ const CATALOG = ["all", "unfinished", "completed", "torrents", "video", "music",
 let tasks = [];
 let currentCategory = "all";
 let selectedId = null;
-let lastSnapshot = "";
+let lastStructKey = null;
 
+// Plain passthrough: a failed command (bad URL, daemon said no) is not a
+// dead connection - the connection pill is owned by poll()/setConn only.
 function invokeSafe(cmd, args) {
-    return invoke(cmd, args).catch((e) => {
-        setConn(false);
-        throw e;
-    });
+    return invoke(cmd, args);
 }
 
 function setConn(ok) {
@@ -50,12 +49,14 @@ function ext(name) {
     return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
 }
 
+// ext -> category, built once (categoryOf runs per task on every render).
+const EXT_CAT = {};
+for (const [cat, list] of Object.entries(CATEGORY_EXT)) {
+    for (const e of list) EXT_CAT[e] = cat;
+}
+
 function categoryOf(name) {
-    const e = ext(name);
-    for (const [cat, list] of Object.entries(CATEGORY_EXT)) {
-        if (list.includes(e)) return cat;
-    }
-    return "other";
+    return EXT_CAT[ext(name)] || "other";
 }
 
 function urlName(url) {
@@ -140,6 +141,19 @@ function percentOf(t) {
     return null;
 }
 
+// Percentage text: one decimal while actively downloading (progress reads as
+// moving), integers elsewhere.
+function pctText(pct, state) {
+    return ["running", "hunt", "downloading", "verifying"].includes(state) ? pct.toFixed(1) : pct.toFixed(0);
+}
+
+// Size column for a task row.
+function sizeText(t) {
+    if (t.state === "completed") return humans(t.total || t.downloaded);
+    if (t.percent != null) return t.total ? humans(t.total) : "?";
+    return t.total ? `${humans(t.downloaded)} / ${humans(t.total)}` : humans(t.downloaded);
+}
+
 function etaOf(t) {
     if (!t.total || !t.speed_bps || t.speed_bps <= 0) return null;
     const left = (t.total - t.downloaded) / t.speed_bps;
@@ -165,7 +179,7 @@ function renderSidebar(counts) {
         <span>${CAT_LABEL[cat]}</span><span class="count">${counts[cat] ?? 0}</span>
       </div>`).join("");
     $("#side-items").querySelectorAll(".side-item").forEach((el) => {
-        el.onclick = () => { currentCategory = el.dataset.cat; lastSnapshot = ""; render(); };
+        el.onclick = () => { currentCategory = el.dataset.cat; lastStructKey = null; render(); };
     });
 }
 
@@ -177,8 +191,47 @@ function inCurrentView(t) {
     return categoryOf(urlName(t.url)) === currentCategory;
 }
 
+// Everything a full row repaint owns. Downstream, poll() compares this per
+// poll: identical -> volatile-refresh the cells in place instead of
+// rebuilding the tbody (which cost hover/dblclick stability and burned CPU
+// every 500ms during downloads).
+function structKey(view) {
+    return currentCategory + "|" + view.map((t) => [
+        t.id, stateLabel(t), rowName(t), t.kind, t.dest_dir, t.dest_file,
+        t.error, t.sequential, t.total ? 1 : 0,
+    ].join("\u0001")).join("\u0002");
+}
+
+// id -> row element, refreshed on every full body render.
+let rowCache = new Map();
+
+// Volatile cells only: bytes, percent, bar width, ETA, speed. The layout
+// (icons, state label, buttons, error text) is structural and untouched.
+function refreshVolatile(t) {
+    const tr = rowCache.get(t.id);
+    if (!tr || !tr.cells) return;
+    const state = stateLabel(t);
+    t.cells[2].textContent = sizeText(t);
+    t.cells[4].textContent = etaOf(t) || "-";
+    t.cells[5].textContent = t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
+    const pct = percentOf(t);
+    if (pct == null) return; // pc-less layout is structural (no-total cases)
+    const fill = tr.querySelector(".prog-fill");
+    const pctSpan = tr.querySelector(".pct");
+    if (fill) fill.style.width = `${Math.min(100, pct).toFixed(1)}%`;
+    if (pctSpan) pctSpan.textContent = `${pctText(pct, state)}%`;
+}
+
+function statusbarText() {
+    const running = tasks.filter((t) => ["running", "queued"].includes(t.state)).length;
+    const totalSpeed = tasks.reduce((s, t) => s + (t.speed_bps || 0), 0);
+    return [`${running} active · ${tasks.length} in list`, `${humans(totalSpeed)} per second`];
+}
+
 function render() {
-    // Category counts (also shown in the sidebar).
+    // Category counts (also shown in the sidebar). Counts only change with
+    // the task set / state label / name extension - all structural - so the
+    // sidebar is repainted here and never by the volatile path.
     const counts = { all: tasks.length, unfinished: 0, completed: 0, torrents: 0 };
     for (const cat of ["video", "music", "images", "documents", "archives", "programs"]) counts[cat] = 0;
     for (const t of tasks) {
@@ -199,12 +252,8 @@ function render() {
         const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "timed"].includes(state) ? "paused" : "");
         const prog = pct == null
             ? `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:0%"></div></div>`
-            : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${(["running", "hunt", "downloading", "verifying"].includes(state) ? pct.toFixed(1) : pct.toFixed(0))}%</span>`;
-        const size = t.state === "completed"
-            ? humans(t.total || t.downloaded)
-            : t.percent != null
-            ? (t.total ? humans(t.total) : "?")
-            : t.total ? `${humans(t.downloaded)} / ${humans(t.total)}` : humans(t.downloaded);
+            : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${pctText(pct, state)}%</span>`;
+        const size = sizeText(t);
         const eta = etaOf(t) || "-";
         const speed = t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
         const dir = t.dest_dir ? t.dest_dir.replace(/[\\/]+$/, "") : "";
@@ -253,10 +302,13 @@ function render() {
         btn.onclick = (ev) => { ev.stopPropagation(); doTaskAction(btn.dataset.act, btn.dataset.id); };
     });
 
-    const running = tasks.filter((t) => ["running", "queued"].includes(t.state)).length;
-    const totalSpeed = tasks.reduce((s, t) => s + (t.speed_bps || 0), 0);
-    $("#st-counts").textContent = `${running} active · ${tasks.length} in list`;
-    $("#st-speed").textContent = `${humans(totalSpeed)} per second`;
+    rowCache = new Map();
+    for (const tr of tbody.children) rowCache.set(tr.dataset.id, tr);
+
+    const [countsTxt, speedTxt] = statusbarText();
+    const c = $("#st-counts"), s = $("#st-speed");
+    if (c.textContent !== countsTxt) c.textContent = countsTxt;
+    if (s.textContent !== speedTxt) s.textContent = speedTxt;
 }
 
 // Rerender without invalidating the selection highlight (implicit: selectedId survives).
@@ -327,35 +379,61 @@ async function doTaskAction(act, id) {
 
 function flashErr(msg) {
     const st = $("#st-counts");
-    const prev = st.textContent;
     st.textContent = msg;
     st.style.color = "#b02a2a";
-    setTimeout(() => { st.textContent = prev; st.style.color = ""; }, 3500);
+    // Same suppression window as flashStatus: without it the 500ms status
+    // writer would overwrite the message before it is readable.
+    statusFlashUntil = Date.now() + 3500;
+    setTimeout(() => { st.style.color = ""; }, 3500);
 }
 
+let pollInFlight = false;
+
+// One round trip on the wire at a time: the command side can sleep ~900ms on
+// a cold daemon spawn, so an unguarded 500ms poll would stack concurrent
+// calls and could answer out of order (stale snapshot rolling back a fresh
+// one).
 async function poll() {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
-        const list = await invokeSafe("list_tasks");
+        const list = await invoke("list_tasks");
         tasks = list;
         setConn(true);
-        // Render once per actual data change (speed/pct shifts re-render;
-        // identical payloads don't, which keeps hover/selection steady).
-        const snap = JSON.stringify(tasks) + "|" + currentCategory;
-        if (snap !== lastSnapshot) {
-            lastSnapshot = snap;
+        // Structural changes (task set, state, name, errors) repaint the
+        // tbody + sidebar; bytes-only changes update cells in place - no DOM
+        // rebuild, no flicker, no lost hover.
+        const view = tasks.filter(inCurrentView);
+        const key = structKey(view);
+        if (key !== lastStructKey) {
+            lastStructKey = key;
             render();
         } else {
+            for (const t of view) refreshVolatile(t);
             renderStatusbar();
         }
-    } catch (_) { /* stays red */ }
+    } catch (_) { /* connection pill only flips via setConn */ }
+    finally {
+        pollInFlight = false;
+    }
 }
+
+// Self-scheduling: 500ms while the window is visible (engine ticks every
+// 500ms), 2s when hidden - close-to-tray shouldn't churn RPCs at all.
+let pollTimer = null;
+function schedulePoll() {
+    clearTimeout(pollTimer);
+    const ms = document.hidden ? 2000 : 500;
+    pollTimer = setTimeout(() => { poll().then(schedulePoll); }, ms);
+}
+document.addEventListener("visibilitychange", schedulePoll);
 
 function renderStatusbar() {
     if (Date.now() < statusFlashUntil) return; // flashing a message
-    const running = tasks.filter((t) => ["running", "queued"].includes(t.state)).length;
-    const totalSpeed = tasks.reduce((s, t) => s + (t.speed_bps || 0), 0);
-    $("#st-counts").textContent = `${running} active · ${tasks.length} in list`;
-    $("#st-speed").textContent = `${humans(totalSpeed)} per second`;
+    const [countsTxt, speedTxt] = statusbarText();
+    const c = $("#st-counts"), s = $("#st-speed");
+    if (c.textContent !== countsTxt) c.textContent = countsTxt;
+    if (s.textContent !== speedTxt) s.textContent = speedTxt;
 }
 
 /* Toolbar */
@@ -588,6 +666,13 @@ $("#set-backdrop").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings();
 $("#set-ytdlp").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 $("#set-dir").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 
+// True while any dialog is open: global accelerators shouldn't fire into
+// them (Ctrl+N while typing in the Add dialog would wipe the typed URL).
+function dialogOpen() {
+    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop"]
+        .some((s) => !$(s).classList.contains("hidden"));
+}
+
 document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
         $("#dlg-backdrop").classList.add("hidden");
@@ -595,6 +680,7 @@ document.addEventListener("keydown", (ev) => {
         closeSettings();
         closeMenus();
     }
+    if (dialogOpen()) return;
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "n") {
         ev.preventDefault();
         openAddDialog();
@@ -672,8 +758,11 @@ document.querySelectorAll("#tdg-tabs .tdg-tab").forEach((el) => {
     };
 });
 
+let detailsRefreshBusy = false;
+
 async function refreshDetails() {
-    if (!detailsTaskId) return;
+    if (!detailsTaskId || detailsRefreshBusy) return;
+    detailsRefreshBusy = true;
     // Title from the task list first: available even when the snapshot
     // fetch fails (e.g. paused session resets don't blank the dialog).
     const t = findTask(detailsTaskId);
@@ -686,6 +775,8 @@ async function refreshDetails() {
         $("#tdg-apply").classList.add("hidden");
         lastDetails = null;
         return;
+    } finally {
+        detailsRefreshBusy = false;
     }
     const name = (t && t.name) || d.name || "(unknown)";
     $("#tdg-name").textContent = name;
@@ -761,6 +852,7 @@ async function refreshDetails() {
 }
 
 async function submitAdd() {
+    if ($("#dlg-ok").disabled) return; // Enter-double-fire / double-click
     const url = $("#dlg-url").value.trim();
     if (!url) return;
     $("#dlg-ok").disabled = true;
@@ -829,8 +921,4 @@ $("#tdg-apply").onclick = async () => {
 };
 
 setConn(false);
-poll().then(() => {
-    // 500ms keeps the percent/speed columns within ~1s of the engine's own
-    // 500ms progress ticker; identical snapshots don't re-render.
-    setInterval(poll, 500);
-});
+poll().then(schedulePoll);
