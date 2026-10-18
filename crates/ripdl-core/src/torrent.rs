@@ -7,6 +7,7 @@
 //! on disk), resume = re-ensure + unpause; the queue record payload
 //! (magnet/.torrent) is the source of truth - no rqbit-side persistence.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -288,8 +289,15 @@ impl TorrentSession {
     /// Start the session (explicit random ports; no rqbit-side persistence
     /// - the queue record is the source of truth, and separate sessions
     /// must never collide on one DHT/resource).
-    pub async fn new(default_output_folder: PathBuf) -> Result<Self> {
+    ///
+    /// `bind_ips`: when set (bonding on), every outgoing peer connection is
+    /// bound to one of these local addresses round-robin (see
+    /// `SessionOptions::bind_ips` in the vendored librqbit). The listener and
+    /// DHT stay OS-routed; uTP, once TCP loses the race, also stays
+    /// OS-routed — bonding redistributes the TCP peer load.
+    pub async fn new(default_output_folder: PathBuf, bind: Option<Vec<IpAddr>>) -> Result<Self> {
         let opts = librqbit::SessionOptions {
+            bind_ips: bind,
             dht: Some(librqbit::DhtSessionConfig {
                 bootstrap_addrs: None,
                 port: Some(0),          // ephemeral: never collide
@@ -762,10 +770,16 @@ mod tests {
             .await
             .expect("seed");
 
-        // Leech: the real ripdl path (ensure -> sample -> finished).
-        let leech = TorrentSession::new(tmp.join("leech-default"))
-            .await
-            .unwrap();
+        // Leech: the real ripdl path (ensure -> sample -> finished), with a
+        // bonded source-IP list of just the loopback IP — every outgoing
+        // peer connection then binds to 127.0.0.1 before connecting, which
+        // exercises the vendored librqbit bind_ips plumbing end-to-end.
+        let leech = TorrentSession::new(
+            tmp.join("leech-default"),
+            Some(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]),
+        )
+        .await
+        .unwrap();
         let dest = tmp.join("leech");
         let cfg = TorrentConfig {
             id: "tor-1".into(),

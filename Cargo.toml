@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon", "crates/ripdl-gui"]
+members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon", "crates/ripdl-gui", "vendor/librqbit"]
 
 [workspace.package]
 version = "0.2.0"
@@ -26,6 +26,14 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 anyhow = "1"
 time = { version = "0.3", features = ["local-offset"] }
+
+# Torrent NIC bonding: use our vendored librqbit fork (upstream ikatson/rqbit
+# 9.0.1, Apache-2.0) instead of the crates.io one. The only delta is support
+# for binding outgoing peer connections to a rotating list of local source
+# addresses (`SessionOptions::bind_ips`). See vendor/librqbit/README.md and
+# AGENTS.md.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
 
 [profile.release]
 lto = "thin"

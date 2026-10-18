@@ -59,6 +59,10 @@ the single-stream path.
   artifacts in `research/` (gitignored).
 - **License**: MIT OR Apache-2.0. No GPL dependencies in first-party code —
   torrent support must go through `librqbit` (Apache-2.0), not GPL clients.
+  A minimal in-tree fork lives at `vendor/librqbit` (upstream 9.0.1 +
+  `SessionOptions::bind_ips` for torrent NIC bonding), wired via
+  `[patch.crates-io]`; keep the delta small and reapply it on upstream bumps
+  (see `vendor/librqbit/README.md`).
 - **No telemetry of any kind.**
 - Commits: use `git -c user.name="ripdl" -c user.email="ripdl@localhost" commit …`.
   One commit per coherent unit, terse imperative subject.
@@ -144,7 +148,12 @@ per-file selection + sequential landed end-to-end (M3.3 Files-tab want
 checkboxes -> Apply -> `UpdateTorrentSelection`, `--sequential` streaming
 drain in `ripdl-core::torrent`, both persisted and replayed; resume of
 existing on-disk files fixed via `AddTorrentOptions.overwrite = true`);
-remaining P3: none beyond backlog items below.
+remaining P3: none beyond backlog items below. Torrent NIC bonding landed
+(2026-10-19): with `bond_interfaces` on, the shared rqbit session binds every
+outgoing peer connection to a rotating local uplink address (vendored
+`SessionOptions::bind_ips`); listener/DHT/uTP stay OS-routed; session-wide —
+created once, so a setting change needs a daemon restart (per-task `--bond`
+stays HTTP-only).
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap.
