@@ -24,6 +24,15 @@ All in `src/stream_connect.rs` + `src/session.rs`:
    (e.g. the interface vanished) logs and falls back to the default route
    instead of failing the peer).
 3. Unit tests for the rotation helper (`stream_connect::tests`).
+4. `SessionOptions::fastresume_folder: Option<PathBuf>` — when `persistence`
+   is unset, the session builds `JsonSessionPersistenceStore` over that folder
+   and uses it as the *bitfield factory only* (`Ok((None, store))` in
+   `persistence_factory`). rqbit then loads/stores `<info-hash>.bitv` piece
+   maps, so a re-added torrent runs `validate_fastresume` (a sample of pieces
+   plus one per file) instead of `initial_check` over every byte. The session
+   half stays `None`, so no torrent list, trackers or pause state are
+   restored: ripdl's `queue.json` remains the single source of truth and
+   nothing is silently re-added or resumed.
 
 Nothing else was touched; `ConnectionOptions`, uTP, DHT and trackers behave
 exactly as upstream. Notably, uTP (once TCP loses the 1s race) and DHT stay
@@ -35,4 +44,4 @@ dominant traffic direction when downloading.
 Copy the new registry tarball over this directory (keep this README), reapply
 the delta above, then run `cargo test --workspace`. The rotation tests and the
 loopback bonded seeder↔leecher round-trip in `crates/ripdl-core/src/torrent.rs`
-must both stay green.
+must both stay green (it also asserts the fastresume bitfield was written).

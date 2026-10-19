@@ -439,6 +439,14 @@ pub struct SessionOptions {
     /// Enable fastresume, to restore state quickly after restart.
     pub fastresume: bool,
 
+    /// Directory for fastresume bitfields (`<info-hash>.bitv`) used when
+    /// `persistence` is not configured: a re-added torrent validates a small
+    /// sample of its on-disk pieces instead of re-reading all of them.
+    /// Nothing else is restored - no torrent list, trackers or pause state -
+    /// so the caller keeps owning those (ripdl's queue stays the single
+    /// source of truth). Ignored when `persistence` is set.
+    pub fastresume_folder: Option<PathBuf>,
+
     /// Turn on to dump session contents into a file periodically, so that on next start
     /// all remembered torrents will continue where they left off.
     pub persistence: Option<SessionPersistenceConfig>,
@@ -498,6 +506,7 @@ impl Default for SessionOptions {
             bind_ips: None,
             disable_trackers: false,
             fastresume: false,
+            fastresume_folder: None,
             persistence: None,
             peer_id: None,
             listen: None,
@@ -686,7 +695,22 @@ impl Session {
                         let p = Arc::new(PostgresSessionStorage::new(connection_string).await?);
                         make_result!(p)
                     }
-                    None => Ok((None, Arc::new(NonPersistentBitVFactory {}))),
+                    None => match &opts.fastresume_folder {
+                        // Fastresume without session persistence: only the
+                        // bitfield half of the JSON store is used (load /
+                        // store_initial_check / clear, all keyed by info
+                        // hash), so a restart skips the full on-disk recheck
+                        // while nothing is silently re-added or resumed.
+                        Some(folder) => {
+                            let s = Arc::new(
+                                JsonSessionPersistenceStore::new(folder.clone(), spawner)
+                                    .await
+                                    .context("error initializing fastresume store")?,
+                            );
+                            Ok((None, s))
+                        }
+                        None => Ok((None, Arc::new(NonPersistentBitVFactory {}))),
+                    },
                 }
             }
 

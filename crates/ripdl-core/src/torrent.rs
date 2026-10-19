@@ -357,6 +357,10 @@ fn sanitize_component(s: &str) -> String {
 /// Process-wide handle over the daemon's single torrent session.
 pub struct TorrentSession {
     session: Arc<Session>,
+    /// Fastresume bitfield cache (`<info-hash>.bitv`), when configured. Only
+    /// the piece cache lives here: rqbit's session DB is deliberately unused,
+    /// so the daemon's queue remains the single owner of task state.
+    fastresume_dir: Option<PathBuf>,
 }
 
 impl TorrentSession {
@@ -369,9 +373,19 @@ impl TorrentSession {
     /// `SessionOptions::bind_ips` in the vendored librqbit). The listener and
     /// DHT stay OS-routed; uTP, once TCP loses the race, also stays
     /// OS-routed — bonding redistributes the TCP peer load.
-    pub async fn new(default_output_folder: PathBuf, bind: Option<Vec<IpAddr>>) -> Result<Self> {
+    ///
+    /// `fastresume_dir`: keep rqbit's piece bitfields there so a re-added
+    /// torrent validates a sample of its on-disk data instead of re-reading
+    /// every piece (29 GB at disk speed, observed as one bogus "download"
+    /// burst per restart). No torrent/session state is restored from it.
+    pub async fn new(
+        default_output_folder: PathBuf,
+        bind: Option<Vec<IpAddr>>,
+        fastresume_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let opts = librqbit::SessionOptions {
             bind_ips: bind,
+            fastresume_folder: fastresume_dir.clone(),
             dht: Some(librqbit::DhtSessionConfig {
                 bootstrap_addrs: None,
                 port: Some(0),          // ephemeral: never collide
@@ -385,6 +399,7 @@ impl TorrentSession {
         };
         Ok(Self {
             session: Session::new_with_opts(default_output_folder, opts).await?,
+            fastresume_dir,
         })
     }
 
@@ -467,11 +482,18 @@ impl TorrentSession {
     /// a stale managed handle would otherwise hijack the next add of the
     /// same payload (`AlreadyManaged` keeps the OLD output folder).
     pub async fn forget_by_hash(&self, info_hash_hex: &str) {
-        let Some(handle) = self.find(info_hash_hex) else { return };
-        let _ = self
-            .session
-            .delete(librqbit::api::TorrentIdOrHash::Id(handle.id()), false)
-            .await;
+        if let Some(handle) = self.find(info_hash_hex) {
+            let _ = self
+                .session
+                .delete(librqbit::api::TorrentIdOrHash::Id(handle.id()), false)
+                .await;
+        }
+        // Nothing else clears the bitfield (no rqbit session store is
+        // configured), so drop it with the task: a re-add after removal must
+        // not inherit the old piece map.
+        if let Some(dir) = &self.fastresume_dir {
+            let _ = std::fs::remove_file(dir.join(format!("{info_hash_hex}.bitv")));
+        }
     }
 
     /// librqbit pause: verified piece state survives on disk, unpause resumes.
@@ -1007,6 +1029,7 @@ mod tests {
         let leech = TorrentSession::new(
             tmp.join("leech-default"),
             Some(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]),
+            Some(tmp.join("fastresume")),
         )
         .await
         .unwrap();
@@ -1065,6 +1088,12 @@ mod tests {
         assert_eq!(details.files.len(), 1, "file list still available");
         assert!(details.seeding, "details report the seeding phase");
 
+        // Fastresume: the initial check left a bitfield for this info hash,
+        // so the next start validates a sample of the on-disk pieces instead
+        // of re-reading all of them.
+        let bitv = tmp.join("fastresume").join(format!("{}.bitv", out.info_hash));
+        assert!(bitv.is_file(), "fastresume bitfield stored: {bitv:?}");
+
         seed_session.stop().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1107,7 +1136,7 @@ mod tests {
         let torfile = tmp.join("dir.torrent");
         std::fs::write(&torfile, &bytes).unwrap();
 
-        let session = TorrentSession::new(tmp.join("unused"), None).await.unwrap();
+        let session = TorrentSession::new(tmp.join("unused"), None, None).await.unwrap();
         let pv = session
             .preview(torfile.to_str().unwrap())
             .await
@@ -1236,6 +1265,7 @@ mod tests {
         let leech = TorrentSession::new(
             tmp.join("leech-default"),
             Some(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]),
+            None,
         )
         .await
         .unwrap();
