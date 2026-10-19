@@ -67,6 +67,16 @@ pub struct Progress {
     /// segments and torrent swarms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_bps: Option<f64>,
+    /// Torrent-only: lifetime bytes served to peers (this run + restores).
+    #[serde(default)]
+    pub uploaded: u64,
+    /// Torrent-only: current upload rate (bytes/s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_bps: Option<f64>,
+    /// Torrent-only: every wanted piece is on disk and the swarm is being
+    /// served. The daemon maps this to the "seeding" row label.
+    #[serde(default)]
+    pub seeding: bool,
 }
 
 impl Default for Progress {
@@ -77,6 +87,9 @@ impl Default for Progress {
             total: None,
             percent: None,
             speed_bps: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
         }
     }
 }

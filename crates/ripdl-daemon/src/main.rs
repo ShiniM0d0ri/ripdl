@@ -54,6 +54,23 @@ struct TaskRecord {
     /// resume/boot-restore replays it.
     #[serde(default)]
     only_files: Option<Vec<usize>>,
+    /// Torrent-only: lifetime bytes served to peers. Baseline kept across
+    /// restarts; the seeding watcher adds rqbit's per-session counter.
+    #[serde(default)]
+    uploaded: u64,
+    /// Torrent-only: last sampled upload rate (live; cleared at boot).
+    #[serde(default)]
+    upload_bps: Option<f64>,
+    /// Torrent-only: finished and currently serving the swarm.
+    #[serde(default)]
+    seeding: bool,
+    /// Torrent-only: seeding stopped by the user or by a seed limit. Kept
+    /// across restarts so a stopped torrent does not start uploading again.
+    #[serde(default)]
+    seed_paused: bool,
+    /// Torrent-only: connected peers (last sample).
+    #[serde(default)]
+    peers: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +86,25 @@ struct QueueFileRef<'a> {
 
 struct TaskRuntime {
     token: CancellationToken,
+}
+
+/// One active seeding watcher. The generation makes stale watchers harmless:
+/// stop→start can overlap, and only the newest watcher may publish state.
+struct SeedWatch {
+    token: CancellationToken,
+    gen: u64,
+}
+
+/// Remove a seeding watcher only if it is still the current generation.
+fn forget_seed_watch(
+    map: &Mutex<HashMap<String, SeedWatch>>,
+    id: &str,
+    generation: u64,
+) {
+    let mut seeders = map.lock().unwrap();
+    if seeders.get(id).map(|w| w.gen) == Some(generation) {
+        seeders.remove(id);
+    }
 }
 
 #[derive(Debug)]
@@ -89,6 +125,12 @@ struct Daemon {
     records: Mutex<Vec<TaskRecord>>,
     progress: Mutex<HashMap<String, ProgressTrack>>,
     runtime: Mutex<HashMap<String, TaskRuntime>>,
+    /// One token per completed torrent currently being served to the swarm.
+    /// Separate from `runtime`: seeding must not hold a download semaphore
+    /// slot, and pause/remove need to stop it independently.
+    seeders: Mutex<HashMap<String, SeedWatch>>,
+    /// Monotonic generation for `seeders` (see `SeedWatch`).
+    seed_gen: std::sync::atomic::AtomicU64,
     /// Single torrent session across all torrent tasks; created on first
     /// torrent use (binds DHT/listener only when actually needed). Async
     /// mutex: creation awaits inside the locked section.
@@ -127,6 +169,8 @@ impl Daemon {
             records: Mutex::new(records),
             progress: Mutex::new(HashMap::new()),
             runtime: Mutex::new(HashMap::new()),
+            seeders: Mutex::new(HashMap::new()),
+            seed_gen: std::sync::atomic::AtomicU64::new(0),
             torrents: tokio::sync::Mutex::new(None),
             shutdown: tokio::sync::Notify::new(),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
@@ -143,6 +187,15 @@ impl Daemon {
             for r in records.iter_mut() {
                 if r.state == TaskState::Running {
                     r.state = TaskState::Queued;
+                    changed = true;
+                }
+                // Live-only fields must not survive a restart: a stale up
+                // rate or "seeding" badge would lie until the watcher ticks.
+                if r.seeding {
+                    r.seeding = false;
+                    changed = true;
+                }
+                if r.upload_bps.take().is_some() {
                     changed = true;
                 }
             }
@@ -168,6 +221,315 @@ impl Daemon {
             self.spawn_runner(r);
         }
         Ok(())
+    }
+
+    /// Re-attach finished/paused torrent tasks to the shared session after a
+    /// restart. librqbit keeps no state of its own, so the session starts
+    /// empty: without this, `details` reports "torrent session not running"
+    /// and nothing seeds until a runner happens to run again.
+    async fn boot_restore_torrents(self: &Arc<Self>) {
+        let recs: Vec<TaskRecord> = {
+            let records = self.records.lock().unwrap();
+            records
+                .iter()
+                .filter(|r| {
+                    r.kind == TaskKind::Torrent
+                        && r.info_hash.is_some()
+                        && matches!(r.state, TaskState::Completed | TaskState::Paused)
+                })
+                .cloned()
+                .collect()
+        };
+        if recs.is_empty() {
+            return;
+        }
+        let session = match self.ensure_torrent_session().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "torrent restore skipped: session unavailable");
+                return;
+            }
+        };
+        for rec in recs {
+            let cfg = ripdl_core::torrent::TorrentConfig {
+                id: rec.id.clone(),
+                payload: rec.url.clone(),
+                dest_dir: rec.dest_dir.clone().unwrap_or_else(|| {
+                    self.conf()
+                        .default_download_dir
+                        .clone()
+                        .or_else(default_download_dir)
+                        .unwrap_or_else(|| PathBuf::from("."))
+                }),
+                only_files: rec.only_files.clone(),
+                sequential: false,
+            };
+            match session.ensure(&cfg).await {
+                Ok(ensured) => {
+                    // Re-read after the await: the user may have resumed the
+                    // task (or removed it) while the hash-check ran. A runner
+                    // now owns a Queued/Running task - leave it live.
+                    let current = {
+                        let records = self.records.lock().unwrap();
+                        records
+                            .iter()
+                            .find(|r| r.id == rec.id)
+                            .map(|r| (r.state, r.seed_paused))
+                    };
+                    let (state, seed_paused) = match current {
+                        Some(v) => v,
+                        None => continue, // removed during the restore
+                    };
+                    if state == TaskState::Completed
+                        && self.conf().seed_enabled()
+                        && !seed_paused
+                    {
+                        self.start_seeding(&rec.id);
+                    } else if matches!(state, TaskState::Completed | TaskState::Paused) {
+                        // A paused download stays paused; a stopped seeder is
+                        // paused too - both remain in the session so the
+                        // details dialog keeps working after a restart.
+                        session.pause(&ensured.handle).await;
+                    }
+                }
+                Err(e) => tracing::warn!(id = %rec.id, error = %e, "torrent restore failed"),
+            }
+        }
+        tracing::info!("torrent session restored");
+    }
+
+    /// Watcher early-exit: only the current generation may clear the flag.
+    fn abort_seed_watch(self: &Arc<Self>, id: &str, generation: u64) {
+        let current = self
+            .seeders
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|w| w.gen == generation)
+            == Some(true);
+        if !current {
+            return;
+        }
+        let snapshot = {
+            let mut records = self.records.lock().unwrap();
+            if let Some(r) = records.iter_mut().find(|r| r.id == id) {
+                r.seeding = false;
+                r.upload_bps = None;
+            }
+            records.clone()
+        };
+        let _ = self.persist(&snapshot);
+        forget_seed_watch(&self.seeders, id, generation);
+    }
+
+    /// Watch one finished torrent and report upload stats into its record.
+    /// Deliberately does NOT hold the download semaphore: seeding must never
+    /// starve queued downloads. Stops on ratio/time limits, pause, removal
+    /// or daemon shutdown.
+    fn start_seeding(self: &Arc<Self>, id: &str) {
+        if !self.conf().seed_enabled() {
+            return;
+        }
+        let (hash, downloaded, cfg) = {
+            let mut records = self.records.lock().unwrap();
+            let Some(r) = records.iter_mut().find(|r| r.id == id) else {
+                return;
+            };
+            if r.state != TaskState::Completed || r.kind != TaskKind::Torrent {
+                return;
+            }
+            let Some(hash) = r.info_hash.clone() else { return };
+            // A manual (re)start overrides a previous user stop; limits that
+            // were already reached are re-checked on the first sample.
+            r.seeding = true;
+            r.seed_paused = false;
+            r.upload_bps = None;
+            let cfg = ripdl_core::torrent::TorrentConfig {
+                id: r.id.clone(),
+                payload: r.url.clone(),
+                dest_dir: r.dest_dir.clone().unwrap_or_else(|| {
+                    self.conf()
+                        .default_download_dir
+                        .clone()
+                        .or_else(default_download_dir)
+                        .unwrap_or_else(|| PathBuf::from("."))
+                }),
+                only_files: r.only_files.clone(),
+                sequential: false,
+            };
+            (hash, r.downloaded.max(r.total.unwrap_or(0)), cfg)
+        };
+        let (token, generation) = {
+            let mut seeders = self.seeders.lock().unwrap();
+            // Replace a winding-down watcher: stop→start can overlap, and the
+            // stale one must never clear the new one's state (generation).
+            if let Some(old) = seeders.remove(id) {
+                old.token.cancel();
+            }
+            let token = CancellationToken::new();
+            let generation = self
+                .seed_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            seeders.insert(
+                id.to_string(),
+                SeedWatch {
+                    token: token.clone(),
+                    gen: generation,
+                },
+            );
+            (token, generation)
+        };
+
+        let this = Arc::clone(self);
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let session = match this.ensure_torrent_session().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "seeding watcher: no session");
+                    this.abort_seed_watch(&id, generation);
+                    return;
+                }
+            };
+            // Re-enable path: the torrent may be paused (global seeding was
+            // off) or absent after a session reset. Ensure it is live again,
+            // unless the task was removed while we were spawning.
+            {
+                let records = this.records.lock().unwrap();
+                if !records
+                    .iter()
+                    .any(|r| r.id == id && r.state == TaskState::Completed)
+                {
+                    drop(records);
+                    this.abort_seed_watch(&id, generation);
+                    return;
+                }
+            }
+            if let Err(e) = session.ensure(&cfg).await {
+                tracing::warn!(error = %e, "seeding watcher: torrent ensure failed");
+                this.abort_seed_watch(&id, generation);
+                return;
+            }
+            // librqbit's upload counter is per-session; the record keeps the
+            // lifetime total across restarts. Sample the baselines once.
+            let base_session = session.seed_stats(&hash).map(|s| s.uploaded).unwrap_or(0);
+            let base_lifetime = {
+                let records = this.records.lock().unwrap();
+                records
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.uploaded)
+                    .unwrap_or(0)
+            };
+            let started = Instant::now();
+            let mut last_persist = Instant::now();
+            let mut should_pause = false;
+
+            loop {
+                if token.is_cancelled() {
+                    // Pause sets seed_paused; a remove deletes the record.
+                    should_pause = this
+                        .records
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r.id == id)
+                        .map(|r| r.seed_paused)
+                        .unwrap_or(false);
+                    break;
+                }
+                let Some(stats) = session.seed_stats(&hash) else {
+                    break; // forgotten from the session
+                };
+                let uploaded = base_lifetime
+                    .saturating_add(stats.uploaded.saturating_sub(base_session));
+                let ratio = if downloaded > 0 {
+                    uploaded as f64 / downloaded as f64
+                } else {
+                    0.0
+                };
+                let ratio_limit = this.conf().seed_ratio();
+                let time_limit = this.conf().seed_time_min();
+                let elapsed_min = started.elapsed().as_secs_f64() / 60.0;
+                let limit_hit = (ratio_limit > 0.0 && ratio >= ratio_limit)
+                    || (time_limit > 0 && elapsed_min >= f64::from(time_limit));
+                // A restored torrent hash-checks first: `finished` is false
+                // for a few ticks, which is not a reason to stop. Only an
+                // explicit pause or a reached limit ends the watch.
+                let stop = limit_hit || stats.paused;
+                {
+                    let mut records = this.records.lock().unwrap();
+                    let Some(r) = records.iter_mut().find(|r| r.id == id) else {
+                        break;
+                    };
+                    if r.state != TaskState::Completed {
+                        should_pause = r.state == TaskState::Paused;
+                        break;
+                    }
+                    r.uploaded = uploaded;
+                    r.upload_bps = Some(stats.upload_bps);
+                    r.peers = stats.peers;
+                    r.seeding = !stop;
+                    if stop {
+                        r.seed_paused = true;
+                    }
+                    if last_persist.elapsed() >= Duration::from_secs(15) {
+                        let snapshot = records.clone();
+                        drop(records);
+                        let _ = this.persist(&snapshot);
+                        last_persist = Instant::now();
+                    }
+                }
+                if stop {
+                    should_pause = true;
+                    break;
+                }
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        should_pause = this
+                            .records
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|r| r.id == id)
+                            .map(|r| r.seed_paused)
+                            .unwrap_or(false);
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+            }
+
+            // Only the newest watcher may publish the exit state: stop→start
+            // can overlap, and a stale watcher must not clear the new one.
+            let current = this
+                .seeders
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|w| w.gen == generation)
+                .unwrap_or(false);
+            if current {
+                {
+                    let mut records = this.records.lock().unwrap();
+                    if let Some(r) = records.iter_mut().find(|r| r.id == id) {
+                        r.seeding = false;
+                        r.upload_bps = None;
+                        if should_pause {
+                            r.seed_paused = true;
+                        }
+                    }
+                    let snapshot = records.clone();
+                    drop(records);
+                    let _ = this.persist(&snapshot);
+                }
+                if should_pause {
+                    session.pause_by_hash(&hash).await;
+                }
+                forget_seed_watch(&this.seeders, &id, generation);
+            }
+        });
     }
 
     fn persist(&self, records: &[TaskRecord]) -> Result<()> {
@@ -214,6 +576,9 @@ impl Daemon {
         // Grace period so in-flight replies can flush, then drain.
         tokio::time::sleep(Duration::from_millis(200)).await;
         for (_, t) in self.runtime.lock().unwrap().drain() {
+            t.token.cancel();
+        }
+        for (_, t) in self.seeders.lock().unwrap().drain() {
             t.token.cancel();
         }
         let snapshot = self.records.lock().unwrap().clone();
@@ -468,6 +833,11 @@ impl Daemon {
             // A zero byte split denominator would kill the planner.
             return err("min_segment_size must be at least 1");
         }
+        if let Some(r) = settings.seed_ratio {
+            if !r.is_finite() || r < 0.0 {
+                return err("seed_ratio must be 0 (no limit) or positive");
+            }
+        }
         // Frontends may send 0 for "unlimited"; normalize before persisting.
         if settings.max_speed_bytes == Some(0) {
             settings.max_speed_bytes = None;
@@ -478,6 +848,7 @@ impl Daemon {
             return err(&format!("saving config failed: {e}"));
         }
         let old_max = self.conf().max_concurrent();
+        let seed_before = self.conf().seed_enabled();
         *self.config.lock().unwrap() = settings;
         let new_max = self.conf().max_concurrent();
         match new_max.checked_sub(old_max) {
@@ -497,6 +868,48 @@ impl Daemon {
             }
         }
         tracing::info!(%new_max, "settings updated");
+        // Applying the seeding toggle live: off = stop every watcher and
+        // pause the swarm sockets (details keep working); on = start serving
+        // finished torrents the user had not explicitly stopped.
+        if seed_before != self.conf().seed_enabled() {
+            if self.conf().seed_enabled() {
+                let ids: Vec<String> = {
+                    let records = self.records.lock().unwrap();
+                    records
+                        .iter()
+                        .filter(|r| {
+                            r.kind == TaskKind::Torrent
+                                && r.state == TaskState::Completed
+                                && !r.seed_paused
+                        })
+                        .map(|r| r.id.clone())
+                        .collect()
+                };
+                for id in ids {
+                    self.start_seeding(&id);
+                }
+            } else {
+                let ids: Vec<String> = self.seeders.lock().unwrap().keys().cloned().collect();
+                let hashes: Vec<String> = {
+                    let records = self.records.lock().unwrap();
+                    records
+                        .iter()
+                        .filter(|r| ids.contains(&r.id))
+                        .filter_map(|r| r.info_hash.clone())
+                        .collect()
+                };
+                for id in &ids {
+                    if let Some(t) = self.seeders.lock().unwrap().get(id).map(|w| w.token.clone()) {
+                        t.cancel();
+                    }
+                }
+                if let Some(session) = self.torrents.lock().await.as_ref() {
+                    for hash in hashes {
+                        session.pause_by_hash(&hash).await;
+                    }
+                }
+            }
+        }
         Response {
             id: req_id,
             reply: Reply::Config { settings: self.conf() },
@@ -597,6 +1010,11 @@ impl Daemon {
             torrent_name: None,
             sequential,
             only_files,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
         };
         {
             // One lock scope for the duplicate check AND the push: two
@@ -740,10 +1158,25 @@ impl Daemon {
         let tasks = records
             .iter()
             .map(|r| {
-                 let (downloaded, total, speed_bps, percent) = match progress.get(&r.id) {
-                    Some(t) => (t.last.downloaded, t.last.total, t.speed, t.last.percent),
-                    None => (r.downloaded, r.total, None, r.total.map(|_| 100.0)),
-                };
+                 let (downloaded, total, speed_bps, percent, uploaded, upload_bps) =
+                    match progress.get(&r.id) {
+                        Some(t) => (
+                            t.last.downloaded,
+                            t.last.total,
+                            t.speed,
+                            t.last.percent,
+                            t.last.uploaded.max(r.uploaded),
+                            r.upload_bps.or(t.last.upload_bps),
+                        ),
+                        None => (
+                            r.downloaded,
+                            r.total,
+                            None,
+                            r.total.map(|_| 100.0),
+                            r.uploaded,
+                            r.upload_bps,
+                        ),
+                    };
                 TaskInfo {
                     id: r.id.clone(),
                     url: r.url.clone(),
@@ -752,6 +1185,11 @@ impl Daemon {
                     downloaded,
                     total,
                     speed_bps,
+                    uploaded,
+                    upload_bps,
+                    seeding: r.seeding,
+                    seeding_stopped: r.seed_paused,
+                    peers: r.peers,
                     error: r.error.clone(),
                     start_at: r.start_at,
                     kind: r.kind,
@@ -771,6 +1209,28 @@ impl Daemon {
     }
 
     fn cmd_pause(self: &Arc<Self>, req_id: u64, id: &str) -> Response {
+        // A finished torrent may be seeding: stop the watcher and remember
+        // the user's choice so the next boot does not resume uploading.
+        let seed_token = self
+            .seeders
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|w| w.token.clone());
+        if let Some(t) = seed_token {
+            t.cancel();
+            let snapshot = {
+                let mut records = self.records.lock().unwrap();
+                if let Some(r) = records.iter_mut().find(|r| r.id == id) {
+                    r.seeding = false;
+                    r.seed_paused = true;
+                    r.upload_bps = None;
+                }
+                records.clone()
+            };
+            let _ = self.persist(&snapshot);
+            return Response { id: req_id, reply: Reply::Ok };
+        }
         let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
         match token {
             Some(t) => {
@@ -778,14 +1238,20 @@ impl Daemon {
                 Response { id: req_id, reply: Reply::Ok }
             }
             None => {
-                // Not running: pausing is a no-op success only if already paused.
-                let paused = self
+                // Not running: pausing is a no-op success only if already
+                // paused (or a finished torrent whose seeding is stopped).
+                let parked = self
                     .records
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|r| r.id == id && r.state == TaskState::Paused);
-                if paused {
+                    .any(|r| {
+                        r.id == id
+                            && (r.state == TaskState::Paused
+                                || (r.state == TaskState::Completed
+                                    && r.kind == TaskKind::Torrent))
+                    });
+                if parked {
                     Response { id: req_id, reply: Reply::Ok }
                 } else {
                     Response {
@@ -798,28 +1264,55 @@ impl Daemon {
     }
 
     fn cmd_resume(self: &Arc<Self>, req_id: u64, id: &str) -> Response {
-        let resumable = {
+        enum Resume {
+            Run(TaskRecord),
+            Seed,
+        }
+        let action = {
             let mut records = self.records.lock().unwrap();
             match records.iter_mut().find(|r| r.id == id) {
                 Some(r) if matches!(r.state, TaskState::Paused | TaskState::Failed) => {
                     r.state = TaskState::Queued;
                     r.error = None;
-                    Some(r.clone())
+                    Some(Resume::Run(r.clone()))
+                }
+                // Completed torrent: "resume" restarts seeding (the row's
+                // pause button used it to stop).
+                Some(r) if r.state == TaskState::Completed
+                    && r.kind == TaskKind::Torrent
+                    && r.info_hash.is_some() =>
+                {
+                    r.seed_paused = false;
+                    Some(Resume::Seed)
                 }
                 _ => None,
             }
         };
-        match resumable {
-            Some(rec) => {
+        match action {
+            Some(Resume::Run(rec)) => {
                 let snapshot = self.records.lock().unwrap().clone();
                 let _ = self.persist(&snapshot);
                 self.spawn_runner(rec);
                 Response { id: req_id, reply: Reply::Ok }
             }
+            Some(Resume::Seed) => {
+                if !self.conf().seed_enabled() {
+                    return Response {
+                        id: req_id,
+                        reply: Reply::Error {
+                            message: "seeding is disabled in Settings".into(),
+                        },
+                    };
+                }
+                let snapshot = self.records.lock().unwrap().clone();
+                let _ = self.persist(&snapshot);
+                self.start_seeding(id);
+                Response { id: req_id, reply: Reply::Ok }
+            }
             None => Response {
                 id: req_id,
                 reply: Reply::Error {
-                    message: format!("task {id} not resumable (missing, running, or completed)"),
+                    message: format!("task {id} not resumable (missing or running)"),
                 },
             },
         }
@@ -828,6 +1321,9 @@ impl Daemon {
     async fn cmd_remove(self: &Arc<Self>, req_id: u64, id: &str, delete_files: bool) -> Response {
         let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
         if let Some(t) = token {
+            t.cancel();
+        }
+        if let Some(t) = self.seeders.lock().unwrap().get(id).map(|w| w.token.clone()) {
             t.cancel();
         }
         let evicted = {
@@ -1065,7 +1561,15 @@ impl Daemon {
 
             this.runtime.lock().unwrap().remove(&rec.id);
             match result {
-                Ok(file) => this.set_completed(&rec.id, file),
+                Ok(file) => {
+                    this.set_completed(&rec.id, file);
+                    // Finished torrents keep serving the swarm (the handle
+                    // stays in the shared session). The watcher reports
+                    // upload stats until a seed limit/pause stops it.
+                    if rec.kind == TaskKind::Torrent {
+                        this.start_seeding(&rec.id);
+                    }
+                }
                 Err(Error::Cancelled) => this.set_state(&rec.id, TaskState::Paused, None),
                 Err(e) => this.set_state(&rec.id, TaskState::Failed, Some(e.to_string())),
             }
@@ -1129,7 +1633,7 @@ impl Daemon {
             .lock()
             .unwrap()
             .get(id)
-            .map(|t| (t.last.downloaded, t.last.total));
+            .map(|t| (t.last.downloaded, t.last.total, t.last.uploaded));
         {
             let mut records = self.records.lock().unwrap();
             match records.iter_mut().find(|r| r.id == id) {
@@ -1137,6 +1641,11 @@ impl Daemon {
                     r.state = TaskState::Completed;
                     r.error = None;
                     r.dest_file = file.clone();
+                    // Uploads served while the download was still running
+                    // are part of the lifetime total too.
+                    if let Some((_, _, uploaded)) = fallback {
+                        r.uploaded = r.uploaded.max(uploaded);
+                    }
                     if r.dest_file.is_some() {
                         match disk {
                             Some(n) => {
@@ -1147,7 +1656,7 @@ impl Daemon {
                             // is 0 there, so fall back to the last progress
                             // snapshot when the walk fails.
                             None => {
-                                if let Some((d, t)) = fallback {
+                                if let Some((d, t, _)) = fallback {
                                     r.downloaded = d;
                                     r.total = t;
                                 }
@@ -1309,6 +1818,11 @@ mod tests {
             total: None,
             info_hash: None,
             torrent_name: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
         }
     }
 
@@ -1430,6 +1944,11 @@ mod tests {
             total: Some(4),
             info_hash: None,
             torrent_name: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
         };
         let deleted = delete_artifacts(&rec);
 
@@ -1463,8 +1982,144 @@ mod tests {
             total: None,
             info_hash: None,
             torrent_name: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
         };
         assert!(delete_artifacts(&rec).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Boot restore is what makes completed torrents survive a daemon
+    // restart: the session is rebuilt from the queue (librqbit keeps no
+    // state), so Files/Peers/Trackers stay inspectable and seeding resumes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boot_restore_keeps_completed_torrents_seeding_and_inspectable() {
+        use librqbit::spawn_utils::BlockingSpawner;
+        use librqbit::CreateTorrentOptions;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ripdl-daemon-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let payload_dir = tmp.join("src");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        let data = vec![7u8; 400_000];
+        let payload = payload_dir.join("payload.bin");
+        std::fs::write(&payload, &data).unwrap();
+
+        let spawner = BlockingSpawner::new(2);
+        let tor = librqbit::create_torrent(
+            &payload,
+            CreateTorrentOptions {
+                name: Some("payload.bin".into()),
+                trackers: Vec::new(),
+                piece_length: Some(64 * 1024),
+            },
+            &spawner,
+        )
+        .await
+        .expect("create torrent");
+        let torfile = tmp.join("payload.torrent");
+        std::fs::write(&torfile, tor.as_bytes().expect("serialize")).unwrap();
+
+        let daemon = Arc::new(
+            Daemon::new(
+                tmp.join("queue.json"),
+                tmp.join("config.json"),
+                DaemonConfig::default(),
+            )
+            .unwrap(),
+        );
+        let session = daemon.ensure_torrent_session().await.unwrap();
+        let pv = session
+            .preview(torfile.to_str().unwrap())
+            .await
+            .expect("preview local torrent");
+
+        // Simulate the on-disk result of a finished task. ripdl's torrent
+        // root is `<dest>/<name>`; librqbit writes the single file inside it.
+        let dest = tmp.join("dest");
+        let root = dest.join("payload.bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("payload.bin"), &data).unwrap();
+        daemon.records.lock().unwrap().push(TaskRecord {
+            id: "tor".into(),
+            url: torfile.to_string_lossy().into_owned(),
+            dest_dir: Some(dest.clone()),
+            state: TaskState::Completed,
+            error: None,
+            headers: Default::default(),
+            start_at: None,
+            kind: TaskKind::Torrent,
+            sequential: false,
+            only_files: None,
+            dest_file: Some(root.clone()),
+            downloaded: data.len() as u64,
+            total: Some(data.len() as u64),
+            info_hash: Some(pv.info_hash.clone()),
+            torrent_name: Some("payload.bin".into()),
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
+        });
+
+        daemon.boot_restore_torrents().await;
+        assert!(
+            daemon
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == "tor")
+                .unwrap()
+                .seeding,
+            "restored completed torrent starts seeding"
+        );
+
+        // Details (files/peers/trackers) work without any runner alive.
+        let mut details = None;
+        for _ in 0..100 {
+            if let Ok(d) = session.details(&pv.info_hash) {
+                if d.finished {
+                    details = Some(d);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let d = details.expect("restored torrent reaches finished state");
+        assert_eq!(d.files.len(), 1, "file list visible after restore");
+        assert_eq!(d.total, data.len() as u64);
+        assert!(!d.paused, "seeding torrent is live");
+
+        // The row's pause/resume pair drives seeding without forgetting the
+        // torrent: stop = kept in the session (inspectable), resume = serve.
+        let _ = daemon.cmd_pause(1, "tor");
+        {
+            let records = daemon.records.lock().unwrap();
+            let r = records.iter().find(|r| r.id == "tor").unwrap();
+            assert!(!r.seeding && r.seed_paused, "pause stops seeding");
+        }
+        let _ = daemon.cmd_resume(2, "tor");
+        {
+            let records = daemon.records.lock().unwrap();
+            let r = records.iter().find(|r| r.id == "tor").unwrap();
+            assert!(r.seeding && !r.seed_paused, "resume seeds again");
+        }
+
+        for (_, t) in daemon.seeders.lock().unwrap().drain() {
+            t.token.cancel();
+        }
+        session.raw().stop().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
@@ -1484,6 +2139,13 @@ async fn real_main() -> Result<()> {
     let config = DaemonConfig::load(&config_path);
     let daemon = Arc::new(Daemon::new(queue_path, config_path, config).context("init daemon")?);
     daemon.boot_resume().context("resume queue")?;
+    // Re-attach completed/paused torrents in the background: this is what
+    // keeps finished torrents seeding and their files/peers/trackers
+    // inspectable after a daemon restart (librqbit keeps no state).
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { d.boot_restore_torrents().await });
+    }
     // Opt-in unattended updates; silent on failure (checked again next boot).
     if daemon.conf().update_check() && daemon.conf().update_auto_install() {
         let d = daemon.clone();

@@ -5146,6 +5146,7 @@ version = "0.3.7"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
+ "librqbit",
  "ripdl-core",
  "serde",
  "serde_json",

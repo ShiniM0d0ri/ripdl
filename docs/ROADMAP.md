@@ -93,8 +93,9 @@ M3.1 - core engine (`ripdl-core::torrent`):
 - [x] Pause = rqbit pause through the cancel token (piece state survives
       on disk), resume = re-ensure + unpause; completion = `finished`
 - [x] `TaskKind::Torrent`; boot-resume re-adds unfinished torrents from the
-      queue record (fresh session re-verifies existing data); completed
-      torrents stay records-only (no silent re-seeding)
+      queue record (fresh session re-verifies existing data); completed and
+      paused torrents are re-attached too (see M3.4), so details survive a
+      daemon restart
 
 M3.2 - daemon + CLI:
 - [x] Runner dispatch: torrent branch mirrors the HTTP branch (one runner per
@@ -154,6 +155,31 @@ M3.4 - tests / verification:
       hash-check and resume them)
 - [ ] Clean-room check: behavior parity notes only, no copying from
       qBittorrent/FDM code or assets; findings → docs/rea-findings.md
+
+M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
+- [x] Torrents restored into the shared session at daemon boot (completed
+      and paused; `only_files` replayed), so Files/Peers/Trackers keep
+      working after a restart - previously the session started empty and
+      Details errored with "torrent session not running"
+- [x] Persistent seeding: a finished torrent stays in the swarm; a daemon
+      watcher (no download semaphore slot) reports uploaded bytes, up rate
+      and connected peers into the task record once per 2 s
+- [x] Seeding limits: `seed_enabled` (default on), `seed_ratio` (default
+      1.0, 0 = unlimited), `seed_time_min` (default 0 = unlimited); limits
+      pause the swarm socket but keep the torrent inspectable
+- [x] Row: `seeding` state (teal up icon) with upload rate in the speed
+      cell; kind tooltip shows uploaded/ratio/peers; row + context-menu
+      toggle stops (pause) or restarts (resume) seeding
+- [x] Details dialog: summary shows uploaded/ratio/peers/up rate; all tabs
+      live after completion and after daemon restarts
+- [x] Lifetime uploaded persisted (rqbit's counter is per-session), so the
+      ratio survives restarts; stale live rates cleared at boot
+- [x] Settings dialog: seeding toggle, ratio and time limit; applying the
+      toggle stops/starts watchers live (no restart)
+- [x] Offline test: create torrent -> finished on-disk layout -> boot
+      restore -> finished details -> pause/resume seeding
+- [x] Clean-room qBittorrent options inventory (275 controls / 9 pages):
+      docs/qbittorrent-options.md + docs/rea-findings.md
 
 ## P4 - browser integration (the killer feature)
 
@@ -248,6 +274,9 @@ M3.4 - tests / verification:
       name cell, kind hint in the row tooltip, "Torrent details..." hidden for
       non-torrent rows, icon context menu (toggle retitled Pause/Resume per
       row); volatile cells now addressed by class so columns can't shift them
+- [x] Seeding UX: teal "seeding" row state with upload rate, Files/Peers/
+      Trackers stay available after completion and restarts, seed start/stop
+      from the row + context menu, ratio/time limits in Settings
 - [ ] Categories: per-category destination, queue slot, speed policy;
       auto-categorize on add (extension heuristic already exists)
 - [ ] Search, filter (status/kind/host), sort columns; multi-select batch

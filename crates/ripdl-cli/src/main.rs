@@ -136,7 +136,8 @@ enum Cmd {
         /// just show the current settings. Valid keys: max_concurrent,
         /// max_segments, min_segment_size, max_speed_bytes (0 = uncapped),
         /// default_download_dir, ytdlp_path, hide_to_tray, bond_interfaces,
-        /// update_check, update_auto_install (true|false).
+        /// update_check, update_auto_install, seed_enabled (true|false),
+        /// seed_ratio (0 = unlimited), seed_time_min (0 = never).
         #[arg(value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
@@ -343,6 +344,20 @@ async fn main() -> anyhow::Result<()> {
                         settings.update_auto_install =
                             Some(val.parse().context("update_auto_install needs true|false")?)
                     }
+                    "seed_enabled" => {
+                        settings.seed_enabled =
+                            Some(val.parse().context("seed_enabled needs true|false")?)
+                    }
+                    "seed_ratio" => {
+                        settings.seed_ratio =
+                            Some(val.parse().context("seed_ratio needs a number (0 = unlimited)")?)
+                    }
+                    "seed_time_min" => {
+                        settings.seed_time_min = Some(
+                            val.parse()
+                                .context("seed_time_min needs minutes (0 = never)")?,
+                        )
+                    }
                     other => bail!("unknown setting {other:?} (see: ripdl config --help)"),
                 }
             }
@@ -448,6 +463,9 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             println!("bond_interfaces:      {}", settings.bond_interfaces.unwrap_or(false));
             println!("update_check:         {}", settings.update_check.unwrap_or(true));
             println!("update_auto_install:  {}", settings.update_auto_install.unwrap_or(false));
+            println!("seed_enabled:         {}", settings.seed_enabled());
+            println!("seed_ratio:           {}", settings.seed_ratio());
+            println!("seed_time_min:        {}", settings.seed_time_min());
         }
         Reply::TorrentDetails { details } => {
             println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));
@@ -455,7 +473,30 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             if let Some(root) = &details.root {
                 println!("root: {}", root.display());
             }
-            println!("state: {} ({} B / {} B)", if details.finished { "finished" } else { "running" }, details.downloaded, details.total);
+            let phase = if details.finished {
+                if details.seeding { "seeding" } else { "finished" }
+            } else {
+                "running"
+            };
+            println!(
+                "state: {} ({} B / {} B){}",
+                phase,
+                details.downloaded,
+                details.total,
+                if details.paused { " [paused]" } else { "" }
+            );
+            let ratio = if details.downloaded > 0 {
+                details.uploaded as f64 / details.downloaded as f64
+            } else {
+                0.0
+            };
+            println!(
+                "uploaded: {} (ratio {:.2}) / {} peers / up {}",
+                humans(details.uploaded),
+                ratio,
+                details.peers_connected,
+                humans(details.upload_speed_bps as u64)
+            );
             if !details.trackers.is_empty() {
                 println!("trackers:");
                 for t in &details.trackers { println!("  {t}"); }
@@ -491,6 +532,9 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             let now = now_unix();
             for t in tasks {
                 let mut state = state_label(t.state).to_string();
+                if t.state == ripdl_core::TaskState::Completed && t.seeding {
+                    state = "seeding".to_string();
+                }
                 if let Some(start) = t.start_at {
                     if start > now && matches!(t.state, ripdl_core::TaskState::Queued) {
                         state = "timed".to_string();
@@ -509,10 +553,15 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                         None => humans(t.downloaded),
                     },
                 };
-                let speed = t
-                    .speed_bps
-                    .map(|s| format!("{}/s", humans(s as u64)))
-                    .unwrap_or_else(|| "-".to_string());
+                let speed = if t.state == ripdl_core::TaskState::Completed && t.seeding {
+                    t.upload_bps
+                        .map(|s| format!("\u{2191} {}/s", humans(s as u64)))
+                        .unwrap_or_else(|| "\u{2191} -".to_string())
+                } else {
+                    t.speed_bps
+                        .map(|s| format!("{}/s", humans(s as u64)))
+                        .unwrap_or_else(|| "-".to_string())
+                };
                 println!(
                     "{:<38} {:<10} {:>16} {:>12}",
                     t.id,

@@ -12,7 +12,7 @@ pub const DEFAULT_PORT: u16 = 5593;
 /// Shared with all frontends: CLI and GUI both send/receive this verbatim;
 /// the daemon persists it back unchanged (so frontend-only fields like
 /// `hide_to_tray` round-trip too).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
@@ -45,6 +45,17 @@ pub struct DaemonSettings {
     /// (`/VERYSILENT`; only the UAC prompt shows). Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_auto_install: Option<bool>,
+    /// Serve finished torrents back to the swarm. Default on (a torrent
+    /// client that never uploads is banned by most private trackers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_enabled: Option<bool>,
+    /// Stop seeding once uploaded/downloaded reaches this ratio. `0` means
+    /// no ratio limit. Default 1.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_ratio: Option<f64>,
+    /// Stop seeding after this many minutes (`0` = unlimited). Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_time_min: Option<u32>,
 }
 
 impl DaemonSettings {
@@ -117,6 +128,21 @@ impl DaemonSettings {
         self.update_auto_install.unwrap_or(false)
     }
 
+    /// Seeding on/off (default on).
+    pub fn seed_enabled(&self) -> bool {
+        self.seed_enabled.unwrap_or(true)
+    }
+
+    /// Stop at this share ratio; `0` disables the ratio limit (default 1.0).
+    pub fn seed_ratio(&self) -> f64 {
+        self.seed_ratio.unwrap_or(1.0).max(0.0)
+    }
+
+    /// Stop after this many minutes; `0` = no time limit (default 0).
+    pub fn seed_time_min(&self) -> u32 {
+        self.seed_time_min.unwrap_or(0)
+    }
+
     /// Apply a partial update: every `Some(x)` in `patch` wins; `None`
     /// leaves the current value untouched. Useful for CLI-style
     /// single-key edits on top of the live values.
@@ -150,6 +176,15 @@ impl DaemonSettings {
         }
         if patch.update_auto_install.is_some() {
             self.update_auto_install = patch.update_auto_install;
+        }
+        if patch.seed_enabled.is_some() {
+            self.seed_enabled = patch.seed_enabled;
+        }
+        if patch.seed_ratio.is_some() {
+            self.seed_ratio = patch.seed_ratio;
+        }
+        if patch.seed_time_min.is_some() {
+            self.seed_time_min = patch.seed_time_min;
         }
     }
 }
@@ -285,6 +320,21 @@ pub struct TaskInfo {
     pub total: Option<u64>,
     #[serde(default)]
     pub speed_bps: Option<f64>,
+    /// Torrent-only: lifetime bytes served to peers.
+    #[serde(default)]
+    pub uploaded: u64,
+    #[serde(default)]
+    pub upload_bps: Option<f64>,
+    /// Torrent-only: finished and currently serving the swarm.
+    #[serde(default)]
+    pub seeding: bool,
+    /// Torrent-only: seeding was stopped by the user or a limit (don't
+    /// auto-resume on the next boot).
+    #[serde(default)]
+    pub seeding_stopped: bool,
+    /// Torrent-only: connected peers (last sample).
+    #[serde(default)]
+    pub peers: u32,
     #[serde(default)]
     pub error: Option<String>,
     /// Unix seconds when the task may start (None = immediately).

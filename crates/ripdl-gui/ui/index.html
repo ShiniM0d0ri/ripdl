@@ -224,6 +224,11 @@
         <div class="set-row"><label for="set-tray">Minimize to tray on close</label><input id="set-tray" type="checkbox" class="chk-box" /></div>
         <div class="set-row"><label for="set-bond">Combine network connections (bond all NICs)</label><input id="set-bond" type="checkbox" class="chk-box" /></div>
 
+        <div class="set-sec">Torrents</div>
+        <div class="set-row"><label for="set-seed" title="Finished torrents stay in the swarm and upload to peers (files/peers stay visible in Details).">Seed finished torrents</label><input id="set-seed" type="checkbox" class="chk-box" /></div>
+        <div class="set-row"><label for="set-ratio" title="Stop seeding once uploaded/downloaded reaches this value. 0 = no ratio limit.">Stop seeding at ratio</label><input id="set-ratio" type="number" min="0" step="0.1" /></div>
+        <div class="set-row"><label for="set-seedtime" title="Stop seeding after this many minutes. 0 = never stop on time.">Stop seeding after (minutes)</label><input id="set-seedtime" type="number" min="0" step="1" /></div>
+
         <div class="set-row"><label for="set-update">Check for updates at startup</label><input id="set-update" type="checkbox" class="chk-box" /></div>
 
         <div class="set-row"><label for="set-auto" title="When a startup check finds a newer release: download the SHA256-verified installer and run it unattended (only the UAC prompt shows)">Download &amp; install updates automatically</label><input id="set-auto" type="checkbox" class="chk-box" /></div>

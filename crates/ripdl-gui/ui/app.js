@@ -122,6 +122,10 @@ function detailsTitle(t) {
     lines.push(`${k.label}: ${t.url || ""}`);
     if (t.dest_dir) lines.push("Location: " + t.dest_dir);
     if (t.info_hash) lines.push("Info-hash: " + t.info_hash);
+    if (t.kind === "torrent" && (t.uploaded > 0 || t.seeding)) {
+        const ratio = t.downloaded > 0 ? (t.uploaded / t.downloaded).toFixed(2) : "0.00";
+        lines.push(`Uploaded: ${humans(t.uploaded)} (ratio ${ratio}) \u00b7 ${t.peers || 0} peers`);
+    }
     if (t.error) { lines.push("Error: " + t.error); const h = errorHint(t.error); if (h) lines.push(h); }
     return lines.join("\n");
 }
@@ -144,10 +148,20 @@ function humans(bytes) {
 
 function stateLabel(t) {
     if (t.state === "queued" && t.start_at && t.start_at * 1000 > Date.now()) return "timed";
+    // Finished torrent still serving the swarm: distinct row label + icon.
+    if (t.state === "completed" && t.seeding) return "seeding";
     if (t.state === "running" && t.kind === "video") return "hunt";
     // Torrent still fetching metadata: no bytes and no total yet.
     if (t.state === "running" && t.kind === "torrent" && !t.total) return "metadata";
     return t.state;
+}
+
+// Speed cell: download rate while moving, upload rate while seeding.
+function speedText(t) {
+    if (t.state === "completed" && t.seeding) {
+        return t.upload_bps ? `\u2191 ${humans(t.upload_bps)}/s` : "\u2191 -";
+    }
+    return t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
 }
 
 function percentOf(t) {
@@ -266,7 +280,7 @@ function refreshVolatile(t) {
     };
     set(".size-cell", sizeText(t));
     set(".eta-cell", etaOf(t) || "-");
-    set(".speed-cell", t.speed_bps ? `${humans(t.speed_bps)}/s` : "-");
+    set(".speed-cell", speedText(t));
     const pct = percentOf(t);
     if (pct == null) return; // pc-less layout is structural (no-total cases)
     const fill = tr.querySelector(".prog-fill");
@@ -308,7 +322,7 @@ function render() {
             : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${pctText(pct, state)}%</span>`;
         const size = sizeText(t);
         const eta = etaOf(t) || "-";
-        const speed = t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
+        const speed = speedText(t);
         const dir = t.dest_dir ? t.dest_dir.replace(/[\\/]+$/, "") : "";
         const cls = t.id === selectedId ? ' class="selected"' : "";
         return `<tr${cls} data-id="${t.id}">
@@ -379,11 +393,16 @@ function renderKeepSelection() { render(); }
 function actionButtons(t) {
     const idAttr = `data-id="${t.id}"`;
     const running = ["running", "queued"].includes(t.state);
-    // Completed rows have nothing to pause/resume.
-    const stop = t.state === "completed" ? "" : `
-      <button class="row-btn" ${idAttr} data-act="toggle" title="${running ? "Pause" : "Resume"}">
-        ${ico(running ? "pause" : "play")}
-      </button>`;
+    // Completed torrents keep a seed toggle: pause stops serving the swarm,
+    // play restarts it. Other completed rows have nothing to pause/resume.
+    const seedable = t.state === "completed" && t.kind === "torrent";
+    const showStop = running || seedable;
+    const stop = showStop ? `
+      <button class="row-btn" ${idAttr} data-act="toggle" title="${
+        seedable ? (t.seeding ? "Stop seeding" : "Start seeding") : (running ? "Pause" : "Resume")
+      }">
+        ${ico(running || (seedable && t.seeding) ? "pause" : "play")}
+      </button>` : "";
     const openFile = t.state === "completed" ? `
       <button class="row-btn" ${idAttr} data-act="openFile" title="Open file">${ico("file")}</button>` : "";
     const open = `
@@ -398,16 +417,19 @@ function escapeHtml(s) {
 }
 
 function showCtx(x, y) {
-    // Retitle the toggle per task (Pause vs Resume) and hide entries that do
-    // not apply: completed rows have nothing to toggle; only torrent rows
-    // have a details view.
+    // Retitle the toggle per task (Pause/Resume vs seed start/stop) and hide
+    // entries that do not apply: only torrent rows have a details view.
     const t = selectedId ? findTask(selectedId) : null;
     const running = !!t && ["running", "queued"].includes(t.state);
+    const seedable = !!t && t.state === "completed" && t.kind === "torrent";
+    const stopping = running || (seedable && t.seeding);
     const toggle = $("#ctx [data-act=toggle]");
     const useEl = $("#ctx-toggle-ico use");
-    if (useEl) useEl.setAttribute("href", running ? "#i-pause" : "#i-play");
-    $("#ctx-toggle-lbl").textContent = running ? "Pause" : "Resume";
-    toggle.classList.toggle("hidden", !!t && t.state === "completed");
+    if (useEl) useEl.setAttribute("href", stopping ? "#i-pause" : "#i-play");
+    $("#ctx-toggle-lbl").textContent = seedable
+        ? (t.seeding ? "Stop seeding" : "Start seeding")
+        : (running ? "Pause" : "Resume");
+    toggle.classList.toggle("hidden", !!t && t.state === "completed" && t.kind !== "torrent");
     $("#ctx .ctx-torrent").classList.toggle("hidden", !t || t.kind !== "torrent");
 
     const menu = $("#ctx");
@@ -445,7 +467,8 @@ async function doTaskAction(act, id) {
             const dir = t.dest_file.replace(/[^\\/]+$/, "");
             await invokeSafe("open_path", { path: dir, reveal: baseName(t.dest_file) });
         } else if (act === "toggle") {
-            const cmd = ["running", "queued"].includes(t.state) ? "pause_task" : "resume_task";
+            const active = ["running", "queued"].includes(t.state) || (t.state === "completed" && t.seeding);
+            const cmd = active ? "pause_task" : "resume_task";
             await invokeSafe(cmd, { id });
         }
         selectedId = id;
@@ -876,6 +899,9 @@ async function openSettings() {
     $("#set-bond").checked = false;
     $("#set-update").checked = true;
     $("#set-auto").checked = false;
+    $("#set-seed").checked = true;
+    $("#set-ratio").value = "1";
+    $("#set-seedtime").value = "0";
     try {
         const s = await invokeSafe("get_config");
         $("#set-conc").value = s.max_concurrent ?? "";
@@ -888,6 +914,10 @@ async function openSettings() {
         $("#set-bond").checked = s.bond_interfaces ?? false;
         $("#set-update").checked = s.update_check ?? true;
         $("#set-auto").checked = s.update_auto_install ?? false;
+        // serde skips None on the wire: absent = built-in default.
+        $("#set-seed").checked = s.seed_enabled ?? true;
+        $("#set-ratio").value = s.seed_ratio ?? "1";
+        $("#set-seedtime").value = s.seed_time_min ?? "0";
         $("#set-backdrop").classList.remove("hidden");
         $("#set-conc").focus();
     } catch (e) {
@@ -920,6 +950,10 @@ async function saveSettings() {
     if (segs !== undefined && segs < 1) return reject("max segments must be at least 1");
     if (minseg !== undefined && minseg < 1) return reject("min segment size must be at least 1");
     const dir = $("#set-dir").value.trim();
+    const ratio = num($("#set-ratio"));
+    const seedTime = num($("#set-seedtime"));
+    if (Number.isNaN(ratio) || ratio < 0) return reject("seed ratio must be 0 (no limit) or positive");
+    if (Number.isNaN(seedTime) || seedTime < 0) return reject("seed time must be 0 (never) or positive minutes");
     // Full-replace semantics: cleared fields become absent -> daemon defaults.
     const payload = {
         max_concurrent: conc,
@@ -932,6 +966,9 @@ async function saveSettings() {
         bond_interfaces: $("#set-bond").checked,
         update_check: $("#set-update").checked,
         update_auto_install: $("#set-auto").checked,
+        seed_enabled: $("#set-seed").checked,
+        seed_ratio: ratio,
+        seed_time_min: seedTime === undefined ? undefined : Math.round(seedTime),
     };
     try {
         await invokeSafe("set_config", { settings: payload });
@@ -1068,6 +1105,7 @@ async function refreshDetails() {
     } catch (e) {
         $("#tdg-body").innerHTML = `<div class="trk-off">${escapeHtml(String(e).replace(/^.*error: /, ""))}</div>`;
         $("#tdg-apply").classList.add("hidden");
+        filesRenderKey = ""; // next success must repaint, not patch a missing table
         lastDetails = null;
         return;
     } finally {
@@ -1076,9 +1114,13 @@ async function refreshDetails() {
     const name = (t && t.name) || d.name || "(unknown)";
     $("#tdg-name").textContent = name;
     const pct = d.total > 0 ? ((d.downloaded / d.total) * 100).toFixed(1) : "0";
+    const ratio = d.downloaded > 0 ? d.uploaded / d.downloaded : 0;
+    const upRate = d.upload_speed_bps > 0 ? `${humans(d.upload_speed_bps)}/s` : "0 B/s";
+    const phase = d.paused ? "paused" : d.finished ? (d.seeding ? "seeding" : "finished") : "running";
     $("#tdg-summary").textContent =
-        `${pct}% / ${humans(d.downloaded)} / ${humans(d.total)} / ${d.finished ? "finished" : d.paused ? "paused" : "running"}` +
+        `${pct}% / ${humans(d.downloaded)} / ${humans(d.total)} / ${phase}` +
         (t && t.sequential ? " / sequential" : "") +
+        `\n\u2191 ${humans(d.uploaded)} (ratio ${ratio.toFixed(2)}) \u00b7 ${d.peers_connected} peers \u00b7 ${upRate}` +
         `\n${d.info_hash}` +
         (d.root ? `\n${d.root}` : "");
     lastDetails = d;

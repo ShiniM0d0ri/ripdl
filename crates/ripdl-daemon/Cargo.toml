@@ -20,3 +20,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 dirs = "6"
+
+[dev-dependencies]
+# Restore/seeding tests create a real .torrent fixture offline.
+librqbit = { version = "9", default-features = false, features = ["default-tls"] }

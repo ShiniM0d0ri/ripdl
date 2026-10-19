@@ -102,9 +102,35 @@ pub struct TorrentDetailsSnapshot {
     pub downloaded: u64,
     pub finished: bool,
     pub paused: bool,
+    /// Lifetime bytes served to peers (rqbit's counter for this session).
+    #[serde(default)]
+    pub uploaded: u64,
+    #[serde(default)]
+    pub upload_speed_bps: f64,
+    #[serde(default)]
+    pub download_speed_bps: f64,
+    /// Peers currently connected (rqbit "live" peer count).
+    #[serde(default)]
+    pub peers_connected: u32,
+    /// Finished and not paused: this torrent is being served to the swarm.
+    #[serde(default)]
+    pub seeding: bool,
     pub files: Vec<TorrentFileSnapshot>,
     pub peers: Vec<TorrentPeerSnapshot>,
     pub trackers: Vec<String>,
+}
+
+/// Lightweight live sample for the daemon's seeding watcher (cheaper than
+/// the full details snapshot: no file walk, no peer table).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TorrentSeedStats {
+    /// rqbit's uploaded counter since this session added the torrent.
+    pub uploaded: u64,
+    pub upload_bps: f64,
+    pub download_bps: f64,
+    pub peers: u32,
+    pub finished: bool,
+    pub paused: bool,
 }
 
 /// One row of the pre-add file list (qB-style file picking before the
@@ -444,6 +470,34 @@ impl TorrentSession {
         })
     }
 
+    /// Live swarm sample for the seeding watcher: rqbit's session upload
+    /// counter, instantaneous up/down rates and the connected peer count.
+    /// `None` when the torrent is not (or no longer) managed.
+    pub fn seed_stats(&self, info_hash_hex: &str) -> Option<TorrentSeedStats> {
+        let handle = self.find(info_hash_hex)?;
+        let st = handle.stats();
+        let live = st.live.as_ref();
+        let paused = matches!(st.state, TorrentStatsState::Paused);
+        Some(TorrentSeedStats {
+            uploaded: st.uploaded_bytes,
+            upload_bps: live.map(|l| l.upload_speed.as_bytes() as f64).unwrap_or(0.0),
+            download_bps: live
+                .map(|l| l.download_speed.as_bytes() as f64)
+                .unwrap_or(0.0),
+            peers: live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
+            finished: st.finished,
+            paused,
+        })
+    }
+
+    /// Pause by info-hash (boot restore and the seeding watcher act on
+    /// hashes, while the download loop holds a handle).
+    pub async fn pause_by_hash(&self, info_hash_hex: &str) {
+        if let Some(h) = self.find(info_hash_hex) {
+            self.pause(&h).await;
+        }
+    }
+
     /// Snapshot hash of every managed torrent, keyed by info-hash. Frontends
     /// match these against their records.
     pub fn list_torrents(&self) -> Vec<String> {
@@ -467,6 +521,8 @@ impl TorrentSession {
         })?;
 
         let st = handle.stats();
+        let live = st.live.as_ref();
+        let paused = matches!(st.state, TorrentStatsState::Paused);
         let mut snapshot = TorrentDetailsSnapshot {
             info_hash: handle.info_hash().as_string(),
             name: handle.name(),
@@ -474,7 +530,14 @@ impl TorrentSession {
             total: st.total_bytes,
             downloaded: st.progress_bytes,
             finished: st.finished,
-            paused: matches!(st.state, TorrentStatsState::Paused),
+            paused,
+            uploaded: st.uploaded_bytes,
+            upload_speed_bps: live.map(|l| l.upload_speed.as_bytes() as f64).unwrap_or(0.0),
+            download_speed_bps: live
+                .map(|l| l.download_speed.as_bytes() as f64)
+                .unwrap_or(0.0),
+            peers_connected: live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
+            seeding: st.finished && !paused,
             files: Vec::new(),
             peers: Vec::new(),
             trackers: {
@@ -736,6 +799,7 @@ fn handle_name_guess(st: &TorrentStats) -> bool {
 
 fn emit(id: &str, st: &TorrentStats, on_progress: &mut impl FnMut(Progress)) {
     let speed = st.live.as_ref().map(|l| l.download_speed.as_bytes() as f64);
+    let upload = st.live.as_ref().map(|l| l.upload_speed.as_bytes() as f64);
     // percent left to None: bytes + total drive the bar, and the daemon's
     // percent branch would otherwise clear its derived speed.
     on_progress(Progress {
@@ -744,6 +808,11 @@ fn emit(id: &str, st: &TorrentStats, on_progress: &mut impl FnMut(Progress)) {
         total: Some(st.total_bytes),
         percent: None,
         speed_bps: speed,
+        uploaded: st.uploaded_bytes,
+        upload_bps: upload,
+        // A finished torrent is already being served while the loop emits
+        // its final sample; the daemon's seeding watcher takes over after.
+        seeding: st.finished,
     });
 }
 
@@ -878,6 +947,19 @@ mod tests {
             seen.load(std::sync::atomic::Ordering::Relaxed) >= data.len() as u64,
             "progress reported live bytes"
         );
+
+        // After completion the handle must stay in the session: this is what
+        // powers post-download Files/Peers details and seeding after a
+        // daemon restart (boot restore re-adds it).
+        let stats = leech
+            .seed_stats(&out.info_hash)
+            .expect("finished torrent stays managed");
+        assert!(stats.finished, "leech is finished and seedable");
+        assert!(!stats.paused, "finished torrents are not auto-paused");
+        let details = leech.details(&out.info_hash).expect("details survive completion");
+        assert_eq!(details.total, data.len() as u64);
+        assert_eq!(details.files.len(), 1, "file list still available");
+        assert!(details.seeding, "details report the seeding phase");
 
         seed_session.stop().await;
         let _ = std::fs::remove_dir_all(&tmp);

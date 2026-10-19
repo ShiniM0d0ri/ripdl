@@ -127,7 +127,7 @@ completing on disk; `rm --files` now drains the runner before the path
 sweep so the pause path can no longer resurrect a sidecar after deletion
 (fix in `cmd_remove`, daemon). Media-URL offer rows and activeTab-granted
 page reads remain user-confirmable only in a real browser session.
-50 tests pass offline (`cargo test --workspace`), including an in-proc
+103 tests pass offline (`cargo test --workspace`), including an in-proc
 seeder↔leecher torrent round-trip.
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
 with native browse, per-row location display, open file/folder via Explorer
@@ -214,6 +214,18 @@ two-phase for torrent payloads (metadata wait → inline file checklist →
 add checked files); librqbit honors add-time `only_files`, but selecting a
 file whose first piece overlaps unselected files drags their bytes of that
 piece along (same as any client — do not "fix").
+Seeding + post-download visibility landed (2026-10-19): daemon boot re-adds
+completed/paused torrents into the shared session (previously it started empty,
+so Files/Peers/Trackers failed with "torrent session not running" after every
+restart). Finished torrents keep seeding; a per-task watcher (no download
+semaphore slot) samples uploaded/up-rate/peers every 2 s, persists lifetime
+uploaded (rqbit counters are per-session), and stops at `seed_ratio` (default
+1.0; 0 = unlimited) / `seed_time_min` (0 = never) or on pause. Config keys:
+`seed_enabled`/`seed_ratio`/`seed_time_min` (GUI Settings + CLI `config`);
+row/context toggle starts/stops seeding (pause keeps the torrent inspectable).
+GUI shows a teal "seeding" state with ↑ rate; details summary adds
+uploaded/ratio/peers; qBittorrent clean-room options inventory lives at
+`docs/qbittorrent-options.md` (275 controls across 9 pages).
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap,

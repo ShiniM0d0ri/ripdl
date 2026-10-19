@@ -295,6 +295,7 @@ impl Engine {
                             total: meta_task.total,
                             percent: None,
                             speed_bps: None,
+                            ..Progress::default()
                         });
                         break;
                     }
@@ -327,6 +328,7 @@ impl Engine {
                         total: meta_task.total,
                         percent: None,
                         speed_bps: None,
+                        ..Progress::default()
                     });
                 }
             })
