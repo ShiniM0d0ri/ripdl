@@ -94,7 +94,13 @@ async fn list_tasks() -> Result<Vec<TaskInfo>, String> {
 /// Queue a URL. `dest_dir` overrides the location entirely (the Add dialog
 /// passes an explicit user choice); otherwise category rules apply.
 #[tauri::command]
-async fn add_task(url: String, category: Option<String>, dest_dir: Option<String>, sequential: Option<bool>) -> Result<String, String> {
+async fn add_task(
+    url: String,
+    category: Option<String>,
+    dest_dir: Option<String>,
+    sequential: Option<bool>,
+    only_files: Option<Vec<usize>>,
+) -> Result<String, String> {
     let dest = match dest_dir {
         Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
         _ => {
@@ -118,10 +124,21 @@ async fn add_task(url: String, category: Option<String>, dest_dir: Option<String
         start_at: None,
         kind,
         sequential: sequential.unwrap_or(false),
+        only_files,
     })
     .await?
     {
         Reply::Added { id } => Ok(id),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+/// Pre-add torrent preview for the Add dialog (qB-style file list before
+/// queuing). Magnets resolve over the swarm and can take a while.
+#[tauri::command]
+async fn torrent_preview(payload: String) -> Result<ripdl_core::torrent::TorrentPreviewSnapshot, String> {
+    match rpc(Command::TorrentPreview { payload }).await? {
+        Reply::TorrentPreview { preview } => Ok(preview),
         other => Err(format!("unexpected daemon reply: {other:?}")),
     }
 }
@@ -141,6 +158,7 @@ async fn add_video_task(url: String, dest_dir: Option<String>) -> Result<String,
         start_at: None,
         kind: TaskKind::Video,
         sequential: false,
+        only_files: None,
     })
     .await?
     {
@@ -373,6 +391,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_tasks,
             add_task,
+            torrent_preview,
             add_video_task,
             pause_task,
             resume_task,

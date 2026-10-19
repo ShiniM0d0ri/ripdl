@@ -183,6 +183,16 @@ pub enum Command {
         /// Torrent-only: fetch pieces front-to-back (streaming order).
         #[serde(default)]
         sequential: bool,
+        /// Torrent-only: fetch only these file indices (None = everything).
+        /// Comes from the Add dialog's pre-add file checklist.
+        #[serde(default)]
+        only_files: Option<Vec<usize>>,
+    },
+    /// Pre-add torrent preview: resolve metadata + file list WITHOUT
+    /// queueing anything. May take a while for magnets (swarm metadata
+    /// fetch, same as qBittorrent's "Retrieving metadata").
+    TorrentPreview {
+        payload: String,
     },
     /// Details for one task's torrent: files/peers/trackers snapshot.
     /// Errors if the task is not a torrent or the session lost it.
@@ -242,6 +252,10 @@ pub enum Reply {
     },
     TorrentDetails {
         details: crate::torrent::TorrentDetailsSnapshot,
+    },
+    /// Result of a `TorrentPreview`.
+    TorrentPreview {
+        preview: crate::torrent::TorrentPreviewSnapshot,
     },
     /// Current daemon-wide settings.
     Config {

@@ -107,6 +107,28 @@ pub struct TorrentDetailsSnapshot {
     pub trackers: Vec<String>,
 }
 
+/// One row of the pre-add file list (qB-style file picking before the
+/// torrent is queued).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentPreviewFile {
+    /// Relative path inside the task root.
+    pub name: String,
+    pub size: u64,
+}
+
+/// The Add-dialog preview: identity + full file list of a torrent payload,
+/// resolved *before* the task exists. `.torrent` payloads parse offline in
+/// milliseconds; magnets resolve over the swarm (the same wait qBittorrent
+/// shows as "Retrieving metadata"), so callers should surface an
+/// in-flight state and tolerate long / failing waits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentPreviewSnapshot {
+    pub info_hash: String,
+    pub name: Option<String>,
+    pub files: Vec<TorrentPreviewFile>,
+    pub total: u64,
+}
+
 /// Does a user-supplied payload look like a torrent (auto-detection for
 /// `add`, GUI and bridge routing)? Pure string/path heuristics by design:
 /// no network, no file reads.
@@ -509,6 +531,42 @@ impl TorrentSession {
 
         Ok(snapshot)
     }
+
+    /// qB-style pre-add preview: resolve a payload's metadata and file list
+    /// WITHOUT managing the torrent (rqbit `list_only`). `.torrent` payloads
+    /// (disk or URL) parse offline in milliseconds; magnets spend as long
+    /// as the swarm needs - the same wait qBittorrent shows in its add
+    /// dialog. The session is reusable: list-only adds never touch the
+    /// managed db, so previewing can't corrupt or hijack real tasks.
+    pub async fn preview(&self, payload: &str) -> Result<TorrentPreviewSnapshot> {
+        let (add, name) = resolve_payload(payload).await?;
+        let opts = AddTorrentOptions {
+            list_only: true,
+            ..AddTorrentOptions::default()
+        };
+        match self.session.add_torrent(add, Some(opts)).await? {
+            AddTorrentResponse::ListOnly(list) => {
+                let files: Vec<TorrentPreviewFile> = list
+                    .info
+                    .iter_file_details()
+                    .map(|d| TorrentPreviewFile {
+                        name: d.filename.to_string(),
+                        size: d.len,
+                    })
+                    .collect();
+                let total = files.iter().map(|f| f.size).sum();
+                Ok(TorrentPreviewSnapshot {
+                    info_hash: list.info_hash.as_string(),
+                    name,
+                    files,
+                    total,
+                })
+            }
+            _ => Err(Error::State(
+                "list-only torrent add unexpectedly managed a torrent".into(),
+            )),
+        }
+    }
 }
 
 /// Full run loop for one task: ensure -> sample stats every second ->
@@ -825,9 +883,186 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // Pre-add preview: a local .torrent resolves offline (no swarm), with
+    // the full file list and never touching the managed db.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preview_local_torrent_offline() {
+        use librqbit::spawn_utils::BlockingSpawner;
+        use librqbit::CreateTorrentOptions;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ripdl-prevtest-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Two files inside one folder = multi-file metainfo.
+        let d = tmp.join("dir");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.bin"), vec![1u8; 1_000_000]).unwrap();
+        std::fs::write(d.join("b.bin"), vec![2u8; 500_000]).unwrap();
+
+        let spawner = BlockingSpawner::new(2);
+        let tor = librqbit::create_torrent(
+            &d,
+            CreateTorrentOptions {
+                name: Some("dir".into()),
+                trackers: Vec::new(),
+                piece_length: Some(16 * 1024),
+            },
+            &spawner,
+        )
+        .await
+        .expect("create torrent");
+        let bytes: Vec<u8> = tor.as_bytes().expect("serialize").to_vec();
+        let torfile = tmp.join("dir.torrent");
+        std::fs::write(&torfile, &bytes).unwrap();
+
+        let session = TorrentSession::new(tmp.join("unused"), None).await.unwrap();
+        let pv = session
+            .preview(torfile.to_str().unwrap())
+            .await
+            .expect("preview");
+        assert_eq!(pv.files.len(), 2);
+        assert_eq!(pv.total, 1_500_000);
+        assert_eq!(pv.info_hash.len(), 40);
+        assert!(pv.name.as_deref() == Some("dir"), "name: {:?}", pv.name);
+        let names: Vec<String> = pv
+            .files
+            .iter()
+            .map(|f| f.name.replace('\\', "/"))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("a.bin")) && names.iter().any(|n| n.contains("b.bin")),
+            "file paths: {names:?}"
+        );
+
+        // Preview must not have managed anything.
+        assert!(
+            session.list_torrents().is_empty(),
+            "list-only add leaked a managed torrent"
+        );
+
+        // TorrentSession has no explicit stop; drop is fine for a test.
+        drop(session);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    // Pre-add selection: only_files=[1] must keep file 0 empty on disk
+    // (zero bytes) while file 1 round-trips fully. Loopback-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_only_files_restriction() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info,librqbit=debug"))
+            .with_test_writer()
+            .try_init()
+            .ok();
+        use librqbit::spawn_utils::BlockingSpawner;
+        use librqbit::CreateTorrentOptions;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ripdl-onlyfiles-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Two 512 KiB files inside one folder.
+        let d = tmp.join("fpair");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f0.bin"), vec![0xAA; 512 * 1024]).unwrap();
+        std::fs::write(d.join("f1.bin"), vec![0xBB; 512 * 1024]).unwrap();
+
+        let spawner = BlockingSpawner::new(2);
+        let tor = librqbit::create_torrent(
+            &d,
+            CreateTorrentOptions {
+                name: Some("fpair".into()),
+                trackers: Vec::new(),
+                piece_length: Some(64 * 1024),
+            },
+            &spawner,
+        )
+        .await
+        .expect("create torrent");
+        let bytes: Vec<u8> = tor.as_bytes().expect("serialize").to_vec();
+        let torfile = tmp.join("fpair.torrent");
+        std::fs::write(&torfile, &bytes).unwrap();
+
+        // Seeder as a plain rqbit session (exact loopback hygiene like the
+        // roundtrip test below).
+        let seed_opts = librqbit::SessionOptions {
+            dht: Some(librqbit::DhtSessionConfig {
+                bootstrap_addrs: None,
+                port: Some(0),
+                persistence: None,
+            }),
+            listen: Some(librqbit::ListenerOptions {
+                listen_addr: "[::]:0".parse().unwrap(),
+                ..librqbit::ListenerOptions::default()
+            }),
+            ..librqbit::SessionOptions::default()
+        };
+        let seed_session = Session::new_with_opts(tmp.join("seed-default"), seed_opts).await.unwrap();
+        seed_session
+            .create_and_serve_torrent(
+                &d,
+                CreateTorrentOptions {
+                    name: Some("fpair".into()),
+                    trackers: Vec::new(),
+                    piece_length: Some(64 * 1024),
+                },
+            )
+            .await
+            .expect("seed");
+
+        // Leech with only file 1 selected: file 0 must stay zero-filled.
+        let leech = TorrentSession::new(
+            tmp.join("leech-default"),
+            Some(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]),
+        )
+        .await
+        .unwrap();
+        let dest = tmp.join("leech");
+        let cfg = TorrentConfig {
+            id: "only-1".into(),
+            payload: torfile.to_string_lossy().into_owned(),
+            dest_dir: dest.clone(),
+            only_files: Some(vec![1]),
+            sequential: false,
+        };
+        let token = CancellationToken::new();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen2 = seen.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            crate::torrent::download(&leech, &cfg, &token, move |p| {
+                use std::sync::atomic::Ordering::Relaxed;
+                seen2.store(p.downloaded, Relaxed);
+            }, |_| {}),
+        )
+        .await
+        .expect("download finished in time")
+        .expect("download ok");
+
+        let root = dest.join("fpair");
+        assert_eq!(std::fs::read(root.join("f1.bin")).unwrap(), vec![0xBB; 512 * 1024], "selected file round-trips");
+        // Unselected file: rqbit doesn't even materialize it — absent or
+        // empty is success, anything non-zero means the picker leaked.
+        let f0 = std::fs::read(root.join("f0.bin")).unwrap_or_default();
+        assert!(
+            f0.iter().all(|b| *b == 0),
+            "unselected file must stay untouched, nonzero bytes: {}",
+            f0.iter().filter(|b| **b != 0).count()
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+        let _ = (f0, seen, seed_session);
+    }
+
     #[test]
-    fn magnet_info_hash_hex_and_base32() {
-        assert_eq!(
+    fn magnet_info_hash_hex_and_base32() {        assert_eq!(
             magnet_info_hash(
                 "magnet:?xt=urn:btih:08ADA5A7A6183AAE1E09D831DF6748D566095A10&dn=Sintel"
             )

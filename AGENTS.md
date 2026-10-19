@@ -167,7 +167,15 @@ remaining P3: none beyond backlog items below. Torrent NIC bonding landed
 outgoing peer connection to a rotating local uplink address (vendored
 `SessionOptions::bind_ips`); listener/DHT/uTP stay OS-routed; session-wide —
 created once, so a setting change needs a daemon restart (per-task `--bond`
-stays HTTP-only).
+stays HTTP-only). Pre-add file selection landed (2026-10-19, qB-style):
+`TorrentSession::preview` via rqbit `list_only` (RPC `TorrentPreview`),
+`Add.only_files` end-to-end (CLI `add --only 0,2-4`), GUI Add dialog
+two-phase for torrent payloads (metadata wait → inline file checklist →
+add checked files); librqbit honors add-time `only_files`, but selecting a
+file whose first piece overlaps unselected files drags their bytes of that
+piece along (same as any client — do not "fix").
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
-still speaks TCP), per-task quota polish, global daemon speed cap.
+still speaks TCP), per-task quota polish, global daemon speed cap,
+magnet paused-until-pick flow (currently the add dialog resolves metadata
+before queueing; a fully paused meta-first flow would allow add-then-pick).

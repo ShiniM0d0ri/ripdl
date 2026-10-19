@@ -89,7 +89,15 @@
           <option value="other">Other (no subfolder)</option>
         </select>
         <label class="chk"><input type="checkbox" id="dlg-hunt" /> Video/stream page (hunt via yt-dlp)</label>
+      </div>
+      <div class="dlg-row" id="row-seq" hidden>
         <label class="chk"><input type="checkbox" id="dlg-seq" /> Torrent: sequential download (play while downloading)</label>
+      </div>
+      <!-- qB-style pre-add file list (torrent payloads only; filled after
+           metadata resolves) -->
+      <div id="row-tfiles" hidden>
+        <div id="tfiles-status" class="hidden"></div>
+        <div id="tfiles-list"></div>
       </div>
       <div class="dlg-row">
         <label for="dlg-dest">Save to</label>

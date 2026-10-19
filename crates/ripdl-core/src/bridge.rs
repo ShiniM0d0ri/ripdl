@@ -432,6 +432,7 @@ mod tests {
                 start_at: None,
                 kind: Default::default(),
                 sequential: Default::default(),
+                only_files: Default::default(),
             },
         )
         .unwrap();

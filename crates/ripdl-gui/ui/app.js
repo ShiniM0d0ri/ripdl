@@ -605,6 +605,33 @@ $("#update-dismiss").onclick = () => $("#update-banner").classList.add("hidden")
 })();
 
 /* Dialog */
+// Torrent payloads get the qB-style flow: metadata first, then a file
+// checklist inside this dialog before anything is queued.
+function looksLikeTorrent(payload) {
+    const p = payload.trim();
+    if (p.toLowerCase().startsWith("magnet:")) return true;
+    const bare = p.split("#")[0].split("?")[0];
+    return bare.toLowerCase().endsWith(".torrent");
+}
+// Preview state for the add dialog: null | { payload, files?|failed }
+// - `files` present (possibly empty) = metadata resolved, ready to add.
+// - `failed` = preview failed; the next submit adds the torrent as-is.
+let torrentPick = null;
+
+function updateTorrentUi() {
+    const url = $("#dlg-url").value.trim();
+    const torrent = !$("#dlg-hunt").checked && looksLikeTorrent(url);
+    $("#row-seq").hidden = !torrent;
+    $("#row-tfiles").hidden = !torrent;
+    if (torrent && torrentPick && torrentPick.payload === url) {
+        $("#row-tfiles").hidden = false; // resolved for this exact payload
+    } else if (!torrent || (torrentPick && torrentPick.payload !== url)) {
+        if (!torrent) torrentPick = null;
+        $("#tfiles-list").textContent = "";
+        $("#tfiles-status").textContent = "";
+    }
+}
+
 function openAddDialog(presetUrl) {
     $("#dlg-url").value = presetUrl || "";
     $("#dlg-err").classList.add("hidden");
@@ -613,10 +640,17 @@ function openAddDialog(presetUrl) {
     $("#dlg-cat").value = "auto";
     dlgDestTouched = false;
     $("#dlg-dest").value = "";
+    torrentPick = null;
+    $("#tfiles-list").textContent = "";
+    $("#tfiles-status").textContent = "";
+    updateTorrentUi();
     $("#dlg-backdrop").classList.remove("hidden");
     $("#dlg-url").focus();
+    $("#dlg-url").select();
 }
 $("#dlg-dest").oninput = () => { dlgDestTouched = true; };
+$("#dlg-url").oninput = updateTorrentUi;
+$("#dlg-hunt").onchange = updateTorrentUi;
 $("#dlg-browse").onclick = async () => {
     try {
         const picked = await invokeSafe("pick_dir");
@@ -628,10 +662,18 @@ $("#dlg-browse").onclick = async () => {
         flashErr(String(e));
     }
 };
-$("#dlg-cancel").onclick = () => $("#dlg-backdrop").classList.add("hidden");
+$("#dlg-cancel").onclick = () => {
+    $("#dlg-backdrop").classList.add("hidden");
+    torrentPick = null;
+};
 $("#dlg-ok").onclick = submitAdd;
 $("#dlg-url").onkeydown = (ev) => { if (ev.key === "Enter") submitAdd(); };
-$("#dlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) $("#dlg-backdrop").classList.add("hidden"); };
+$("#dlg-backdrop").onclick = (ev) => {
+    if (ev.target === ev.currentTarget) {
+        $("#dlg-backdrop").classList.add("hidden");
+        torrentPick = null;
+    }
+};
 
 /* Settings dialog (daemon-wide config) */
 const SET_INPUTS = ["#set-conc", "#set-segs", "#set-minseg", "#set-speed", "#set-dir", "#set-ytdlp"];
@@ -767,6 +809,7 @@ function dialogOpen() {
 document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
         $("#dlg-backdrop").classList.add("hidden");
+        torrentPick = null;
         closeDetails();
         closeSettings();
         closeMenus();
@@ -946,7 +989,42 @@ async function submitAdd() {
     if ($("#dlg-ok").disabled) return; // Enter-double-fire / double-click
     const url = $("#dlg-url").value.trim();
     if (!url) return;
+    // Torrents go two-phase like qBittorrent: the first submit resolves
+    // metadata and fills the file checklist; the second one queues the
+    // task with the checked files. A failed preview falls through and
+    // adds as-is instead of dead-ending a dead swarm.
+    if (!$("#dlg-hunt").checked && looksLikeTorrent(url) &&
+        !(torrentPick && torrentPick.payload === url &&
+          (torrentPick.files || torrentPick.failed))) {
+        $("#dlg-ok").disabled = true;
+        $("#row-tfiles").hidden = false;
+        const st = $("#tfiles-status");
+        st.textContent = "Retrieving metadata\u2026";
+        try {
+            const pv = await invokeSafe("torrent_preview", { payload: url });
+            torrentPick = { payload: url, files: pv.files || [] };
+            st.textContent = pv.files && pv.files.length > 1
+                ? `${pv.files.length} files \u00B7 ${humans(pv.total ?? 0)}`
+                : "";
+            $("#tfiles-list").innerHTML = (pv.files || []).map((f, i) => `
+              <label><input type="checkbox" class="tfile-chk" data-idx="${i}" checked />
+                      ${escapeHtml(f.name)} <span style="color:#8d98a4">(${humans(f.size)})</span></label>`).join("");
+        } catch (e) {
+            torrentPick = { payload: url, failed: true };
+            st.textContent = "Metadata unavailable \u2014 the torrent will be added as-is.";
+            $("#dlg-err").textContent = String(e).replace(/^.*error:\s*/, "");
+            $("#dlg-err").classList.remove("hidden");
+        } finally {
+            $("#dlg-ok").disabled = false;
+        }
+        return;
+    }
     $("#dlg-ok").disabled = true;
+    const onlyFiles = torrentPick && torrentPick.payload === url && torrentPick.files
+        ? torrentPick.files
+              .map((_, i) => i)
+              .filter((i) => $(`#tfiles-list .tfile-chk[data-idx="${i}"]`)?.checked)
+        : null;
     try {
         const dest = $("#dlg-dest").value.trim();
         if ($("#dlg-hunt").checked) await invokeSafe("add_video_task", { url, destDir: dest || null });
@@ -955,7 +1033,9 @@ async function submitAdd() {
             category: $("#dlg-cat").value,
             destDir: dest || null,
             sequential: $("#dlg-seq").checked,
+            onlyFiles,
         });
+        torrentPick = null;
         $("#dlg-backdrop").classList.add("hidden");
         await poll();
     } catch (e) {

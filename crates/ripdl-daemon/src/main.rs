@@ -330,8 +330,11 @@ impl Daemon {
 
     async fn dispatch(self: &Arc<Self>, req: Request) -> Response {
         match req.cmd {
-            Command::Add { url, dest_dir, headers, start_at, kind, sequential } => {
-                self.cmd_add(req.id, url, dest_dir, headers, start_at, kind, sequential)
+            Command::Add { url, dest_dir, headers, start_at, kind, sequential, only_files } => {
+                self.cmd_add(req.id, url, dest_dir, headers, start_at, kind, sequential, only_files)
+            }
+            Command::TorrentPreview { payload } => {
+                self.cmd_torrent_preview(req.id, &payload).await
             }
             Command::List => self.cmd_list(req.id),
             Command::Details { id } => self.cmd_torrent_details(req.id, &id).await,
@@ -481,6 +484,59 @@ impl Daemon {
         self.config.lock().unwrap().clone()
     }
 
+    /// The daemon's one torrent session, created on demand (DHT/listener
+    /// bind once, rooted at the download default). Torrent runners and
+    /// preview queries share this same path.
+    async fn ensure_torrent_session(
+        &self,
+    ) -> Result<Arc<ripdl_core::torrent::TorrentSession>, String> {
+        let mut guard = self.torrents.lock().await;
+        if guard.is_none() {
+            let root = self
+                .conf()
+                .default_download_dir
+                .clone()
+                .or_else(default_download_dir)
+                .unwrap_or_else(|| PathBuf::from("."));
+            // Torrents share one session, so bonding is session-wide:
+            // read the current uplinks once at creation (daemon restart
+            // re-reads; setting changes later only affect HTTP tasks live).
+            let bind = if self.conf().bond_interfaces() {
+                let ips: Vec<std::net::IpAddr> = ripdl_core::engine::bonded_nics()
+                    .into_iter()
+                    .map(|n| std::net::IpAddr::V4(n.addr))
+                    .collect();
+                (!ips.is_empty()).then_some(ips)
+            } else {
+                None
+            };
+            let session = ripdl_core::torrent::TorrentSession::new(root, bind)
+                .await
+                .map_err(|e| e.to_string())?;
+            *guard = Some(Arc::new(session));
+        }
+        Ok(Arc::clone(guard.as_ref().unwrap()))
+    }
+
+    /// Pre-add torrent preview (Add dialog file list). No task is queued;
+    /// magnets may take as long as the swarm needs to yield metadata.
+    async fn cmd_torrent_preview(&self, req_id: u64, payload: &str) -> Response {
+        let reply: Result<Reply, String> = async {
+            let session = self.ensure_torrent_session().await?;
+            session
+                .preview(payload)
+                .await
+                .map(|preview| Reply::TorrentPreview { preview })
+                .map_err(|e| e.to_string())
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
+    }
+
     fn cmd_add(
         self: &Arc<Self>,
         req_id: u64,
@@ -490,6 +546,7 @@ impl Daemon {
         start_at: Option<i64>,
         kind: TaskKind,
         sequential: bool,
+        only_files: Option<Vec<usize>>,
     ) -> Response {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
@@ -515,7 +572,7 @@ impl Daemon {
             info_hash: None,
             torrent_name: None,
             sequential,
-            only_files: None,
+            only_files,
         };
         {
             // One lock scope for the duplicate check AND the push: two
@@ -902,42 +959,13 @@ impl Daemon {
                         .map(|out| out.file)
                 }
                 TaskKind::Torrent => {
-                    // One session for the whole daemon, created on demand
-                    // rooted at the download default (DHT/listener bind once).
-                    let session = {
-                        let mut guard = this.torrents.lock().await;
-                        if guard.is_none() {
-                            let root = this
-                                .conf()
-                                .default_download_dir
-                                .clone()
-                                .or_else(default_download_dir)
-                                .unwrap_or_else(|| PathBuf::from("."));
-                            //Torrents share one session, so bonding is
-                            // session-wide: read the current uplinks once at
-                            // creation (daemon restart re-reads; setting
-                            // changes later only affect HTTP tasks live).
-                            let bind = if this.conf().bond_interfaces() {
-                                let ips: Vec<std::net::IpAddr> =
-                                    ripdl_core::engine::bonded_nics()
-                                        .into_iter()
-                                        .map(|n| std::net::IpAddr::V4(n.addr))
-                                        .collect();
-                                (!ips.is_empty()).then_some(ips)
-                            } else {
-                                None
-                            };
-                            match ripdl_core::torrent::TorrentSession::new(root, bind).await {
-                                Ok(s) => *guard = Some(Arc::new(s)),
-                                Err(e) => {
-                                    drop(guard);
-                                    detach_runtime();
-                                    this.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
-                                    return;
-                                }
-                            }
+                    let session = match this.ensure_torrent_session().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            detach_runtime();
+                            this.set_state(&rec.id, TaskState::Failed, Some(e));
+                            return;
                         }
-                        Arc::clone(guard.as_ref().unwrap())
                     };
                     let cfg = ripdl_core::torrent::TorrentConfig {
                         id: rec.id.clone(),

@@ -107,6 +107,10 @@ enum Cmd {
         /// the file head plays before the whole task completes).
         #[arg(long = "sequential")]
         sequential: bool,
+        /// Torrent-only: fetch only these file indices (comma-separated,
+        /// based on `ripdl details` order; e.g. `--only 0,2-4`).
+        #[arg(long = "only")]
+        only: Option<String>,
     },
     /// List tasks known to the daemon.
     Ls,
@@ -232,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{info:#?}");
             Ok(())
         }
-        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video, torrent, sequential } => {
+        Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video, torrent, sequential, only } => {
             let start_at = match (&after, &at) {
                 (Some(_), Some(_)) => bail!("use --after or --at, not both"),
                 (Some(delay), None) => Some(now_unix() + parse_after(delay)? as i64),
@@ -249,7 +253,23 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 ripdl_core::task::TaskKind::Http
             };
-            rpc(Command::Add { url, dest_dir: dest, headers, start_at, kind, sequential }).await
+            let only_files = match &only {
+                Some(spec) if kind == ripdl_core::task::TaskKind::Torrent => {
+                    Some(parse_only(spec)?)
+                }
+                Some(_) => bail!("--only applies to torrent downloads only"),
+                None => None,
+            };
+            rpc(Command::Add {
+                url,
+                dest_dir: dest,
+                headers,
+                start_at,
+                kind,
+                sequential,
+                only_files,
+            })
+            .await
         }
         Cmd::RegisterHost { ext_id, host } => register_host(&ext_id, &host),
         Cmd::Ls => rpc(Command::List).await,
@@ -450,6 +470,21 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             for p in details.peers.iter().take(12) {
                 println!("  {:>21} {:>12} {:<28} dl {:>12} ul {:>12}", p.addr, p.state, p.client.as_deref().unwrap_or("-"), p.downloaded, p.uploaded);
             }
+        }
+        Reply::TorrentPreview { preview } => {
+            println!("name: {}", preview.name.as_deref().unwrap_or("(unknown)"));
+            println!("hash: {}", preview.info_hash);
+            for (i, f) in preview.files.iter().enumerate() {
+                println!("  {:>3} {:>10}  {}", i, humans(f.size), f.name);
+            }
+            println!(
+                "total: {}",
+                if preview.files.len() > 1 {
+                    format!("{} files, {} bytes", preview.files.len(), preview.total)
+                } else {
+                    format!("{}", preview.total.max(preview.files.first().map(|f| f.size).unwrap_or(0)))
+                }
+            );
         }
         Reply::Tasks { tasks } => {
             println!("{:<38} {:<10} {:>16} {:>12}", "ID", "STATE", "PROGRESS", "SPEED");
@@ -768,6 +803,23 @@ fn parse_speed(s: &str) -> anyhow::Result<u64> {
     Ok(bps)
 }
 
+fn parse_only(spec: &str) -> anyhow::Result<Vec<usize>> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if let Some((a, b)) = part.split_once('-') {
+            let a: usize = a.trim().parse().context("bad --only range start")?;
+            let b: usize = b.trim().parse().context("bad --only range end")?;
+            anyhow::ensure!(a <= b, "--only range start above end");
+            out.extend(a..=b);
+        } else {
+            out.push(part.parse().context("bad --only index")?);
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "empty --only list");
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,9 +841,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_selections() {
+        assert_eq!(parse_only("0").unwrap(), vec![0]);
+        assert_eq!(parse_only("0,2").unwrap(), vec![0, 2]);
+        assert_eq!(parse_only("2-4").unwrap(), vec![2, 3, 4]);
+        assert_eq!(parse_only(" 0 , 2-3 ,5 ").unwrap(), vec![0, 2, 3, 5]);
+        assert!(parse_only("3-2").is_err());
+        assert!(parse_only("").is_err());
+        assert!(parse_only("x").is_err());
+    }
+
+    #[test]
     fn parses_header_name_value() {
-        assert_eq!(parse_header("Referer: https://x.y").unwrap(), ("Referer".into(), "https://x.y".into()));
-        assert!(parse_header("novalue").is_err());
+        assert_eq!(parse_header("Referer: https://x.y").unwrap(), ("Referer".into(), "https://x.y".into()));        assert!(parse_header("novalue").is_err());
         assert!(parse_header("Name:").is_err(), "empty value rejected");
         assert!(parse_header(": value").is_err(), "empty name rejected");
     }

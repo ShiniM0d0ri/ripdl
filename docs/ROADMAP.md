@@ -113,6 +113,14 @@ M3.2 - daemon + CLI:
       record and replayed on resume/boot
 - [x] CLI `select <id> all|0,2,3` + RPC `UpdateTorrentSelection`;
       `only_files` persisted and replayed
+- [x] Pre-add file selection (qB-style): RPC `TorrentPreview` resolves a
+      payload's metadata + file list without queueing (rqbit `list_only`;
+      instant for `.torrent`, swarm-wait for magnets), CLI `add --only
+      0,2-4`; GUI Add dialog goes two-phase for torrent payloads
+      ("Retrieving metadata…" → inline file checklist → add with the
+      checked files); sequential checkbox shows only for torrent payloads
+      (verified: librqbit honors add-time `only_files`; boundary pieces carry
+      interleaved side data exactly as with any client)
 
 M3.3 - GUI merge (HTTP + torrent in one grid):
 - [x] Row model: kind-specific status (metadata phase when a magnet still

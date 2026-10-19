@@ -23,3 +23,8 @@ librqbit = { version = "9", default-features = false, features = ["default-tls"]
 # NIC bonding: enumerate uplink interfaces (gateway metadata) so the
 # engine can bind segments to one interface each. MIT, pure Rust.
 netdev = { version = "0.46.3", default-features = false, features = ["gateway"] }
+
+[dev-dependencies]
+# Loopback seeder↔leecher trace output: librqbit's internal decisions
+# (piece selection, only_files handling) are only visible via tracing.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
