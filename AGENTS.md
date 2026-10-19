@@ -127,8 +127,22 @@ completing on disk; `rm --files` now drains the runner before the path
 sweep so the pause path can no longer resurrect a sidecar after deletion
 (fix in `cmd_remove`, daemon). Media-URL offer rows and activeTab-granted
 page reads remain user-confirmable only in a real browser session.
-104 tests pass offline (`cargo test --workspace`), including an in-proc
+112 tests pass offline (`cargo test --workspace`), including an in-proc
 seeder↔leecher torrent round-trip.
+HTTP resilience pass (2026-10-20, verified live): a per-IP quota host (OVH
+answers 429 to ranged GETs after ~37 MiB) used to fail the task mid-flight; it
+now completes. Engine: transient statuses (408/429/5xx) and transport faults
+retry, a refused probe is retried instead of killing a fresh task, a
+host-pressure failure gets a longer leash (10 attempts, 2→10 s jittered) and
+halves a shared in-flight cap (`engine/gate.rs`) so eight parallel ranges
+degrade to one connection and ramp back up, and parked-but-not-durable bytes
+are rolled back on every failed attempt (they used to double-count, which read
+as a 1.5 Gbps spike and could end in SizeMismatch). Display: engine ticks use
+`MissedTickBehavior::Delay` (no catch-up burst) and the daemon derives speed
+from a 2 s sliding window instead of a per-tick EMA, so a 1 GB Hetzner pull
+shows a clean ramp to ~22 MiB/s with no spike and no zero-gaps. Three live
+runs of the same 100 MB URL (single-segment, 8-segment, quota-degraded) hash
+identically (SHA256).
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
 with native browse, per-row location display, open file/folder via Explorer
 `/select`, `remove_task(delete_files)` with sidecar-aware disk cleanup,

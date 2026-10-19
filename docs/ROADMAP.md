@@ -18,12 +18,26 @@ Guiding rules:
 - [x] Cancellation tokens (cancels propagate to all segments)
 - [x] In-memory queue + auto-categorization
 - [x] Atomic sidecar writes (temp + rename)
-- [x] Retry/backoff per segment (bounded; transport errors only)
+- [x] Retry/backoff per segment (bounded; transport errors and transient
+      statuses: 408/429/5xx retry, other 4xx don't)
+- [x] Host-pressure handling: a quota/overload reply (429/503) or a refused
+      connection gives a segment a longer leash (10 attempts, 2→10 s jittered)
+      and halves a shared in-flight cap (`engine/gate.rs`), so a host that
+      chokes on eight parallel ranges degrades to one connection and then
+      ramps back up instead of failing the task; parked-but-not-durable bytes
+      are rolled back on every failed attempt so retries cannot double-count;
+      the probe itself retries a refused HEAD (a fresh task no longer dies
+      before it starts)
+- [x] Honest speed: engine progress ticks use `MissedTickBehavior::Delay`
+      (no catch-up burst), read timeout 15 s, and the daemon derives speed
+      from a 2 s sliding window (preferring a tool-supplied rate, e.g.
+      librqbit) instead of a per-tick EMA — no GB/s spikes after a stall
 - [x] Integration tests against a local test HTTP server
       (`crates/ripdl-core/tests/engine_integration.rs`: offline mock server
-      with drop-injection, no-range mode, etag switching; covers exact-byte
-      correctness, retry recovery, single-stream fallback, pause→resume from
-      sidecar, etag-change fresh restart)
+      with drop-injection, no-range mode, etag switching, 429 quota
+      injection; covers exact-byte correctness, retry recovery, single-stream
+      fallback, pause→resume from sidecar, etag-change fresh restart, quota
+      back-off, refused-probe retry)
 - [x] Buffered async segment writes (256 KiB blocks through the blocking
       pool; slow disks no longer stall the network pipeline)
 - [x] Request headers pass-through (`--header`/`--referer`/`--cookie`/`--user-agent`;
@@ -290,6 +304,10 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       scheduler respects priority
 - [ ] Per-host concurrency limit (`max_per_host`, default off) so one host
       cannot starve the queue
+- [ ] Honor `Retry-After` on 429/503 (needs a status-carrying error variant);
+      today the backoff is doubled from 2 s to a 10 s ceiling with jitter
+- [ ] Mid-download re-division: split a slow segment's range off its
+      neighbours (today the gate only widens/narrows the in-flight cap)
 - [ ] Global daemon speed cap exposed in GUI (engine + config already have it)
 - [ ] Mid-download segment map: active connections, byte ranges, stalls;
       re-divide a stalled segment from busy neighbours
