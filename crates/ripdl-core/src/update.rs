@@ -37,12 +37,19 @@ pub fn current_version() -> &'static str {
 }
 
 /// One release asset (the fields we use).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateAsset {
     #[serde(default)]
     pub name: String,
+    /// GitHub API asset URL (`api.github.com/.../assets/<id>`). This returns
+    /// JSON metadata, **not** the file bytes, so it must never be downloaded
+    /// directly.
     #[serde(default)]
     pub url: String,
+    /// Direct download URL (`browser_download_url`). This is what downloads
+    /// must use.
+    #[serde(default)]
+    pub browser_download_url: String,
     #[serde(default)]
     pub size: u64,
 }
@@ -53,6 +60,15 @@ impl UpdateAsset {
     }
     fn is_sums(&self) -> bool {
         self.name.eq_ignore_ascii_case("SHA256SUMS.txt")
+    }
+    /// The URL to fetch bytes from: the web URL when the API supplied one
+    /// (GitHub always does), else the raw `url` (local mocks).
+    fn download_url(&self) -> &str {
+        if self.browser_download_url.is_empty() {
+            &self.url
+        } else {
+            &self.browser_download_url
+        }
     }
 }
 
@@ -263,7 +279,7 @@ pub async fn download_setup(
     let mut expected = None;
     if let Some(sums) = sums {
         let text = client
-            .get(&sums.url)
+            .get(sums.download_url())
             .header(reqwest::header::USER_AGENT, "ripdl-updater")
             .send()
             .await
@@ -291,7 +307,7 @@ pub async fn download_setup(
     }
 
     let mut resp = client
-        .get(&setup.url)
+        .get(setup.download_url())
         .header(reqwest::header::USER_AGENT, "ripdl-updater")
         .send()
         .await
@@ -481,15 +497,54 @@ mod tests {
     #[test]
     fn asset_picking() {
         let assets = vec![
-            UpdateAsset { name: "ripdl-v0.4.0-x86_64-linux.tar.gz".into(), url: "http://x/l".into(), size: 1 },
-            UpdateAsset { name: "ripdl-v0.4.0-x86_64-windows.zip".into(), url: "http://x/p".into(), size: 2 },
-            UpdateAsset { name: "ripdl-v0.4.0-x86_64-windows-setup.exe".into(), url: "http://x/s".into(), size: 3 },
-            UpdateAsset { name: "SHA256SUMS.txt".into(), url: "http://x/h".into(), size: 4 },
+            UpdateAsset {
+                name: "ripdl-v0.4.0-x86_64-linux.tar.gz".into(),
+                url: "http://api/x/l".into(),
+                browser_download_url: "http://x/l".into(),
+                size: 1,
+            },
+            UpdateAsset {
+                name: "ripdl-v0.4.0-x86_64-windows.zip".into(),
+                url: "http://api/x/p".into(),
+                browser_download_url: "http://x/p".into(),
+                size: 2,
+            },
+            UpdateAsset {
+                name: "ripdl-v0.4.0-x86_64-windows-setup.exe".into(),
+                url: "http://api/x/s".into(),
+                browser_download_url: "http://x/s".into(),
+                size: 3,
+            },
+            UpdateAsset {
+                name: "SHA256SUMS.txt".into(),
+                url: "http://api/x/h".into(),
+                browser_download_url: "http://x/h".into(),
+                size: 4,
+            },
         ];
         let setup = assets.iter().find(|a| a.is_windows_setup()).unwrap();
         let sums = assets.iter().find(|a| a.is_sums()).unwrap();
-        assert_eq!(setup.url, "http://x/s"); // installer, not the portable zip
-        assert_eq!(sums.url, "http://x/h");
+        assert_eq!(setup.download_url(), "http://x/s"); // installer, not the portable zip
+        assert_eq!(sums.download_url(), "http://x/h");
+        // API asset URLs return JSON metadata; never download from them.
+        assert_ne!(setup.download_url(), setup.url);
+    }
+
+    /// Regression: GitHub's asset object carries both `url` (API JSON) and
+    /// `browser_download_url` (bytes). The updater shipped reading `url`,
+    /// so every real install failed at the checksum gate.
+    #[test]
+    fn asset_prefers_browser_download_url() {
+        let json = r#"{
+            "name": "ripdl-v0.4.0-x86_64-windows-setup.exe",
+            "url": "https://api.github.com/repos/o/r/releases/assets/42",
+            "browser_download_url": "https://github.com/o/r/releases/download/v0.4.0/ripdl-v0.4.0-x86_64-windows-setup.exe",
+            "size": 1234
+        }"#;
+        let a: UpdateAsset = serde_json::from_str(json).unwrap();
+        assert_eq!(a.size, 1234);
+        assert!(a.download_url().starts_with("https://github.com/"));
+        assert!(!a.download_url().contains("api.github.com"));
     }
 
     #[test]
@@ -537,14 +592,19 @@ mod tests {
             }
         });
 
+        // GitHub-shaped assets: `url` is the API endpoint (JSON), the web URL
+        // is what must be fetched. Point `url` at the mock too so the test
+        // stays offline while still exercising the browser_download_url path.
         let setup = UpdateAsset {
             name: name.clone(),
-            url: format!("http://{addr}/{name}"),
+            url: format!("http://{addr}/api-json"),
+            browser_download_url: format!("http://{addr}/{name}"),
             size: body_len as u64,
         };
         let sums_asset = UpdateAsset {
             name: "SHA256SUMS.txt".to_string(),
-            url: format!("http://{addr}/SHA256SUMS.txt"),
+            url: format!("http://{addr}/api-json"),
+            browser_download_url: format!("http://{addr}/SHA256SUMS.txt"),
             size: sums_len as u64,
         };
         let dir = std::env::temp_dir().join(format!("ripdl-update-test-{}", std::process::id()));
