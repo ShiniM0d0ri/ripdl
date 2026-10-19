@@ -16,10 +16,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 mod single_instance;
 
+/// Set once an in-app update has handed over to the installer. While it is
+/// set the GUI must not help: polling would auto-spawn the daemon the
+/// installer is trying to close (a windowless daemon makes Windows' Restart
+/// Manager stop an interactive install with "unable to close all
+/// applications"), and a close request must actually exit instead of
+/// minimizing to the tray.
+static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// One-shot RPC round trip against the daemon, with a single
 /// spawn-and-retry recovery: cold starts (fresh login after boot) make the
 /// user wait for the daemon otherwise.
 async fn rpc(cmd: Command) -> Result<Reply, String> {
+    if INSTALLING.load(std::sync::atomic::Ordering::Relaxed) {
+        // During an install the daemon is expected to be gone.
+        return rpc_once(cmd).await;
+    }
     match rpc_once(cmd.clone()).await {
         Ok(reply) => Ok(reply),
         Err(_) => {
@@ -219,7 +231,13 @@ async fn check_update() -> Result<ripdl_core::update::UpdateInfo, String> {
 /// One-click upgrade: daemon downloads the verified setup and runs it.
 #[tauri::command]
 async fn install_update() -> Result<(), String> {
-    expect_ok(rpc(Command::UpdateInstall).await?)
+    let out = expect_ok(rpc(Command::UpdateInstall).await?);
+    if out.is_ok() {
+        // The installer is running now: stop spawning daemons and let the
+        // next close request through (see INSTALLING).
+        INSTALLING.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    out
 }
 
 /// The running build's version (Help > About). Read from the crate rather
@@ -600,7 +618,9 @@ fn main() {
                 let hide = window
                     .app_handle()
                     .try_state::<GuiPrefs>()
-                    .is_some_and(|p| p.hide_to_tray.load(std::sync::atomic::Ordering::Relaxed));
+                    .is_some_and(|p| p.hide_to_tray.load(std::sync::atomic::Ordering::Relaxed))
+                    // An installer is closing us: exiting is the point.
+                    && !INSTALLING.load(std::sync::atomic::Ordering::Relaxed);
                 if hide && window.label() == "main" {
                     api.prevent_close();
                     let _ = window.hide();

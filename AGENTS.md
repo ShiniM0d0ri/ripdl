@@ -89,6 +89,11 @@ the single-stream path.
   (don't rely on its env expansion), nfpm needs `--packager deb/rpm` when
   `--target` is a directory, and Inno wants
   `ArchitecturesInstallIn64BitMode` (bare `Architectures` is invalid).
+  Installer close-out: use `CloseApplications=force` (the Tauri GUI treats
+  "close" as minimize-to-tray, so a plain close leaves the wizard stuck on
+  "unable to close all applications"), and kill `ripdl-gui.exe` *before*
+  `ripdl-daemon.exe` - the GUI's poll auto-spawns a daemon, and a respawned
+  windowless daemon is exactly what Restart Manager cannot close.
 
 ## Resume-sidecar format
 
@@ -155,6 +160,14 @@ session is not bonded - restart the daemon", or "off, but the session is still
 bonded - restart". Saving a changed toggle asks to restart the daemon on the
 spot (the existing snapshot-and-resume path) and the state line turns
 green/amber. Older daemons just omit the new fields (serde defaults).
+v0.3.11: installer unblocked. Inno force-closes the app
+(`CloseApplications=force`) instead of stopping at "Setup was unable to
+automatically close all applications", and `[Code]` sweeps `ripdl-gui.exe`
+first, then the browser host, then the daemon, twice (a respawn during the
+first sweep is caught by the second). The GUI stops auto-spawning daemons and
+stops hiding to the tray once an in-app install has launched (`INSTALLING`),
+so the 0.3.9 -> 0.3.10 stall - minimize-to-tray swallowed the close request
+while a poll-respawned windowless daemon could not be closed - cannot repeat.
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
 with native browse, per-row location display, open file/folder via Explorer
 `/select`, `remove_task(delete_files)` with sidecar-aware disk cleanup,

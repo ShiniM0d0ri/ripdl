@@ -33,7 +33,12 @@ WizardStyle=modern
 ; demanding a reboot; OpenFilesFromRM shows its name in the files-in-use
 ; list. PrepareToInstall + the uninstall step additionally taskkill as a
 ; belt-and-braces measure below.
-CloseApplications=yes
+;
+; `force` matters: the Tauri GUI treats "close" as minimize-to-tray, so an
+; interactive run used to stop at "Setup was unable to automatically close
+; all applications" instead of finishing. Forcing the close keeps the
+; wizard moving; the kills below remove whatever a fresh spawn raced back in.
+CloseApplications=force
 RestartApplications=yes
 
 [Tasks]
@@ -69,10 +74,26 @@ Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall
 ; foreign keys stay untouched; nothing else runs on uninstall.
 
 [Code]
+// taskkill one image name; a no-op when it is not running.
+procedure KillOne(const Image: String);
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'),
+       '/F /IM ' + Image, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 // Belt-and-braces process killer: the Restart Manager usually arranges the
 // file locks on its own, but silent installs (/S) skip its prompt, so both
 // the upgrade and the uninstall paths call this first. Harmless no-op when
 // nothing is running.
+//
+// Order matters. The GUI's one-second poll auto-spawns a daemon whenever it
+// disappears, so killing the daemon first lets a fresh (windowless) daemon
+// appear in the gap - Restart Manager cannot ask that one to close, and an
+// interactive install stops with "unable to close all applications" (seen on
+// 0.3.9 -> 0.3.10). Kill the GUI first, then the browser host (it can spawn a
+// daemon too), then the daemon, and sweep once more for a race.
 //
 // NEVER add /T here. When the update is app-driven, Setup is a *child* of
 // ripdl-daemon.exe (the daemon ShellExecutes it), so a tree kill on the
@@ -80,15 +101,14 @@ Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall
 // survives, and nothing gets installed. The daemon stops its own sidecar
 // children before handing over, so name-only kills are enough.
 procedure KillRipdlProcesses;
-var
-  ResultCode: Integer;
 begin
-  Exec(ExpandConstant('{sys}\taskkill.exe'),
-       '/F /IM ripdl-daemon.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec(ExpandConstant('{sys}\taskkill.exe'),
-       '/F /IM ripdl-gui.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec(ExpandConstant('{sys}\taskkill.exe'),
-       '/F /IM ripdl.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  KillOne('ripdl-gui.exe');
+  KillOne('ripdl.exe');
+  KillOne('ripdl-daemon.exe');
+  Sleep(400);
+  KillOne('ripdl-daemon.exe');
+  KillOne('ripdl-gui.exe');
+  KillOne('ripdl.exe');
 end;
 
 // Uninstall-time native-messaging cleanup: delete the HKCU keys this
