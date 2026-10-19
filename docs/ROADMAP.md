@@ -190,6 +190,10 @@ M3.4 - tests / verification:
       `update_auto_install` opt-in setting (daemon-side unattended
       `/VERYSILENT` run at boot; installer replaces ripdl in place), CLI
       `ripdl update --install`. Old installers pruned after a week.
+      v0.3.4 fixes the asset URL: downloads must use `browser_download_url`
+      (the API `url` is JSON metadata, so every real install failed the
+      SHA256SUMS gate); the GUI exe version now inherits the workspace
+      version instead of a stale `tauri.conf.json` literal.
 - [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n
@@ -222,6 +226,9 @@ M3.4 - tests / verification:
 
 - [x] Single app instance: a second launch focuses the running window and
       exits (named-pipe/unix-socket guard in the GUI, no duplicate daemons)
+- [x] GUI chrome: icon-only toolbar + SVG state/row icons (one inline sprite,
+      tooltips for labels), 60 s total-speed strip with now/avg readout
+      (canvas, DPR-scaled), inline installer-failure reason in the banner
 - [ ] Categories: per-category destination, queue slot, speed policy;
       auto-categorize on add (extension heuristic already exists)
 - [ ] Search, filter (status/kind/host), sort columns; multi-select batch

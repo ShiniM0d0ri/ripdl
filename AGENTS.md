@@ -154,7 +154,14 @@ banner "Download & Install" button + `update_auto_install` opt-in setting
 `ripdl update --install`; sha2 dep. Windows setup upgraded in place
 (`AppId` fixed forever, [Code] kills daemon/GUI before file copy,
 `[InstallDelete]` refreshes `ext/`, uninstaller removes ripdl's per-user
-native-messaging keys).
+native-messaging keys). v0.3.4 fixes the updater's asset URL: installs fetch
+`browser_download_url` (the API `url` returns JSON metadata, so every real
+install failed the SHA256SUMS gate; asset downloads now share one
+`download_url()` helper). Same release: GUI chrome pass (icon-only toolbar +
+SVG state/row icons from one inline sprite, 60 s total-speed strip with
+now/avg readout, install failures shown inline), and the exe version is
+inherited from the workspace Cargo.toml (the stale `tauri.conf.json`
+`version` literal pinned every build to 0.3.2).
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

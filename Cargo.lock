@@ -5104,7 +5104,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-cli"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -5119,7 +5119,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5141,7 +5141,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-daemon"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -5157,7 +5157,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-gui"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "dirs 6.0.0",
  "rfd",
