@@ -142,6 +142,11 @@ struct Daemon {
     /// torrent use (binds DHT/listener only when actually needed). Async
     /// mutex: creation awaits inside the locked section.
     torrents: tokio::sync::Mutex<Option<Arc<ripdl_core::torrent::TorrentSession>>>,
+    /// Local addresses the live torrent session binds outgoing peer
+    /// connections to (None until the session is created; empty = created
+    /// without bonding). `bind_ips` is fixed at creation, so this is the only
+    /// truth about whether a `bond_interfaces` change actually applied.
+    torrent_bind: std::sync::Mutex<Option<Vec<std::net::IpAddr>>>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
     /// Set during an install fetch (concurrent ones would share a .part).
@@ -179,6 +184,7 @@ impl Daemon {
             seeders: Mutex::new(HashMap::new()),
             seed_gen: std::sync::atomic::AtomicU64::new(0),
             torrents: tokio::sync::Mutex::new(None),
+            torrent_bind: std::sync::Mutex::new(None),
             shutdown: tokio::sync::Notify::new(),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
@@ -803,7 +809,24 @@ impl Daemon {
     fn cmd_get_config(self: &Arc<Self>, req_id: u64) -> Response {
         Response {
             id: req_id,
-            reply: Reply::Config { settings: self.conf() },
+            reply: self.config_reply(),
+        }
+    }
+
+    /// Settings plus the live torrent-session bonding state. Frontends use the
+    /// latter because `bond_interfaces` is only read when the shared session is
+    /// created: after a toggle the config is already "true" while torrents are
+    /// still unbound (and vice versa), and that must be visible, not inferred.
+    fn config_reply(self: &Arc<Self>) -> Reply {
+        let bind = self.torrent_bind.lock().unwrap().clone();
+        Reply::Config {
+            settings: self.conf(),
+            torrent_session: bind.is_some(),
+            torrent_bind: bind
+                .unwrap_or_default()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 
@@ -990,7 +1013,7 @@ impl Daemon {
         }
         Response {
             id: req_id,
-            reply: Reply::Config { settings: self.conf() },
+            reply: self.config_reply(),
         }
     }
 
@@ -1026,9 +1049,12 @@ impl Daemon {
                 None
             };
             let session =
-                ripdl_core::torrent::TorrentSession::new(root, bind, self.torrent_state_dir())
+                ripdl_core::torrent::TorrentSession::new(root, bind.clone(), self.torrent_state_dir())
                     .await
                     .map_err(|e| e.to_string())?;
+            // Only after creation succeeded: this is what the session really
+            // bound, not what the config says.
+            *self.torrent_bind.lock().unwrap() = Some(bind.unwrap_or_default());
             *guard = Some(Arc::new(session));
         }
         Ok(Arc::clone(guard.as_ref().unwrap()))

@@ -48,6 +48,40 @@ impl Bond {
     }
 }
 
+/// One-line state of torrent NIC bonding, for `ripdl config` and the GUI.
+///
+/// Torrents share a single librqbit session whose `bind_ips` is fixed when it
+/// is created, so the config value alone can lie: toggling `bond_interfaces`
+/// afterwards only applies after a daemon restart. `session` says whether the
+/// shared session exists yet and `bind` which addresses it actually bound, so
+/// the text can call out the stale cases instead of repeating the config.
+pub fn describe_torrent_bond(configured: bool, session: bool, bind: &[IpAddr]) -> String {
+    if !configured {
+        return if session && !bind.is_empty() {
+            "off, but the running session is still bonded - restart the daemon".to_string()
+        } else {
+            "off".to_string()
+        };
+    }
+    if !session {
+        return "enabled - applies when the torrent session starts".to_string();
+    }
+    if bind.is_empty() {
+        return "enabled, but the running session is not bonded - restart the daemon".to_string();
+    }
+    let nics = bonded_nics();
+    let names: Vec<String> = bind
+        .iter()
+        .map(|ip| {
+            nics.iter()
+                .find(|n| IpAddr::V4(n.addr) == *ip)
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| ip.to_string())
+        })
+        .collect();
+    format!("active on {}", names.join(", "))
+}
+
 /// Tunables for the download engine.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -826,5 +860,16 @@ mod tests {
         let plan = plan_fresh(&info(Some(1024 * 1024 * 500), false), &cfg);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].end, UNBOUNDED);
+    }
+
+    #[test]
+    fn torrent_bond_description_flags_a_stale_session() {
+        let one = [IpAddr::from([10, 0, 0, 2])];
+        assert_eq!(describe_torrent_bond(false, false, &[]), "off");
+        assert_eq!(describe_torrent_bond(false, true, &[]), "off");
+        assert!(describe_torrent_bond(false, true, &one).contains("still bonded"));
+        assert!(describe_torrent_bond(true, false, &[]).contains("when the torrent session starts"));
+        assert!(describe_torrent_bond(true, true, &[]).contains("restart the daemon"));
+        assert!(describe_torrent_bond(true, true, &one).starts_with("active on"));
     }
 }

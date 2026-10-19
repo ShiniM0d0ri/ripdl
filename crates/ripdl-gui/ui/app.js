@@ -944,20 +944,34 @@ let bondAtOpen = false;
 // "combining made it slower" trap.
 async function renderBondNics() {
     const el = $("#set-bond-info");
+    const live = $("#set-bond-state");
     try {
         const nics = await invokeSafe("bond_nics");
         if (!nics.length) {
             el.textContent = "No internet uplink detected.";
-            return;
+        } else {
+            const list = nics
+                .map((n) => `${n.name} (${n.addr}${n.default ? ", default route" : ""})`)
+                .join(" \u00b7 ");
+            el.textContent = nics.length === 1
+                ? `1 uplink: ${list} \u2014 combining cannot add bandwidth.`
+                : `${nics.length} uplinks: ${list}`;
         }
-        const list = nics
-            .map((n) => `${n.name} (${n.addr}${n.default ? ", default route" : ""})`)
-            .join(" \u00b7 ");
-        el.textContent = nics.length === 1
-            ? `1 uplink: ${list} \u2014 combining cannot add bandwidth.`
-            : `${nics.length} uplinks: ${list}`;
     } catch (e) {
         el.textContent = "";
+    }
+    // What the *running* torrent session actually bound. The checkbox above is
+    // only the saved setting; a change does not reach torrents until restart.
+    try {
+        const st = await invokeSafe("bond_state");
+        live.textContent = `Torrents: ${st.text}`;
+        live.className = st.text.includes("restart")
+            ? "set-hint warn"
+            : st.active
+              ? "set-hint ok"
+              : "set-hint";
+    } catch (e) {
+        live.textContent = "";
     }
 }
 
@@ -1005,11 +1019,20 @@ async function saveSettings() {
         await invokeSafe("set_config", { settings: payload });
         closeSettings();
         const bondingChanged = $("#set-bond").checked !== bondAtOpen;
-        flashStatus(
-            bondingChanged
-                ? "settings saved - restart the daemon to apply bonding to torrents"
-                : "settings saved"
-        );
+        if (bondingChanged) {
+            // The torrent session binds its uplinks at creation, so a saved
+            // toggle is a no-op until the daemon restarts. Offer it right here
+            // instead of leaving a status-line hint that is easy to miss.
+            if (confirm("Torrent bonding applies after the daemon restarts.\nRestart it now? Active transfers resume by themselves.")) {
+                await invokeSafe("restart_daemon");
+                flashStatus("settings saved - daemon restarted, torrent bonding applied");
+                await poll();
+            } else {
+                flashStatus("settings saved - restart the daemon to apply bonding to torrents");
+            }
+        } else {
+            flashStatus("settings saved");
+        }
     } catch (e) {
         reject(String(e).replace(/^.*error: /, ""));
     }

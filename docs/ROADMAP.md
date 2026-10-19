@@ -279,7 +279,12 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       on demand; it snapshots Running tasks and replays `Resume` on the fresh
       daemon, so active transfers come back downloading (torrents re-check
       on-disk data first, shown as `verifying`). Saving a changed bond toggle
-      nudges that restart
+      offers the daemon restart right there, and the live state is exposed
+      (`Reply::Config.torrent_session`/`torrent_bind`, filled from the
+      addresses the session actually bound): `ripdl config` and Settings show
+      "active on <uplinks>", "enabled, but the running session is not bonded -
+      restart the daemon", or "off, but the session is still bonded - restart"
+      instead of repeating a config value torrents have not picked up
 - [x] Torrent fastresume: librqbit gained `SessionOptions::fastresume_folder`
       (vendored delta 4) pointing at `<data_dir>/ripdl/torrent-state`. Only
       the bitfield half of the JSON store is used, so `<info-hash>.bitv` is

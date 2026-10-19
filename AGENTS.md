@@ -129,7 +129,7 @@ completing on disk; `rm --files` now drains the runner before the path
 sweep so the pause path can no longer resurrect a sidecar after deletion
 (fix in `cmd_remove`, daemon). Media-URL offer rows and activeTab-granted
 page reads remain user-confirmable only in a real browser session.
-112 tests pass offline (`cargo test --workspace`), including an in-proc
+115 tests pass offline (`cargo test --workspace`), including an in-proc
 seeder↔leecher torrent round-trip.
 v0.3.9: HTTP resilience pass (verified live): a per-IP quota host (OVH
 answers 429 to ranged GETs after ~37 MiB) used to fail the task mid-flight; it
@@ -145,6 +145,16 @@ from a 2 s sliding window instead of a per-tick EMA, so a 1 GB Hetzner pull
 shows a clean ramp to ~22 MiB/s with no spike and no zero-gaps. Three live
 runs of the same 100 MB URL (single-segment, 8-segment, quota-degraded) hash
 identically (SHA256).
+v0.3.10: torrent bonding is visible and self-applying. The shared rqbit session
+fixes `bind_ips` when it is created, so a saved `bond_interfaces` toggle used
+to look like a no-op (the status-line hint was easy to miss). `Reply::Config`
+now carries `torrent_session` + `torrent_bind` (the addresses the live session
+actually bound), so a new `torrent bonding:` line in `ripdl config` and a line
+under the Settings toggle say "active on <uplinks>", "enabled, but the running
+session is not bonded - restart the daemon", or "off, but the session is still
+bonded - restart". Saving a changed toggle asks to restart the daemon on the
+spot (the existing snapshot-and-resume path) and the state line turns
+green/amber. Older daemons just omit the new fields (serde defaults).
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
 with native browse, per-row location display, open file/folder via Explorer
 `/select`, `remove_task(delete_files)` with sidecar-aware disk cleanup,

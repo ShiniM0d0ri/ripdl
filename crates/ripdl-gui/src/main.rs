@@ -350,7 +350,7 @@ fn download_root_path() -> String {
 #[tauri::command]
 async fn get_config() -> Result<DaemonSettings, String> {
     match rpc(Command::GetConfig).await? {
-        Reply::Config { settings } => Ok(settings),
+        Reply::Config { settings, .. } => Ok(settings),
         other => Err(format!("unexpected daemon reply: {other:?}")),
     }
 }
@@ -376,6 +376,40 @@ fn bond_nics() -> Vec<UplinkView> {
             default: n.is_default_route,
         })
         .collect()
+}
+
+/// Live torrent-bonding state. The setting alone can lie: the shared session
+/// fixes `bind_ips` when it is created, so a toggle applies only after a
+/// daemon restart. `text` is the same sentence `ripdl config` prints.
+#[derive(serde::Serialize)]
+struct BondState {
+    text: String,
+    active: bool,
+}
+
+#[tauri::command]
+async fn bond_state() -> Result<BondState, String> {
+    match rpc(Command::GetConfig).await? {
+        Reply::Config {
+            settings,
+            torrent_session,
+            torrent_bind,
+        } => {
+            let bind: Vec<std::net::IpAddr> = torrent_bind
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            Ok(BondState {
+                active: torrent_session && !bind.is_empty(),
+                text: ripdl_core::engine::describe_torrent_bond(
+                    settings.bond_interfaces(),
+                    torrent_session,
+                    &bind,
+                ),
+            })
+        }
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
 }
 
 /// Stop the daemon and let the bridge spawn a fresh one. Needed for settings
@@ -418,7 +452,7 @@ async fn set_config(
     state: tauri::State<'_, GuiPrefs>,
 ) -> Result<DaemonSettings, String> {
     let saved = match rpc(Command::SetConfig { settings }).await? {
-        Reply::Config { settings } => settings,
+        Reply::Config { settings, .. } => settings,
         other => Err(format!("unexpected daemon reply: {other:?}"))?,
     };
     state
@@ -480,6 +514,7 @@ fn main() {
             get_config,
             set_config,
             bond_nics,
+            bond_state,
             restart_daemon,
             check_update,
             install_update,
@@ -505,7 +540,7 @@ fn main() {
             // Sync the tray preference from the daemon settings.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Ok(Reply::Config { settings }) = rpc(Command::GetConfig).await {
+                if let Ok(Reply::Config { settings, .. }) = rpc(Command::GetConfig).await {
                     if let Some(prefs) = handle.try_state::<GuiPrefs>() {
                         prefs.hide_to_tray.store(
                             settings.hide_to_tray.unwrap_or(true),

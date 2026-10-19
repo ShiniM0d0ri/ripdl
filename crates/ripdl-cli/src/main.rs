@@ -300,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
             // Partial edits: fetch the live values and patch on top, then
             // send the whole settings object back (full-replace semantics).
             let mut settings = match rpc_reply(Command::GetConfig).await? {
-                Reply::Config { settings } => settings,
+                Reply::Config { settings, .. } => settings,
                 other => bail!("unexpected daemon reply: {other:?}"),
             };
             for pair in set {
@@ -432,7 +432,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
         Reply::Ok => println!("ok"),
         Reply::Added { id } => println!("queued: {id}"),
         Reply::Error { message } => bail!("{message}"),
-        Reply::Config { settings } => {
+        Reply::Config { settings, torrent_session, torrent_bind } => {
             println!("max_concurrent:       {}", settings.max_concurrent.unwrap_or(3));
             println!("max_segments:         {}", settings.max_segments.unwrap_or(8));
             println!(
@@ -484,6 +484,20 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             if settings.bond_interfaces() && nics.len() < 2 {
                 println!("note:                 only one uplink - combining cannot add bandwidth");
             }
+            // Torrents share one session whose binding is fixed at creation;
+            // show what is actually live, not just the config value.
+            let bind: Vec<std::net::IpAddr> = torrent_bind
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            println!(
+                "torrent bonding:      {}",
+                ripdl_core::engine::describe_torrent_bond(
+                    settings.bond_interfaces(),
+                    torrent_session,
+                    &bind
+                )
+            );
             println!("update_check:         {}", settings.update_check.unwrap_or(true));
             println!("update_auto_install:  {}", settings.update_auto_install.unwrap_or(false));
             println!("seed_enabled:         {}", settings.seed_enabled());

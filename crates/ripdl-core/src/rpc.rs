@@ -295,6 +295,17 @@ pub enum Reply {
     /// Current daemon-wide settings.
     Config {
         settings: DaemonSettings,
+        /// True when the shared torrent session already exists. Its bonding
+        /// (`bind_ips`) is fixed when the session is created, so a changed
+        /// `bond_interfaces` only takes effect after a daemon restart; this
+        /// flag (with `torrent_bind`) lets frontends say so instead of
+        /// silently showing a stale config value.
+        #[serde(default)]
+        torrent_session: bool,
+        /// Local addresses the live session actually binds outgoing peer
+        /// connections to (empty when the session is not bonded).
+        #[serde(default)]
+        torrent_bind: Vec<String>,
     },
     /// Result of a `CheckUpdate`.
     Update {
@@ -366,4 +377,51 @@ pub struct TaskInfo {
     /// Torrent-only: current per-file selection (None = everything).
     #[serde(default)]
     pub only_files: Option<Vec<usize>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_reply_tolerates_a_daemon_without_bonding_fields() {
+        // A pre-0.3.10 daemon sends just `settings`; the new fields must
+        // default so a newer frontend can still talk to it.
+        let reply: Reply =
+            serde_json::from_str(r#"{"type":"config","settings":{"max_segments":4}}"#)
+                .expect("old reply parses");
+        match reply {
+            Reply::Config {
+                settings,
+                torrent_session,
+                torrent_bind,
+            } => {
+                assert_eq!(settings.max_segments, Some(4));
+                assert!(!torrent_session);
+                assert!(torrent_bind.is_empty());
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_reply_round_trips_the_live_bond_state() {
+        let reply = Reply::Config {
+            settings: DaemonSettings::default(),
+            torrent_session: true,
+            torrent_bind: vec!["10.0.0.2".to_string()],
+        };
+        let json = serde_json::to_string(&reply).expect("serialize");
+        match serde_json::from_str::<Reply>(&json).expect("parse") {
+            Reply::Config {
+                torrent_session,
+                torrent_bind,
+                ..
+            } => {
+                assert!(torrent_session);
+                assert_eq!(torrent_bind, vec!["10.0.0.2".to_string()]);
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
 }
