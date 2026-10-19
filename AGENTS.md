@@ -127,7 +127,7 @@ completing on disk; `rm --files` now drains the runner before the path
 sweep so the pause path can no longer resurrect a sidecar after deletion
 (fix in `cmd_remove`, daemon). Media-URL offer rows and activeTab-granted
 page reads remain user-confirmable only in a real browser session.
-103 tests pass offline (`cargo test --workspace`), including an in-proc
+104 tests pass offline (`cargo test --workspace`), including an in-proc
 seeder↔leecher torrent round-trip.
 In progress: P2 GUI polish — basic file management landed (per-task "Save to"
 with native browse, per-row location display, open file/folder via Explorer
@@ -206,9 +206,16 @@ Also on main: bonding transparency — the Settings dialog and `ripdl config`
 now list the uplinks bonding would actually use (`name (addr[, default
 route])`) and flag a single-uplink machine, and Settings grew a "Restart
 daemon" button because torrent bonding is fixed when the shared session is
-created (HTTP tasks read the setting per download). Note rqbit's listener
-defaults to TCP-only (`ListenerMode::TcpOnly`, no uTP socket), so uTP is not
-a tuning lever.
+created (HTTP tasks read the setting per download); the button snapshots
+Running tasks and replays `Resume` after the fresh daemon answers, so active
+transfers keep downloading instead of the stop's cancelled runners leaving
+them Paused. Note rqbit's listener defaults to TCP-only
+(`ListenerMode::TcpOnly`, no uTP socket), so uTP is not a tuning lever.
+Torrent resume/recheck is now a distinct `verifying` state: librqbit's
+`Initializing` phase reports *checked* bytes (a 29 GB torrent reads at disk
+speed), so `Progress.verifying` is set, the daemon skips its derived-rate
+EMA (which used to show ~500 MB/s and pollute the graph), and GUI/CLI label
+the row `verifying` with no speed until the check finishes.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

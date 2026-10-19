@@ -383,6 +383,17 @@ fn bond_nics() -> Vec<UplinkView> {
 /// from their records/sidecars.
 #[tauri::command]
 async fn restart_daemon() -> Result<(), String> {
+    // A stop cancels runners, and the queue may record them as Paused (it
+    // races the process exit). Remember what was moving and replay resume on
+    // the fresh daemon so "active transfers resume" is deterministic.
+    let running: Vec<String> = match rpc_once(Command::List).await {
+        Ok(Reply::Tasks { tasks }) => tasks
+            .into_iter()
+            .filter(|t| t.state == ripdl_core::task::TaskState::Running)
+            .map(|t| t.id)
+            .collect(),
+        _ => Vec::new(),
+    };
     let _ = rpc_once(Command::Shutdown).await;
     for _ in 0..60 {
         if transport::connect_daemon().await.is_err() {
@@ -390,7 +401,13 @@ async fn restart_daemon() -> Result<(), String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    rpc(Command::List).await.map(|_| ())
+    rpc(Command::List).await?;
+    for id in running {
+        // Best effort per task: HTTP resumes from its sidecar, a torrent
+        // re-attaches to the session (and re-checks existing data first).
+        let _ = rpc(Command::Resume { id }).await;
+    }
+    Ok(())
 }
 
 /// Replace the daemon settings (validation happens daemon-side; the reply

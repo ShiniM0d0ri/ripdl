@@ -185,6 +185,12 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       existing nested root is reused, so resume/seeding never re-downloads
       (magnet single-file torrents still nest - layout is chosen before the
       metadata fetch)
+- [x] Resume/recheck is a distinct `verifying` state: librqbit's
+      `Initializing` phase reports checked bytes (a 29 GB torrent reads at
+      disk speed), so the daemon now suppresses the derived rate and GUI/CLI
+      show `verifying` instead of a bogus hundreds-of-MB/s "download" that
+      also poisoned the 60 s speed graph; the first real sample afterwards
+      starts from a re-anchored baseline
 
 ## P4 - browser integration (the killer feature)
 
@@ -252,7 +258,13 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       ("combining cannot add bandwidth"); `ripdl config` prints the same
       `uplinks:` line. Settings grew a "Restart daemon" button so the
       torrent session (bonding is fixed at session creation) can be rebuilt
-      on demand; saving a changed bond toggle nudges that restart
+      on demand; it snapshots Running tasks and replays `Resume` on the fresh
+      daemon, so active transfers come back downloading (torrents re-check
+      on-disk data first, shown as `verifying`). Saving a changed bond toggle
+      nudges that restart
+- [ ] Torrent fastresume: persist librqbit's piece bitfield (rqbit
+      `fastresume` + a ripdl-owned state folder) so a daemon restart skips
+      the full on-disk hash pass (29 GB re-read observed at ~500 MB/s)
 - [ ] Bonding health: keep the default-route uplink and drop candidates that
       fail a reachability probe, so one dead-end adapter can never halve
       the peer connection success rate
