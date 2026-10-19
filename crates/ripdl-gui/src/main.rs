@@ -222,6 +222,13 @@ async fn install_update() -> Result<(), String> {
     expect_ok(rpc(Command::UpdateInstall).await?)
 }
 
+/// The running build's version (Help > About). Read from the crate rather
+/// than tauri.conf.json so it can never drift from the binaries.
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// Open a URL in the user's browser (update banner, Help menu).
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
@@ -419,6 +426,7 @@ fn main() {
             set_config,
             check_update,
             install_update,
+            app_version,
             open_url,
             exit_app
         ])

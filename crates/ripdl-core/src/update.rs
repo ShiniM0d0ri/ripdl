@@ -397,22 +397,26 @@ pub fn is_elevated() -> bool {
     false
 }
 
-/// Run the installer elevated through `ShellExecuteW("runas")`, which is what
-/// surfaces the UAC prompt. Error 1223 = the user declined it.
+/// Run the installer through the shell so Windows raises the UAC prompt. The
+/// verb is deliberately NULL (the default "open"), *not* "runas": the setup's
+/// own manifest already requires admin, and letting the shell elevate keeps
+/// Setup aware of the original (non-elevated) user - which is exactly what
+/// makes its `runasoriginaluser` [Run] entry relaunch the GUI unelevated.
+/// "runas" would hand Setup an already-elevated token instead (the relaunched
+/// app then inherits admin). Error 1223/5 = the user declined the prompt.
 #[cfg(windows)]
-fn shell_execute_runas(path: &std::path::Path, args: &str) -> Result<()> {
+fn shell_execute_elevated(path: &std::path::Path, args: &str) -> Result<()> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
-    let verb = wide("runas");
     let file = wide(&path.to_string_lossy());
     let params = wide(args);
     // SW_SHOWNORMAL = 1; ShellExecute returns > 32 on success.
     let code = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
-            verb.as_ptr(),
+            std::ptr::null(),
             file.as_ptr(),
             params.as_ptr(),
             std::ptr::null(),
@@ -420,8 +424,8 @@ fn shell_execute_runas(path: &std::path::Path, args: &str) -> Result<()> {
         )
     } as isize;
     if code <= 32 {
-        let why = if code == 1223 {
-            "elevation was cancelled".to_string()
+        let why = if code == 1223 || code == 5 {
+            "the Windows elevation prompt was cancelled".to_string()
         } else {
             format!("Windows refused to elevate (code {code})")
         };
@@ -441,7 +445,7 @@ pub fn run_installer(path: &std::path::Path, silent: bool) -> Result<()> {
     {
         let args = if silent { "/VERYSILENT /NORESTART" } else { "" };
         if !is_elevated() {
-            return shell_execute_runas(path, args);
+            return shell_execute_elevated(path, args);
         }
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

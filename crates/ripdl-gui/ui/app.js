@@ -587,10 +587,7 @@ const MENUS = {
         { label: "Check for Updates", act: () => runUpdateCheck(false) },
         { label: "Open Release Page", act: () => openReleases() },
         null,
-        { label: "About ripdl", act: () =>
-            alert("ripdl — free, ad-free, multi-segment download manager.\n" +
-                  "No telemetry, no ads, forever. License: MIT OR Apache-2.0.\n" +
-                  "https://github.com/ShiniM0d0ri/ripdl") },
+        { label: "About ripdl", act: () => openAbout() },
     ],
 };
 let openMenu = null;
@@ -634,6 +631,28 @@ $("#btn-clear-done").onclick = clearDone;
 
 /* Update check: banner + Help menu; installs go through the daemon. */
 const RELEASES_URL = "https://github.com/ShiniM0d0ri/ripdl/releases";
+const REPO_URL = "https://github.com/ShiniM0d0ri/ripdl";
+
+/* About box: version comes from the running build, so it always matches the
+   exe the user is looking at (Help > About ripdl). */
+async function openAbout() {
+    let ver = "";
+    try { ver = await invokeSafe("app_version"); } catch (_) { /* leave blank */ }
+    $("#abt-ver").textContent = ver ? `v${ver}` : "";
+    $("#abt-backdrop").classList.remove("hidden");
+}
+function closeAbout() { $("#abt-backdrop").classList.add("hidden"); }
+
+function openExternal(url) {
+    invokeSafe("open_url", { url }).catch((e) => flashErr(String(e)));
+}
+$("#abt-close").onclick = closeAbout;
+$("#abt-ok").onclick = closeAbout;
+$("#abt-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeAbout(); };
+$("#abt-repo").onclick = () => openExternal(REPO_URL);
+$("#abt-releases").onclick = () => openExternal(RELEASES_URL);
+$("#abt-issues").onclick = () => openExternal(`${REPO_URL}/issues`);
+$("#abt-check").onclick = () => { closeAbout(); runUpdateCheck(false); };
 
 function openReleases() {
     invokeSafe("open_url", { url: RELEASES_URL }).catch((e) => flashErr(String(e)));
@@ -892,7 +911,7 @@ $("#set-dir").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 // True while any dialog is open: global accelerators shouldn't fire into
 // them (Ctrl+N while typing in the Add dialog would wipe the typed URL).
 function dialogOpen() {
-    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop"]
+    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop", "#abt-backdrop"]
         .some((s) => !$(s).classList.contains("hidden"));
 }
 
@@ -902,6 +921,7 @@ document.addEventListener("keydown", (ev) => {
         torrentPick = null;
         closeDetails();
         closeSettings();
+        closeAbout();
         closeMenus();
     }
     if (dialogOpen()) return;

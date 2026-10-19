@@ -200,7 +200,10 @@ M3.4 - tests / verification:
       Setup is a child of the daemon when the update is triggered from the
       app, so the tree kill terminated Setup itself mid-install (name-only
       kills now; the daemon stops its video runners before handing over, and
-      `[Run]` uses `runasoriginaluser`).
+      `[Run]` uses `runasoriginaluser`). v0.3.6 launches Setup with the shell's
+      default verb so Setup elevates itself and the relaunched GUI is not left
+      elevated, and adds a real About dialog (Help > About ripdl: running
+      version via the new `app_version` command, licence, links).
 - [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n
@@ -235,7 +238,8 @@ M3.4 - tests / verification:
       exits (named-pipe/unix-socket guard in the GUI, no duplicate daemons)
 - [x] GUI chrome: icon-only toolbar + SVG state/row icons (one inline sprite,
       tooltips for labels), 60 s total-speed strip with now/avg readout
-      (canvas, DPR-scaled), inline installer-failure reason in the banner
+      (canvas, DPR-scaled), inline installer-failure reason in the banner,
+      About dialog under Help (version, licence, links, update check)
 - [ ] Categories: per-category destination, queue slot, speed policy;
       auto-categorize on add (extension heuristic already exists)
 - [ ] Search, filter (status/kind/host), sort columns; multi-select batch

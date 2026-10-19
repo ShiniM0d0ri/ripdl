@@ -141,6 +141,31 @@
     </div>
   </div>
 
+  <!-- About dialog (Help > About ripdl) -->
+  <div id="abt-backdrop" class="hidden">
+    <div id="abt">
+      <div class="set-title">About ripdl<button id="abt-close">&times;</button></div>
+      <div id="abt-body">
+        <div class="abt-head">
+          <span class="abt-logo">&#8681;</span>
+          <span class="abt-name">ripdl</span>
+          <span id="abt-ver" class="abt-ver"></span>
+        </div>
+        <div class="abt-tag">Free, ad-free multi-segment download manager.</div>
+        <div class="abt-meta">No telemetry, no ads, forever. License: MIT OR Apache-2.0.</div>
+      </div>
+      <div class="abt-links">
+        <button id="abt-repo">Source code</button>
+        <button id="abt-releases">Releases</button>
+        <button id="abt-issues">Report an issue</button>
+      </div>
+      <div class="dlg-actions">
+        <button id="abt-check">Check for updates</button>
+        <button id="abt-ok" class="primary">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Row context menu -->
   <div id="ctx" class="hidden">
     <div data-act="toggle">Pause / Resume</div>
