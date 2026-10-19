@@ -969,11 +969,23 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Two 512 KiB files inside one folder.
+        // Two 512 KiB patterned files. Patterns (not constant fills!) make
+        // the info-hash unique per run: a constant fill would put the same
+        // fixture on the public DHT for every CI machine ever, and foreign
+        // peers for that fixture interfere with the loopback exchange.
         let d = tmp.join("fpair");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("f0.bin"), vec![0xAA; 512 * 1024]).unwrap();
-        std::fs::write(d.join("f1.bin"), vec![0xBB; 512 * 1024]).unwrap();
+        let pattern = |fill: u8, seed: u8| {
+            let mut v = Vec::with_capacity(512 * 1024);
+            for i in 0..512 * 1024 {
+                v.push(fill ^ (seed.wrapping_add((i * 31 % 251) as u8)));
+            }
+            v
+        };
+        let data0 = pattern(0xAA, 7);
+        let data1 = pattern(0xBB, 13);
+        std::fs::write(d.join("f0.bin"), &data0).unwrap();
+        std::fs::write(d.join("f1.bin"), &data1).unwrap();
 
         let spawner = BlockingSpawner::new(2);
         let tor = librqbit::create_torrent(
@@ -1048,7 +1060,7 @@ mod tests {
         .expect("download ok");
 
         let root = dest.join("fpair");
-        assert_eq!(std::fs::read(root.join("f1.bin")).unwrap(), vec![0xBB; 512 * 1024], "selected file round-trips");
+        assert_eq!(std::fs::read(root.join("f1.bin")).unwrap(), data1, "selected file round-trips");
         // Unselected file: rqbit doesn't even materialize it — absent or
         // empty is success, anything non-zero means the picker leaked.
         let f0 = std::fs::read(root.join("f0.bin")).unwrap_or_default();
@@ -1062,7 +1074,8 @@ mod tests {
     }
 
     #[test]
-    fn magnet_info_hash_hex_and_base32() {        assert_eq!(
+    fn magnet_info_hash_hex_and_base32() {
+        assert_eq!(
             magnet_info_hash(
                 "magnet:?xt=urn:btih:08ADA5A7A6183AAE1E09D831DF6748D566095A10&dn=Sintel"
             )
