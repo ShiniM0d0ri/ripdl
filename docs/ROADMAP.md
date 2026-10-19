@@ -201,3 +201,39 @@ M3.4 - tests / verification:
       (`bond_interfaces` in config.json / `ripdl download --bond` / GUI
       settings; per-IP server caps bypassed, VPN tunnels excluded)
 - [ ] Segment visibility in the GUI (active connections + ranges per task)
+
+## P7 - core control (engine power features)
+
+- [ ] Per-task engine controls in GUI + CLI: max connections, per-task speed
+      cap, header/referer/UA overrides (config plumbing mostly exists)
+- [ ] Proxy support: HTTP + SOCKS5, `config.json`, GUI settings, CLI
+      `--proxy`; applies to probe + segments + torrent session
+- [ ] Task priority + queue ordering: `--priority`, GUI move up/down,
+      scheduler respects priority
+- [ ] Per-host concurrency limit (`max_per_host`, default off) so one host
+      cannot starve the queue
+- [ ] Global daemon speed cap exposed in GUI (engine + config already have it)
+- [ ] Mid-download segment map: active connections, byte ranges, stalls;
+      re-divide a stalled segment from busy neighbours
+- [ ] Post-download checksum: sha256 verify when a hash is known
+      (sidecar/manifest/`--sha256`), warn on mismatch
+
+## P8 - task UX + OS integration
+
+- [ ] Categories: per-category destination, queue slot, speed policy;
+      auto-categorize on add (extension heuristic already exists)
+- [ ] Search, filter (status/kind/host), sort columns; multi-select batch
+      pause/resume/remove
+- [ ] History: completed/removed tasks with redownload
+- [ ] Completion notifications (tray balloon) + drag-and-drop URLs /
+      `.torrent` files onto the window
+- [ ] Windows Explorer context menu ("Download with ripdl") + `ripdl://`
+      protocol handler
+- [ ] Diagnostics: every failed task exposes a reason + "copy diagnostics"
+      (URL, headers without secrets, last error)
+
+## Packaging / reach (backlog)
+
+- [ ] winget / scoop / Homebrew, AUR
+- [ ] Website + README showcase (screenshots, honest feature table)
+- [ ] i18n
