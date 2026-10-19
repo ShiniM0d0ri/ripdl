@@ -1,3 +1,4 @@
+mod gate;
 mod limiter;
 mod nic;
 mod planner;
@@ -124,7 +125,10 @@ impl Engine {
         // far above any legitimate read stall.
         builder = builder
             .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(30))
+            // 15 s of total silence is a dead connection on any real link.
+            // 30 s meant a stalled segment kept its share of the file frozen
+            // for half a minute before the retry could reconnect.
+            .read_timeout(Duration::from_secs(15))
             .tcp_keepalive(Duration::from_secs(15));
         Ok(builder.build()?)
     }
@@ -190,6 +194,10 @@ impl Engine {
         let downloaded = Arc::new(AtomicU64::new(segments.iter().map(|s| s.done).sum()));
         let active = Arc::new(AtomicU64::new(segments.len() as u64));
         let finished = Arc::new(AtomicBool::new(false));
+        // Shared in-flight cap: 429/503 (or refused connections) halve it, a
+        // finished attempt doubles it back, so a quota storm ends up with one
+        // connection instead of eight retries tripping the same limit.
+        let gate = gate::Gate::new(segments.len());
 
         // Spawn one task per segment; each writes at its own file offset.
         // NIC bonding (see `Bond`): when active, segments cycle through
@@ -216,6 +224,7 @@ impl Engine {
             let downloaded = downloaded.clone();
             let token = token.clone();
             let active = active.clone();
+            let gate = gate.clone();
 
             handles.push(tokio::spawn({
                 let limiter = self.limiter.clone();
@@ -231,6 +240,7 @@ impl Engine {
                         downloaded.clone(),
                         limiter.clone(),
                         token.clone(),
+                        &gate,
                     )
                     .await;
                     if r.is_err() && !matches!(r, Err(Error::Cancelled)) {
@@ -250,6 +260,7 @@ impl Engine {
                                 downloaded,
                                 limiter,
                                 token,
+                                &gate,
                             )
                             .await;
                         }
@@ -281,6 +292,10 @@ impl Engine {
             let mut on_progress = on_progress;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
+                // A stall (retry backoff, slow disk) must not queue up a
+                // burst of catch-up ticks: each one would sample a tiny dt
+                // and read as a huge speed spike.
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // Sentinel != any real value: force one write on the first tick.
                 let mut persisted_downloaded = u64::MAX;
                 loop {
@@ -455,6 +470,7 @@ async fn run_segment(
     downloaded: Arc<AtomicU64>,
     limiter: std::sync::Arc<limiter::Limiter>,
     token: CancellationToken,
+    gate: &gate::Gate,
 ) -> Result<()> {
     let mut attempt = 0u32;
     loop {
@@ -477,20 +493,43 @@ async fn run_segment(
             tracing::warn!(index = seg.index, "no range support; restarting stream");
         }
 
+        // One in-flight request per permit; cancellation while queued must
+        // still win, or pausing a degraded download would hang.
+        let permit = tokio::select! {
+            _ = token.cancelled() => return Err(Error::Cancelled),
+            p = gate.acquire() => p,
+        };
+
         match segment_attempt(
             client, url, etag, &seg, &cells, &dest, &downloaded, &limiter, &token,
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                drop(permit);
+                gate.grow();
+                return Ok(());
+            }
             Err(Error::Cancelled) => return Err(Error::Cancelled),
-            Err(e) if retry::is_retryable(&e) && attempt < retry_cfg.max_retries => {
+            Err(e)
+                if retry::is_retryable(&e)
+                    && attempt < retry::max_attempts(&retry_cfg, retry::is_host_pressure(&e)) =>
+            {
                 attempt += 1;
-                let delay = retry_cfg.backoff(attempt);
+                let host_pressure = retry::is_host_pressure(&e);
+                let delay = retry::delay(&retry_cfg, host_pressure, attempt, initial.index as u64);
+                if host_pressure {
+                    // Fewer connections from now on: serial retries have a
+                    // chance where eight simultaneous ones re-trip the quota.
+                    gate.shrink();
+                    tracing::info!(index = seg.index, limit = gate.limit(), "segment concurrency reduced");
+                }
+                drop(permit);
                 tracing::warn!(
                     index = seg.index,
                     attempt,
                     delay_ms = delay.as_millis() as u64,
+                    host_pressure,
                     error = %e,
                     "segment retry"
                 );
@@ -551,6 +590,20 @@ async fn segment_attempt(
     ];
     let mut cur = 0;
     let mut inflight: Option<tokio::task::JoinHandle<(std::fs::File, Vec<u8>, usize)>> = None;
+    // Byte accounting for this attempt: parking a block adds to `counted`,
+    // a joined (durable) write adds to `durable_added`. On any non-success
+    // exit the un-durable remainder is subtracted again, so a retry that
+    // re-downloads from `cells.done` cannot double-count (which used to read
+    // as a huge speed spike and could end in SizeMismatch).
+    let mut counted: u64 = 0;
+    let mut durable_added: u64 = 0;
+    macro_rules! rollback {
+        () => {
+            if counted > durable_added {
+                downloaded.fetch_sub(counted - durable_added, Ordering::Relaxed);
+            }
+        };
+    }
 
     // Flushed bytes advance only when durably on disk (join), but the
     // headline counter moves at park time: a failed write aborts the task
@@ -561,11 +614,13 @@ async fn segment_attempt(
             if let Some(task) = inflight.take() {
                 let (handle, block, flushed) = task.await.expect("blocking pool join");
                 if flushed != block.len() {
+                    rollback!();
                     return Err(std::io::Error::other("segment file write failed").into());
                 }
                 // Durable counters move only when the bytes are on disk.
                 pos += flushed as u64;
                 seg_done += flushed as u64;
+                durable_added += flushed as u64;
                 cells.lock().expect("state cells")[seg.index].done = seg_done;
 
                 file = Some(handle);
@@ -597,6 +652,7 @@ async fn segment_attempt(
                 });
                 inflight = Some(task);
                 downloaded.fetch_add(len as u64, Ordering::Relaxed);
+                counted += len as u64;
                 cur = 1 - cur;
             }
         };
@@ -614,16 +670,24 @@ async fn segment_attempt(
                         if flushed == block.len() {
                             pos += flushed as u64;
                             seg_done += flushed as u64;
+                            durable_added += flushed as u64;
                             cells.lock().expect("state cells")[seg.index].done = seg_done;
                             file = Some(handle);
                             let _ = &file;
                         }
                     }
                 }
+                rollback!();
                 return Err(Error::Cancelled);
             }
             chunk = stream.next() => match chunk {
-                Some(c) => c?,
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
+                    // Retry resumes from cells.done: give back the bytes that
+                    // were parked but never became durable.
+                    rollback!();
+                    return Err(e.into());
+                }
                 None => break,
             },
         };

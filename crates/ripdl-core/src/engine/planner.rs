@@ -15,52 +15,75 @@ pub struct PlanInfo {
 
 /// Probe a URL with HEAD (falling back to a 1-byte ranged GET) to learn
 /// size, range support, and a filename before downloading anything.
+///
+/// Transient answers (408/429/5xx) and transport errors are retried a few
+/// times: a host that just asked parallel ranges to slow down must not make
+/// a fresh task fail before it starts. Each attempt is short; the download's
+/// own backoff takes over once the plan is known.
 pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
     let parsed: reqwest::Url =
         url.parse().map_err(|_| Error::InvalidUrl(url.to_string()))?;
 
-    let resp = match client.head(parsed.clone()).send().await {
-        Ok(r) if r.status().is_success() => r,
-        // Some servers reject HEAD; ask for the first byte instead.
-        _ => {
-            client
-                .get(parsed.clone())
-                .header(reqwest::header::RANGE, "bytes=0-0")
-                .send()
-                .await?
+    let mut last: Option<Error> = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 << (attempt - 1))).await;
         }
-    };
+        let resp = match client.head(parsed.clone()).send().await {
+            Ok(r) if r.status().is_success() => Ok(r),
+            // Some servers reject HEAD; ask for the first byte instead.
+            _ => {
+                client
+                    .get(parsed.clone())
+                    .header(reqwest::header::RANGE, "bytes=0-0")
+                    .send()
+                    .await
+            }
+        };
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                last = Some(e.into());
+                continue;
+            }
+        };
+        let status = resp.status();
+        if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
+            let err = Error::Server(format!("server returned {status}"));
+            if !super::retry::retryable_status(status.as_u16()) {
+                return Err(err);
+            }
+            last = Some(err);
+            continue;
+        }
 
-    let status = resp.status();
-    if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
-        return Err(Error::Server(format!("server returned {status}")));
+        let accept_ranges = resp
+            .headers()
+            .get(ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("bytes"))
+            .unwrap_or(false)
+            || resp.headers().get(CONTENT_RANGE).is_some();
+
+        let total = total_from(&resp);
+        let filename = filename_from(&resp)
+            .or_else(|| filename_from_url(&parsed))
+            .unwrap_or_else(|| "download.bin".to_string());
+        let etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        return Ok(PlanInfo {
+            url: parsed,
+            total,
+            accept_ranges,
+            filename,
+            etag,
+        });
     }
-
-    let accept_ranges = resp
-        .headers()
-        .get(ACCEPT_RANGES)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("bytes"))
-        .unwrap_or(false)
-        || resp.headers().get(CONTENT_RANGE).is_some();
-
-    let total = total_from(&resp);
-    let filename = filename_from(&resp)
-        .or_else(|| filename_from_url(&parsed))
-        .unwrap_or_else(|| "download.bin".to_string());
-    let etag = resp
-        .headers()
-        .get(ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    Ok(PlanInfo {
-        url: parsed,
-        total,
-        accept_ranges,
-        filename,
-        etag,
-    })
+    Err(last.unwrap_or_else(|| Error::Server("probe failed".into())))
 }
 
 fn total_from(resp: &reqwest::Response) -> Option<u64> {

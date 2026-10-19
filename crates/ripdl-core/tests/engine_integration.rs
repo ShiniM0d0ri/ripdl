@@ -75,6 +75,14 @@ struct ServerState {
     /// proves which local interfaces the client actually routed through
     /// (NIC bonding assertion).
     peers_seen: Mutex<Vec<String>>,
+    /// First N ranged GETs answer 429 (host quota); proves the client backs
+    /// off and keeps the task alive instead of failing a segment for good.
+    quota_replies: usize,
+    quota_served: AtomicUsize,
+    /// First N requests of any kind (HEAD probes included) answer 429. Proves
+    /// a fresh task retries the probe instead of failing before it starts.
+    hard_quota_replies: usize,
+    hard_quota_served: AtomicUsize,
 }
 
 async fn spawn_server(state: Arc<ServerState>) -> String {
@@ -152,6 +160,16 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
 
     let etag = etag_of(&state);
 
+    // Host-level quota: refuse the first N requests outright, HEAD included.
+    // The probe must treat that as transient instead of failing the task.
+    if state.hard_quota_served.fetch_add(1, Ordering::SeqCst) < state.hard_quota_replies {
+        sock.write_all(
+            b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // HEAD = engine probe: advertise size + range support, send no body.
     if is_head {
         let ranges_hdr = if state.ranges { "accept-ranges: bytes\r\n" } else { "" };
@@ -180,6 +198,16 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
     match range {
         // Ranged GET -> 206 with the exact requested slice.
         Some((a, b)) if state.ranges => {
+            // Host quota: answer the first N ranged GETs with 429. A client
+            // that treats status errors as terminal fails the whole task
+            // here; the engine must back off (jittered) and retry.
+            if state.quota_served.fetch_add(1, Ordering::SeqCst) < state.quota_replies {
+                sock.write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await?;
+                return Ok(());
+            }
             if a >= state.total {
                 sock.write_all(
                     format!(
@@ -312,6 +340,10 @@ async fn multi_segment_exact_bytes() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -334,6 +366,95 @@ async fn multi_segment_exact_bytes() {
     );
 }
 
+/// Host quota (429) on the first round of range requests: every segment must
+/// back off and retry instead of failing the task. This is what OVH does when
+/// eight parallel ranges trip its per-IP limit; treating 429 as terminal used
+/// to kill the whole download at ~25%.
+#[tokio::test]
+async fn rate_limited_ranges_back_off_and_finish() {
+    let state = Arc::new(ServerState {
+        total: 4 * MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        // 4 MiB / 128 KiB / max 8 => 8 segments, each refused once.
+        quota_replies: 8,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let engine = test_engine();
+    let tmp = temp_dir("quota");
+    let dest = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        engine.download(&url, Some(tmp), CancellationToken::new(), move |_p| {}),
+    )
+    .await
+    .expect("quota retries finish in time")
+    .expect("download ok despite 429s");
+
+    verify(&dest, 4 * MIB);
+    let seen = state.ranges_seen.lock().unwrap();
+    assert_eq!(seen.len(), 8, "all 8 ranges retried once: {seen:?}");
+    assert_eq!(
+        state.quota_served.load(Ordering::SeqCst),
+        8 + seen.len(),
+        "every 429 was retried"
+    );
+}
+
+/// A brand-new task must survive a host that answers 429 to the probe itself
+/// (HEAD and the 1-byte ranged fallback). Treating the probe as one-shot made
+/// a fresh download fail in under a second while the host was only asking for
+/// a pause.
+#[tokio::test]
+async fn probe_retries_host_quota_and_starts() {
+    let state = Arc::new(ServerState {
+        total: 2 * MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        // HEAD + fallback GET on attempt 1, HEAD on attempt 2.
+        hard_quota_replies: 3,
+        hard_quota_served: AtomicUsize::new(0),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let engine = test_engine();
+    let tmp = temp_dir("probe-quota");
+    let dest = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        engine.download(&url, Some(tmp), CancellationToken::new(), move |_p| {}),
+    )
+    .await
+    .expect("probe retry finishes in time")
+    .expect("download ok despite a refused probe");
+
+    verify(&dest, 2 * MIB);
+    assert!(
+        state.hard_quota_served.load(Ordering::SeqCst) >= 3,
+        "the probe really was refused first"
+    );
+}
+
 /// NIC bonding (explicit addresses): every segment must cycle through the
 /// two bound loopback addresses (Windows/Linux treat 127.0.0.0/8 as local)
 /// and the file must still land byte-exact. The server records each ranged
@@ -352,6 +473,10 @@ async fn bonded_segments_cycle_interfaces() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -399,6 +524,10 @@ async fn bonded_single_extra_address_still_binds() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -440,6 +569,10 @@ async fn dropped_connection_recovered_by_retry() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -469,6 +602,10 @@ async fn no_ranges_falls_back_to_single_stream() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -507,6 +644,10 @@ async fn pause_resumes_from_sidecar() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -587,6 +728,10 @@ async fn speed_limit_paces_download() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -639,6 +784,10 @@ async fn speed_limit_applies_to_single_stream() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -686,6 +835,10 @@ async fn stale_etag_forces_fresh_restart() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -761,6 +914,10 @@ async fn carries_headers_and_uses_cd_filename() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
