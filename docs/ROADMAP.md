@@ -196,7 +196,11 @@ M3.4 - tests / verification:
       version instead of a stale `tauri.conf.json` literal; the installer is
       launched through `ShellExecuteW("runas")` so a non-elevated daemon gets
       the UAC prompt instead of error 740 (silent/unattended runs skip when
-      not already elevated).
+      not already elevated). v0.3.5 fixes the installer's own `taskkill /T`:
+      Setup is a child of the daemon when the update is triggered from the
+      app, so the tree kill terminated Setup itself mid-install (name-only
+      kills now; the daemon stops its video runners before handing over, and
+      `[Run]` uses `runasoriginaluser`).
 - [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n

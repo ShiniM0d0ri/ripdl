@@ -425,6 +425,26 @@ impl Daemon {
         let path = ripdl_core::update::download_setup(&update_dir, setup, info.sha256.as_ref())
             .await
             .context("installer download failed")?;
+        // The installer force-kills us by image name (it can no longer kill
+        // our whole tree - Setup is a child of this process). HTTP runners
+        // resume from their durable sidecars, but an orphaned yt-dlp would
+        // keep appending to the same .part the next daemon re-invokes, so
+        // stop the video runners first and leave them paused for the user.
+        let video_ids: Vec<String> = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.kind == ripdl_core::task::TaskKind::Video)
+            .map(|r| r.id.clone())
+            .collect();
+        for id in video_ids {
+            let token = self.runtime.lock().unwrap().get(&id).map(|rt| rt.token.clone());
+            if let Some(token) = token {
+                tracing::info!(task = %id, "stopping video runner before upgrade");
+                token.cancel();
+            }
+        }
         tracing::info!(path = %path.display(), "launching upgrade installer");
         ripdl_core::update::run_installer(&path, silent)
             .context("failed to launch installer")

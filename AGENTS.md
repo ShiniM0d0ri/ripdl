@@ -166,6 +166,13 @@ inherited from the workspace Cargo.toml (the stale `tauri.conf.json`
 `requireAdministrator`, so `CreateProcess` used to fail with 740); the
 unattended `/VERYSILENT` path refuses to run without elevation so it can
 never raise a UAC prompt at boot.
+v0.3.5 fixes the installer's last blocker: `taskkill ... /T` on
+`ripdl-daemon.exe` killed Setup itself, because Setup is a child of the daemon
+when the update is triggered from the app (ShellExecute). Symptom: the daemon
+died, the GUI survived, nothing installed. Kills are name-only now, the daemon
+stops its own video runners (yt-dlp sidecars) before handing over (a running
+video task comes back Paused after an upgrade), and `[Run]` uses
+`runasoriginaluser` so the relaunched GUI is not left elevated.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

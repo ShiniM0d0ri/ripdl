@@ -58,7 +58,10 @@ Name: "{autodesktop}\ripdl"; Filename: "{app}\ripdl-gui.exe"; Tasks: desktopicon
 Type: filesandordirs; Name: "{app}\ext"
 
 [Run]
-Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall nowait skipifsilent
+; runasoriginaluser: Setup runs elevated (Program Files), but the app itself
+; has no need for admin rights - after an in-app update the relaunched GUI
+; used to inherit the elevation.
+Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; The native-messaging registrations below are deleted from Pascal code so
@@ -69,16 +72,22 @@ Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall
 // file locks on its own, but silent installs (/S) skip its prompt, so both
 // the upgrade and the uninstall paths call this first. Harmless no-op when
 // nothing is running.
+//
+// NEVER add /T here. When the update is app-driven, Setup is a *child* of
+// ripdl-daemon.exe (the daemon ShellExecutes it), so a tree kill on the
+// daemon terminates Setup itself mid-install: the daemon dies, the GUI
+// survives, and nothing gets installed. The daemon stops its own sidecar
+// children before handing over, so name-only kills are enough.
 procedure KillRipdlProcesses;
 var
   ResultCode: Integer;
 begin
   Exec(ExpandConstant('{sys}\taskkill.exe'),
-       '/F /IM ripdl-daemon.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+       '/F /IM ripdl-daemon.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\taskkill.exe'),
-       '/F /IM ripdl-gui.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+       '/F /IM ripdl-gui.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\taskkill.exe'),
-       '/F /IM ripdl.exe /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+       '/F /IM ripdl.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 // Uninstall-time native-messaging cleanup: delete the HKCU keys this
