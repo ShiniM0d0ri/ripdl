@@ -180,6 +180,11 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       restore -> finished details -> pause/resume seeding
 - [x] Clean-room qBittorrent options inventory (275 controls / 9 pages):
       docs/qbittorrent-options.md + docs/rea-findings.md
+- [x] Single-file layout: `.torrent`/URL payloads land at `<dest>/<name>`
+      (qBittorrent layout) instead of the nested `<dest>/<name>/<name>`; an
+      existing nested root is reused, so resume/seeding never re-downloads
+      (magnet single-file torrents still nest - layout is chosen before the
+      metadata fetch)
 
 ## P4 - browser integration (the killer feature)
 

@@ -181,13 +181,27 @@ pub fn is_torrent_file_bytes(b: &[u8]) -> bool {
 /// http(s) .torrent URLs are fetched here so every byte-backed payload
 /// yields a name - rqbit never has to fetch them itself.
 ///
+/// Hints about a payload that are known before the torrent is added.
+struct PayloadInfo {
+    name: Option<String>,
+    /// Metainfo with fewer than two files. `None` for magnets: only the
+    /// metadata fetch can tell (rqbit's own rule for the default subfolder).
+    single_file: Option<bool>,
+}
+
 /// Recording the name before adding matters: rqbit writes files straight
 /// into the output folder, so ripdl always sets `sub_folder` to keep each
 /// task's artifacts in a dedicated, deletable directory.
-async fn resolve_payload(payload: &str) -> Result<(AddTorrent<'static>, Option<String>)> {
+async fn resolve_payload(payload: &str) -> Result<(AddTorrent<'static>, PayloadInfo)> {
     let p = payload.trim();
     if p.starts_with("magnet:") {
-        return Ok((AddTorrent::from_url(p.to_string()), magnet_display_name(p)));
+        return Ok((
+            AddTorrent::from_url(p.to_string()),
+            PayloadInfo {
+                name: magnet_display_name(p),
+                single_file: None,
+            },
+        ));
     }
     let bytes = if p.starts_with("http://") || p.starts_with("https://") {
         let client = reqwest::Client::builder()
@@ -202,18 +216,30 @@ async fn resolve_payload(payload: &str) -> Result<(AddTorrent<'static>, Option<S
         }
         std::fs::read(&path)?
     };
-    let name = metainfo_name(&bytes);
-    Ok((AddTorrent::from_bytes(Bytes::from(bytes)), name))
+    let info = metainfo_hints(&bytes);
+    Ok((AddTorrent::from_bytes(Bytes::from(bytes)), info))
 }
 
-/// Torrent name from metainfo bytes (None on any parse trouble; the
-/// fallback sub-folder keeps the task self-contained regardless).
-fn metainfo_name(bytes: &[u8]) -> Option<String> {
-    let parsed = librqbit::torrent_from_bytes(bytes).ok()?;
-    let name = parsed.info.data.name.as_ref()?;
-    std::str::from_utf8(name.as_ref())
-        .ok()
-        .map(str::to_string)
+/// Name + file count from metainfo bytes (best effort: any parse trouble
+/// leaves both unknown and the caller falls back to the task-owned root).
+fn metainfo_hints(bytes: &[u8]) -> PayloadInfo {
+    let Ok(parsed) = librqbit::torrent_from_bytes(bytes) else {
+        return PayloadInfo {
+            name: None,
+            single_file: None,
+        };
+    };
+    let name = parsed
+        .info
+        .data
+        .name
+        .as_ref()
+        .and_then(|n| std::str::from_utf8(n.as_ref()).ok())
+        .map(str::to_string);
+    // Single-file metainfo: a `length` with no `files` list (rqbit's own
+    // "fewer than two files" rule for the default subfolder).
+    let single_file = Some(parsed.info.data.length.is_some() && parsed.info.data.files.is_none());
+    PayloadInfo { name, single_file }
 }
 
 /// Info-hash from a magnet URI's `xt=urn:btih:` parameter (hex or base32
@@ -376,17 +402,33 @@ impl TorrentSession {
     /// writes files directly into its output folder, so ripdl sets
     /// `sub_folder` itself to keep artifacts contained and deletable.
     pub async fn ensure(&self, cfg: &TorrentConfig) -> Result<Ensured> {
-        let (add, name) = resolve_payload(&cfg.payload).await?;
-        let sub = match name {
-            Some(n) => sanitize_component(&n),
+        let (add, info) = resolve_payload(&cfg.payload).await?;
+        let sub = match &info.name {
+            Some(n) => sanitize_component(n),
             None => format!("ripdl-torrent-{}", cfg.id),
         };
         let root = cfg.dest_dir.join(&sub);
+        // rqbit joins `output_folder` with each file's relative path. For a
+        // multi-file torrent those paths are relative to the torrent name,
+        // so the task-owned root (<dest>/<name>) is correct. A single-file
+        // torrent's path is the file name itself: pointing output_folder at
+        // the destination gives <dest>/<name> (qBittorrent layout) instead
+        // of the old <dest>/<name>/<name>.
+        //
+        // Legacy guard: a single-file task already on disk as a nested
+        // folder keeps that root, so resume/seed never re-downloads it.
+        let single = info.single_file == Some(true);
+        let legacy_nested = single && root.is_dir();
+        let output_folder = if single && !legacy_nested {
+            cfg.dest_dir.clone()
+        } else {
+            root.clone()
+        };
         // rqbit takes either output_folder (absolute) or sub_folder
         // (relative to the session default), never both - pass the
         // combined task-owned root directly.
         let mut opts = AddTorrentOptions {
-            output_folder: Some(root.to_string_lossy().into_owned()),
+            output_folder: Some(output_folder.to_string_lossy().into_owned()),
             // Reuse files already on disk (resume/boot-restore/partial data):
             // with the default (false) rqbit refuses to open existing files
             // and the task fails with "error creating a new file". Overwrite
@@ -523,10 +565,22 @@ impl TorrentSession {
         let st = handle.stats();
         let live = st.live.as_ref();
         let paused = matches!(st.state, TorrentStatsState::Paused);
+        // Single-file torrents keep the file directly under the destination
+        // (output_folder IS the destination), so the display root must be
+        // the file itself, not the whole folder.
+        let root = handle
+            .with_metadata(|meta| {
+                let mut files = meta.info.iter_file_details();
+                match (files.next(), files.next()) {
+                    (Some(f), None) => handle.output_folder().join(f.filename.to_string()),
+                    _ => handle.output_folder().to_path_buf(),
+                }
+            })
+            .unwrap_or_else(|_| handle.output_folder().to_path_buf());
         let mut snapshot = TorrentDetailsSnapshot {
             info_hash: handle.info_hash().as_string(),
             name: handle.name(),
-            root: Some(handle.output_folder().to_path_buf()),
+            root: Some(root),
             total: st.total_bytes,
             downloaded: st.progress_bytes,
             finished: st.finished,
@@ -602,7 +656,8 @@ impl TorrentSession {
     /// dialog. The session is reusable: list-only adds never touch the
     /// managed db, so previewing can't corrupt or hijack real tasks.
     pub async fn preview(&self, payload: &str) -> Result<TorrentPreviewSnapshot> {
-        let (add, name) = resolve_payload(payload).await?;
+        let (add, info) = resolve_payload(payload).await?;
+        let name = info.name;
         let opts = AddTorrentOptions {
             list_only: true,
             ..AddTorrentOptions::default()
@@ -934,14 +989,15 @@ mod tests {
         .expect("download finished in time")
         .expect("download ok");
 
-        // The output root holds the file with identical contents.
+        // The output root holds the file with identical contents. A
+        // single-file torrent lands at <dest>/<name> (qBittorrent layout),
+        // not the old nested <dest>/<name>/<name>.
         let produced = out.root;
-        assert!(produced.is_file() || produced.is_dir(), "root exists: {produced:?}");
-        let got = if produced.is_file() {
-            std::fs::read(&produced).unwrap()
-        } else {
-            std::fs::read(produced.join("payload.bin")).unwrap()
-        };
+        assert!(
+            produced.is_file(),
+            "single-file torrent root is the file itself: {produced:?}"
+        );
+        let got = std::fs::read(&produced).unwrap();
         assert_eq!(got, data, "payload round-tripped identically");
         assert!(
             seen.load(std::sync::atomic::Ordering::Relaxed) >= data.len() as u64,
@@ -1254,7 +1310,8 @@ mod tests {
         let m = resolve_payload("magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=Sintel")
             .await
             .unwrap();
-        assert_eq!(m.1.as_deref(), Some("Sintel"));
+        assert_eq!(m.1.name.as_deref(), Some("Sintel"));
+        assert_eq!(m.1.single_file, None, "magnets only learn the file count from metadata");
         let not_torrent = resolve_payload("D:\\no\\such\\file.zip").await;
         assert!(matches!(not_torrent, Err(Error::InvalidUrl(_))));
     }

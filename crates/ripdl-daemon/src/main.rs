@@ -1599,8 +1599,8 @@ impl Daemon {
     /// Terminal success with the produced file, remembered for the
     /// "open file" / "delete files" flows (and byte counters for the UI).
     /// Size of a path on disk: files measure directly, directories sum
-    /// their contents recursively. None for absent paths (torrent roots are
-    /// folders, so plain `metadata.len()` would report 0).
+    /// their contents recursively. None for absent paths (multi-file torrent
+    /// roots are folders, where plain `metadata.len()` would report 0).
     fn disk_size(p: &std::path::Path) -> Option<u64> {
         let meta = std::fs::metadata(p).ok()?;
         if !meta.is_dir() {
@@ -1729,8 +1729,8 @@ fn delete_artifacts(rec: &TaskRecord) -> Vec<PathBuf> {
         }
     };
     if let Some(f) = &rec.dest_file {
-        // Torrent roots are directories (multi-file layout); HTTP/video are
-        // plain files. Sidecar logic only applies to files.
+        // Multi-file torrent roots are directories; single-file torrents and
+        // HTTP/video tasks are plain files. Sidecar logic applies to files.
         if f.is_dir() {
             if std::fs::remove_dir_all(f).is_ok() {
                 deleted.push(f.to_path_buf());
