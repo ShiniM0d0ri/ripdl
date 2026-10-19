@@ -192,6 +192,13 @@ category-coloured file-type glyphs in the name cell, sidebar category icons,
 an icon context menu whose Pause/Resume entry follows the row state, a kind
 hint in row tooltips, and volatile cells keyed by class (the kind column had
 silently shifted the index-based updater).
+v0.3.8: persistent torrent seeding + post-restart visibility (boot restore of
+completed/paused torrents, 2 s upload/peer watcher, lifetime uploaded, row
+seeding state + up rate, stop/start from the row, ratio/time limits in
+Settings; verified live against the real queue). Also the clean-room
+qBittorrent options inventory (275 controls / 9 pages). Known follow-up:
+single-file torrents land in `<dest>/<name>/<name>` instead of qB's
+`<dest>/<name>` - fixing it must keep existing on-disk roots resumable.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root
