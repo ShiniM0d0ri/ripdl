@@ -10,9 +10,11 @@ use ripdl_core::bridge;
 use ripdl_core::categories::categorize;
 use ripdl_core::engine::percent_decode_lossy;
 use ripdl_core::rpc::{Command, DaemonSettings, Reply, Request, Response, TaskInfo};
-use ripdl_core::transport;
 use ripdl_core::task::TaskKind;
+use ripdl_core::transport;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+mod single_instance;
 
 /// One-shot RPC round trip against the daemon, with a single
 /// spawn-and-retry recovery: cold starts (fresh login after boot) make the
@@ -386,6 +388,17 @@ fn expect_ok(reply: Reply) -> Result<(), String> {
 }
 
 fn main() {
+    // One GUI per machine: a second launch asks the running window to come
+    // forward and exits before any window or tray icon is created.
+    let guard = match single_instance::claim() {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("ripdl: single-instance guard unavailable ({e}); starting anyway");
+            None
+        }
+    };
+
     tauri::Builder::default()
         .manage(GuiPrefs::default())
         .invoke_handler(tauri::generate_handler![
@@ -409,8 +422,20 @@ fn main() {
             open_url,
             exit_app
         ])
-        .setup(|app| {
+        .setup(move |app| {
             use tauri::Manager;
+
+            // Serve "show" requests from later launches.
+            if let Some(guard) = guard {
+                let handle = app.handle().clone();
+                guard.spawn_listener(move || {
+                    if let Some(w) = handle.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.unminimize();
+                        let _ = w.set_focus();
+                    }
+                });
+            }
 
             // Sync the tray preference from the daemon settings.
             let handle = app.handle().clone();

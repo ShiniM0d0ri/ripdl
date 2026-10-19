@@ -136,7 +136,10 @@ with native browse, per-row location display, open file/folder via Explorer
 settings panel + tray landed: `GetConfig`/`SetConfig` RPC (core
 `DaemonSettings`, full-replace, `config.json` persisted, concurrency
 resizes the runner semaphore live), GUI Settings dialog (toolbar gear),
-tray icon with close-to-tray (`hide_to_tray` preference in config.json).
+tray icon with close-to-tray (`hide_to_tray` preference in config.json),
+single-instance guard (a second GUI launch asks the running window to come
+forward and exits; `\\.\pipe\ripdl-gui` on Windows, `<data_dir>/gui.sock`
+elsewhere).
 Remaining P2: nothing major.
 Update mechanism landed: `ripdl-core::update` (GitHub Releases probe of
 `api.github.com`, v-compare, tests incl. mock server), RPC `CheckUpdate` →

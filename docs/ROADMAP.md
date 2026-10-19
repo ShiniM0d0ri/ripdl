@@ -220,6 +220,8 @@ M3.4 - tests / verification:
 
 ## P8 - task UX + OS integration
 
+- [x] Single app instance: a second launch focuses the running window and
+      exits (named-pipe/unix-socket guard in the GUI, no duplicate daemons)
 - [ ] Categories: per-category destination, queue slot, speed policy;
       auto-categorize on add (extension heuristic already exists)
 - [ ] Search, filter (status/kind/host), sort columns; multi-select batch
