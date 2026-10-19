@@ -375,11 +375,15 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
     font-weight: 600; font-size: 14px; color: #333c44;
 }
 .set-title em { font-weight: 400; font-style: normal; color: #889; font-size: 11.5px; margin-left: 6px; flex: 1; }
-#set-close {
+#set-close,
+#abt-close {
     border: none; background: none; font-size: 18px; cursor: pointer; color: #667;
     padding: 0 6px; border-radius: 4px;
 }
-#set-close:hover { background: #eef1f4; }
+/* The Settings title has a flex:1 subtitle; About has none, so push the X. */
+#abt-close { margin-left: auto; }
+#set-close:hover,
+#abt-close:hover { background: #eef1f4; }
 #set-body { display: flex; flex-direction: column; gap: 7px; }
 .set-row {
     display: grid; grid-template-columns: 190px 1fr 92px;
