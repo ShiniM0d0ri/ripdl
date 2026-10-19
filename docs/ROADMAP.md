@@ -203,7 +203,9 @@ M3.4 - tests / verification:
       `[Run]` uses `runasoriginaluser`). v0.3.6 launches Setup with the shell's
       default verb so Setup elevates itself and the relaunched GUI is not left
       elevated, and adds a real About dialog (Help > About ripdl: running
-      version via the new `app_version` command, licence, links).
+      version via the new `app_version` command, licence, links). v0.3.7
+      installs with `/SILENT` (UAC only, no wizard, app relaunches itself)
+      and hides a stale update banner when a check reports "current".
 - [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n
@@ -237,9 +239,15 @@ M3.4 - tests / verification:
 - [x] Single app instance: a second launch focuses the running window and
       exits (named-pipe/unix-socket guard in the GUI, no duplicate daemons)
 - [x] GUI chrome: icon-only toolbar + SVG state/row icons (one inline sprite,
-      tooltips for labels), 60 s total-speed strip with now/avg readout
-      (canvas, DPR-scaled), inline installer-failure reason in the banner,
-      About dialog under Help (version, licence, links, update check)
+      tooltips for labels), sidebar category icons, 60 s total-speed strip with
+      now/avg readout (canvas, DPR-scaled), inline installer-failure reason in
+      the banner, About dialog under Help (version, licence, links, update
+      check)
+- [x] Torrent vs HTTP at a glance: dedicated icon-only kind column (magnet /
+      download / film with tooltips), category-coloured file-type glyph in the
+      name cell, kind hint in the row tooltip, "Torrent details..." hidden for
+      non-torrent rows, icon context menu (toggle retitled Pause/Resume per
+      row); volatile cells now addressed by class so columns can't shift them
 - [ ] Categories: per-category destination, queue slot, speed policy;
       auto-categorize on add (extension heuristic already exists)
 - [ ] Search, filter (status/kind/host), sort columns; multi-select batch

@@ -118,7 +118,8 @@ function rowName(t) {
 // Multi-line title for a row: full error + diagnostics.
 function detailsTitle(t) {
     const lines = [];
-    lines.push(t.url || "");
+    const k = kindOf(t);
+    lines.push(`${k.label}: ${t.url || ""}`);
     if (t.dest_dir) lines.push("Location: " + t.dest_dir);
     if (t.info_hash) lines.push("Info-hash: " + t.info_hash);
     if (t.error) { lines.push("Error: " + t.error); const h = errorHint(t.error); if (h) lines.push(h); }
@@ -180,14 +181,40 @@ function etaOf(t) {
 function ico(name, cls = "") {
     return `<svg class="ico ${cls}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 }
-const STATE_ICON = {
-    completed: ico("check", "green"), running: ico("download", "blue"),
-    queued: ico("clock", "gray"), paused: ico("pause", "gray"),
-    failed: ico("alert", "red"), cancelled: ico("x", "gray"),
-    timed: ico("clock", "amber"), hunt: ico("film", "violet"),
-    downloading: ico("download", "blue"), verifying: ico("search", "gray"),
-    seeding: ico("up", "green"), metadata: ico("globe", "blue"),
+
+// One icon per sidebar category, reused for the row's file-type glyph.
+const CAT_ICON = {
+    all: "inbox", unfinished: "clock", completed: "check", torrents: "magnet",
+    video: "film", music: "music", images: "image", documents: "doc",
+    archives: "box", programs: "app", other: "file",
 };
+
+// Transport, not content: this is what tells a torrent row apart from a plain
+// HTTP download at a glance (and hints that torrent rows have a details view).
+const KIND = {
+    torrent: { icon: "magnet", cls: "green", label: "BitTorrent", hint: "double-click for files, peers and trackers" },
+    http: { icon: "download", cls: "blue", label: "HTTP", hint: "multi-segment download" },
+    video: { icon: "film", cls: "violet", label: "Video", hint: "stream page handled by yt-dlp" },
+};
+
+function kindOf(t) {
+    return KIND[t.kind] || KIND.http;
+}
+
+// Row glyph: what the file *is* (film/music/archive/...). Torrent payloads
+// without an extension are multi-file folders, so they get the box icon.
+function fileIcon(t) {
+    let cat = categoryOf(rowName(t));
+    if (cat === "other" && t.kind === "torrent") cat = "archives";
+    return ico(CAT_ICON[cat] || "file", "cat-" + cat);
+}
+
+function kindCell(t) {
+    const k = kindOf(t);
+    const tip = `${k.label} \u2014 ${k.hint}`;
+    return `<td class="kind-cell" title="${escapeHtml(tip)}">${ico(k.icon, k.cls)}</td>`;
+}
+
 const STATUS_ICON = {
     completed: ico("check"), running: ico("download"), queued: ico("clock"),
     timed: ico("clock"), paused: ico("pause"), failed: ico("alert"),
@@ -198,7 +225,9 @@ const STATUS_ICON = {
 function renderSidebar(counts) {
     $("#side-items").innerHTML = CATALOG.map((cat) => `
       <div class="side-item ${cat === currentCategory ? "active" : ""}" data-cat="${cat}">
-        <span>${CAT_LABEL[cat]}</span><span class="count">${counts[cat] ?? 0}</span>
+        <span class="side-ico">${ico(CAT_ICON[cat])}</span>
+        <span class="side-label">${CAT_LABEL[cat]}</span>
+        <span class="count">${counts[cat] ?? 0}</span>
       </div>`).join("");
 }
 
@@ -226,14 +255,18 @@ let rowCache = new Map();
 
 // Volatile cells only: bytes, percent, bar width, ETA, speed. The layout
 // (icons, state label, buttons, error text) is structural and untouched.
+// Cells are addressed by class, not index, so inserting a column (the kind
+// column did exactly this) can never silently shift these writes.
 function refreshVolatile(t) {
     const tr = rowCache.get(t.id);
-    // tr.cells: HTMLTableRowElement's live cell collection (columns: name,
-    // status, size, progress, eta, speed, actions).
-    if (!tr || tr.cells.length < 6) return;
-    tr.cells[2].textContent = sizeText(t);
-    tr.cells[4].textContent = etaOf(t) || "-";
-    tr.cells[5].textContent = t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
+    if (!tr) return;
+    const set = (sel, txt) => {
+        const el = tr.querySelector(sel);
+        if (el && el.textContent !== txt) el.textContent = txt;
+    };
+    set(".size-cell", sizeText(t));
+    set(".eta-cell", etaOf(t) || "-");
+    set(".speed-cell", t.speed_bps ? `${humans(t.speed_bps)}/s` : "-");
     const pct = percentOf(t);
     if (pct == null) return; // pc-less layout is structural (no-total cases)
     const fill = tr.querySelector(".prog-fill");
@@ -280,14 +313,15 @@ function render() {
         const cls = t.id === selectedId ? ' class="selected"' : "";
         return `<tr${cls} data-id="${t.id}">
           <td class="name-cell" title="${escapeHtml(detailsTitle(t))}">
-            <div class="fname-cell"><span class="ficon">${STATE_ICON[state] || "&#128230;"}</span><span title="${escapeHtml(name)}">${escapeHtml(name)}</span></div>
+            <div class="fname-cell"><span class="ficon">${fileIcon(t)}</span><span title="${escapeHtml(name)}">${escapeHtml(name)}</span></div>
             <div class="fdir" title="${escapeHtml(dir)}">${escapeHtml(dir)}</div>
           </td>
+          ${kindCell(t)}
           <td class="st-${state}" title="${escapeHtml(errorTitle(t.error))}"><span class="st-ico">${STATUS_ICON[state] || ""}</span>${state}${t.error ? '<div class="st-err">' + escapeHtml(shortError(t.error)) + '</div>' : ""}</td>
-          <td>${size}</td>
+          <td class="size-cell">${size}</td>
           <td class="prog-cell">${prog}</td>
-          <td>${eta}</td>
-          <td>${speed}</td>
+          <td class="eta-cell">${eta}</td>
+          <td class="speed-cell">${speed}</td>
           <td class="col-act">${actionButtons(t)}</td>
         </tr>`;
     }).join("");
@@ -364,6 +398,18 @@ function escapeHtml(s) {
 }
 
 function showCtx(x, y) {
+    // Retitle the toggle per task (Pause vs Resume) and hide entries that do
+    // not apply: completed rows have nothing to toggle; only torrent rows
+    // have a details view.
+    const t = selectedId ? findTask(selectedId) : null;
+    const running = !!t && ["running", "queued"].includes(t.state);
+    const toggle = $("#ctx [data-act=toggle]");
+    const useEl = $("#ctx-toggle-ico use");
+    if (useEl) useEl.setAttribute("href", running ? "#i-pause" : "#i-play");
+    $("#ctx-toggle-lbl").textContent = running ? "Pause" : "Resume";
+    toggle.classList.toggle("hidden", !!t && t.state === "completed");
+    $("#ctx .ctx-torrent").classList.toggle("hidden", !t || t.kind !== "torrent");
+
     const menu = $("#ctx");
     menu.classList.remove("hidden");
     menu.style.left = Math.min(x, innerWidth - 190) + "px";
@@ -672,8 +718,13 @@ async function runUpdateCheck(initial) {
             `New version <b>v${escapeHtml(info.latest)}</b> is available` +
             ` <span class="update-dim">(running v${escapeHtml(info.current)})</span>`;
         $("#update-banner").classList.remove("hidden");
-    } else if (!initial) {
-        flashStatus(`ripdl v${info.current} is up to date`);
+    } else {
+        // A check that says "current" must clear a banner left over from an
+        // earlier daemon/session (e.g. an in-app update swapped the daemon
+        // after the banner was rendered - it must not keep offering a version
+        // that is already installed).
+        $("#update-banner").classList.add("hidden");
+        if (!initial) flashStatus(`ripdl v${info.current} is up to date`);
     }
 }
 
@@ -684,7 +735,7 @@ async function installUpdate() {
     el.textContent = "Downloading & verifying the new setup\u2026";
     try {
         await invokeSafe("install_update");
-        el.textContent = "Installer launched \u2014 approve the Windows prompt to finish installing.";
+        el.textContent = "Installing \u2014 approve the Windows prompt; ripdl will restart when it finishes.";
     } catch (e) {
         const msg = String(e).replace(/^.*error: /, "").trim();
         flashErr(msg);

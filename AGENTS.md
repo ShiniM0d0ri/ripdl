@@ -182,6 +182,16 @@ release, queue preserved, v0.3.6 relaunched the GUI *unelevated*: token check
 0). Same release: real About dialog (Help > About ripdl) with the running
 version from the new `app_version` command, licence, and source/releases/issues
 links.
+v0.3.7: the in-app path installs with `/SILENT` (UAC stays the single
+confirmation - no wizard pages) and `[Run]` no longer skips silent installs, so
+the app relaunches by itself. A check that reports "current" now also hides a
+stale banner: swapping the daemon during an update used to leave the old banner
+offering the version that had just been installed. Also the "torrent vs HTTP"
+pass: a dedicated icon-only kind column (magnet / download / film, tooltips),
+category-coloured file-type glyphs in the name cell, sidebar category icons,
+an icon context menu whose Pause/Resume entry follows the row state, a kind
+hint in row tooltips, and volatile cells keyed by class (the kind column had
+silently shifted the index-based updater).
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

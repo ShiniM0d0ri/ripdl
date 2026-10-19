@@ -437,22 +437,26 @@ fn shell_execute_elevated(path: &std::path::Path, args: &str) -> Result<()> {
 }
 
 /// Launch the downloaded installer (Inno Setup stops the running app and
-/// replaces it in place itself). `silent` = `/VERYSILENT /NORESTART`, the
-/// unattended auto-install path; a non-elevated process re-launches through
-/// ShellExecute so the UAC prompt appears instead of failing with error 740.
+/// replaces it in place itself). A user-clicked "Download & Install" uses
+/// `/SILENT` (progress window only - UAC is the single confirmation);
+/// the unattended boot path uses `/VERYSILENT` (no window at all). A
+/// non-elevated process re-launches through the shell so the UAC prompt
+/// appears instead of failing with error 740.
 pub fn run_installer(path: &std::path::Path, silent: bool) -> Result<()> {
     #[cfg(windows)]
     {
-        let args = if silent { "/VERYSILENT /NORESTART" } else { "" };
+        let args = if silent {
+            "/VERYSILENT /NORESTART"
+        } else {
+            "/SILENT /NORESTART"
+        };
         if !is_elevated() {
             return shell_execute_elevated(path, args);
         }
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut cmd = std::process::Command::new(path);
-        if silent {
-            cmd.args(["/VERYSILENT", "/NORESTART"]);
-        }
+        cmd.args(args.split_whitespace());
         cmd.creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map(|_| ())

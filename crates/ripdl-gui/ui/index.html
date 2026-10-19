@@ -27,6 +27,15 @@
       <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v11M7 10l5 5 5-5M5 21h14"/></symbol>
       <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 21V10M7 15l5-5 5 5"/></symbol>
       <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></symbol>
+      <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/></symbol>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 16l-5-5-7 7"/></symbol>
+      <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></symbol>
+      <symbol id="i-box" viewBox="0 0 24 24"><path d="M12 3l9 5v8l-9 5-9-5V8z"/><path d="M3 8l9 5 9-5M12 13v8"/></symbol>
+      <symbol id="i-app" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></symbol>
+      <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M4 13h4l2 3h4l2-3h4"/><path d="M5 4h14l2 9v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></symbol>
+      <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5M3 17l9 5 9-5"/></symbol>
     </defs>
   </svg>
   <div id="menubar">
@@ -65,8 +74,8 @@
   <div id="update-banner" class="hidden">
     <span id="update-text"></span>
     <span class="update-gap"></span>
-    <button id="update-install" class="primary">Download &amp; Install</button>
-    <button id="update-open">Open release page</button>
+    <button id="update-install" class="primary"><svg class="ico"><use href="#i-download"/></svg>Download &amp; Install</button>
+    <button id="update-open"><svg class="ico"><use href="#i-external"/></svg>Release page</button>
     <button id="update-dismiss" title="Dismiss">&times;</button>
   </div>
 
@@ -81,6 +90,7 @@
         <thead>
           <tr>
             <th class="col-name">File Name</th>
+            <th class="col-kind" title="Download kind"><svg class="ico"><use href="#i-layers"/></svg></th>
             <th class="col-status">Status</th>
             <th class="col-size">Size</th>
             <th class="col-prog">Progress</th>
@@ -91,7 +101,10 @@
         </thead>
         <tbody id="task-rows"></tbody>
       </table>
-      <div id="empty-hint">No downloads in this view. Click the <b>+</b> button to start one.</div>
+      <div id="empty-hint">
+        <svg class="ico empty-ico" aria-hidden="true"><use href="#i-inbox"/></svg>
+        <div>No downloads in this view. Click the <b>+</b> button to start one.</div>
+      </div>
     </div>
   </div>
 
@@ -131,7 +144,7 @@
       <div class="dlg-row">
         <label for="dlg-dest">Save to</label>
         <input id="dlg-dest" type="text" placeholder="&lt;your downloads folder&gt;" />
-        <button id="dlg-browse">Browse&hellip;</button>
+        <button id="dlg-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
       </div>
       <div class="dlg-actions">
         <button id="dlg-cancel">Cancel</button>
@@ -166,15 +179,15 @@
     </div>
   </div>
 
-  <!-- Row context menu -->
+  <!-- Row context menu (icons; the toggle entry is retitled per task) -->
   <div id="ctx" class="hidden">
-    <div data-act="toggle">Pause / Resume</div>
-    <div data-act="details" class="ctx-torrent">Torrent details&hellip;</div>
-    <div data-act="openFile">Open file</div>
-    <div data-act="openFolder">Open download folder</div>
+    <div data-act="toggle"><svg class="ico" id="ctx-toggle-ico"><use href="#i-pause"/></svg><span id="ctx-toggle-lbl">Pause</span></div>
+    <div data-act="details" class="ctx-torrent"><svg class="ico"><use href="#i-info"/></svg>Torrent details&hellip;</div>
+    <div data-act="openFile"><svg class="ico"><use href="#i-file"/></svg>Open file</div>
+    <div data-act="openFolder"><svg class="ico"><use href="#i-folder"/></svg>Open download folder</div>
     <hr />
-    <div data-act="remove">Remove from list</div>
-    <div data-act="deleteFiles">Remove &amp; delete files</div>
+    <div data-act="remove"><svg class="ico"><use href="#i-x"/></svg>Remove from list</div>
+    <div data-act="deleteFiles"><svg class="ico"><use href="#i-trash"/></svg>Remove &amp; delete files</div>
   </div>
 
   <!-- Torrent details dialog -->
@@ -205,7 +218,7 @@
         <div class="set-row"><label for="set-speed">Speed cap (shared)</label><input id="set-speed" type="text" placeholder="e.g. 2MiB, empty = unlimited" /></div>
         <div class="set-row"><label for="set-dir">Default download folder</label>
           <input id="set-dir" type="text" placeholder="(user Downloads)" />
-          <button id="set-dir-browse">Browse&hellip;</button>
+          <button id="set-dir-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
         </div>
         <div class="set-row"><label for="set-ytdlp">yt-dlp path</label><input id="set-ytdlp" type="text" placeholder="yt-dlp (on PATH)" /></div>
         <div class="set-row"><label for="set-tray">Minimize to tray on close</label><input id="set-tray" type="checkbox" class="chk-box" /></div>

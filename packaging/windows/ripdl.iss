@@ -60,8 +60,9 @@ Type: filesandordirs; Name: "{app}\ext"
 [Run]
 ; runasoriginaluser: Setup runs elevated (Program Files), but the app itself
 ; has no need for admin rights - after an in-app update the relaunched GUI
-; used to inherit the elevation.
-Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall nowait skipifsilent runasoriginaluser
+; must not inherit the elevation. No skipifsilent: the in-app path installs
+; with /SILENT (progress only), and the app should still come back by itself.
+Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall nowait runasoriginaluser
 
 [UninstallRun]
 ; The native-messaging registrations below are deleted from Pascal code so
