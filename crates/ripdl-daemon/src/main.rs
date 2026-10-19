@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -111,8 +111,15 @@ fn forget_seed_watch(
 struct ProgressTrack {
     last: Progress,
     speed: Option<f64>,
-    at: Instant,
+    /// `(when, cumulative bytes)` samples inside the rate window. A sliding
+    /// window over real elapsed time beats a per-tick delta: tick jitter and
+    /// short bursts (a stalled link catching up) otherwise read as GB/s
+    /// spikes followed by hard zeros.
+    window: VecDeque<(Instant, u64)>,
 }
+
+/// Speed is averaged over this much wall time (>= 2 samples).
+const RATE_WINDOW: Duration = Duration::from_secs(2);
 
 struct Daemon {
     port: u16,
@@ -1748,50 +1755,49 @@ impl Daemon {
         self.progress.lock().unwrap().remove(id);
     }
 
-    /// Track per-task progress and derive an EMA-smoothed speed.
+    /// Track per-task progress and derive a window-averaged speed.
     fn on_progress(&self, id: &str, p: Progress) {
         let mut map = self.progress.lock().unwrap();
+        let now = Instant::now();
         // or_insert_with clones Progress only on the first tick per task;
         // the common path skips the eager clone and the extra hash lookup.
         let entry = map.entry(id.to_string()).or_insert_with(|| ProgressTrack {
             last: p.clone(),
             speed: None,
-            at: Instant::now(),
+            window: VecDeque::new(),
         });
-        let now = Instant::now();
         // Resume/recheck hash pass: `downloaded` counts verified bytes and
         // climbs at disk speed, so a derived rate would show hundreds of MB/s
-        // and poison the 60 s speed graph. Report no speed; the baseline is
-        // re-anchored here so the first real sample after the pass is sane.
-        if p.verifying {
+        // and poison the 60 s speed graph. Report no speed and drop the
+        // window so the first real sample starts from a clean baseline.
+        // Percent-only samples (the yt-dlp sidecar) have no byte rate either.
+        if p.verifying || p.percent.is_some() {
             entry.speed = None;
+            entry.window.clear();
             entry.last = p;
-            entry.at = now;
             return;
         }
-        match p.percent {
-            // Byte-free progress (video sidecar): percent only, no speed.
-            Some(_) => entry.speed = None,
-            None => {
-                // Torrents carry their own smoothed rate from librqbit; trust
-                // it over the byte delta, which jumps when an existing payload
-                // is adopted (resume/adopt after a restart) and would read as
-                // a multi-GB/s "download". HTTP samples leave it None.
-                let dt = now.duration_since(entry.at).as_secs_f64().max(0.05);
-                let inst = p
-                    .speed_bps
-                    .unwrap_or_else(|| {
-                        (p.downloaded as f64 - entry.last.downloaded as f64) / dt
-                    })
-                    .clamp(0.0, 1.0e12);
-                entry.speed = Some(match entry.speed {
-                    Some(s) => 0.7 * inst + 0.3 * s,
-                    None => inst,
-                });
-            }
+        entry.window.push_back((now, p.downloaded));
+        // Keep ~2 s of samples (never fewer than two, so a fresh task still
+        // gets a span once its second tick lands).
+        while entry.window.len() > 2
+            && now.duration_since(entry.window[0].0) > RATE_WINDOW
+        {
+            entry.window.pop_front();
         }
+        let rate = match (entry.window.front(), entry.window.back()) {
+            (Some(&(t0, b0)), Some(&(t1, b1))) => {
+                let dt = t1.duration_since(t0).as_secs_f64();
+                // Under half a second the delta is too bursty to display.
+                (dt >= 0.5).then(|| ((b1.saturating_sub(b0)) as f64 / dt).clamp(0.0, 1.0e12))
+            }
+            _ => None,
+        };
+        // Torrents carry librqbit's own smoothed rate; prefer it (adopted
+        // bytes on resume would otherwise look like a burst). HTTP samples
+        // leave `speed_bps` None and use the window.
+        entry.speed = p.speed_bps.or(rate);
         entry.last = p;
-        entry.at = now;
     }
 }
 
