@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ripdl",
-  "version": "0.3.2",
   "identifier": "app.ripdl.desktop",
   "build": {
     "frontendDist": "ui"

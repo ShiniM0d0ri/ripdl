@@ -8,7 +8,6 @@ const $ = (sel) => document.querySelector(sel);
 // Static skeleton, queried once (used by every 500ms poll tick).
 const TBODY = document.getElementById("task-rows");
 const ST_COUNTS = document.getElementById("st-counts");
-const ST_SPEED = document.getElementById("st-speed");
 
 const CATEGORY_EXT = {
     video: ["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv", "m4v", "mpg", "mpeg"],
@@ -177,15 +176,23 @@ function etaOf(t) {
     return h > 0 ? `${h}h ${m}m` : `${m}m ${Math.floor(left % 60)}s`;
 }
 
+// Inline sprite lookup; `cls` adds a color/utility class to the <svg>.
+function ico(name, cls = "") {
+    return `<svg class="ico ${cls}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+}
 const STATE_ICON = {
-    completed: "✔", running: "▶", queued: "⏳",
-    paused: "⏸", failed: "✖", cancelled: "⏸", timed: "⏰", hunt: "🎬",
-    downloading: "▶", verifying: "🔍", seeding: "⇅", metadata: "🌐",
+    completed: ico("check", "green"), running: ico("download", "blue"),
+    queued: ico("clock", "gray"), paused: ico("pause", "gray"),
+    failed: ico("alert", "red"), cancelled: ico("x", "gray"),
+    timed: ico("clock", "amber"), hunt: ico("film", "violet"),
+    downloading: ico("download", "blue"), verifying: ico("search", "gray"),
+    seeding: ico("up", "green"), metadata: ico("globe", "blue"),
 };
 const STATUS_ICON = {
-    completed: "✅", running: "⬇", queued: "🕒", timed: "⏰",
-    paused: "⏸", failed: "❌", cancelled: "❌", hunt: "🎬",
-    downloading: "⬇", verifying: "🔍", seeding: "🌱", metadata: "🌐",
+    completed: ico("check"), running: ico("download"), queued: ico("clock"),
+    timed: ico("clock"), paused: ico("pause"), failed: ico("alert"),
+    cancelled: ico("x"), hunt: ico("film"), downloading: ico("download"),
+    verifying: ico("search"), seeding: ico("up"), metadata: ico("globe"),
 };
 
 function renderSidebar(counts) {
@@ -235,10 +242,10 @@ function refreshVolatile(t) {
     if (pctSpan) pctSpan.textContent = `${pctText(pct, stateLabel(t))}%`;
 }
 
+// Speed lives in the top strip; the status bar stays counts-only.
 function statusbarText() {
     const running = tasks.filter((t) => ["running", "queued"].includes(t.state)).length;
-    const totalSpeed = tasks.reduce((s, t) => s + (t.speed_bps || 0), 0);
-    return [`${running} active · ${tasks.length} in list`, `${humans(totalSpeed)} per second`];
+    return `${running} active · ${tasks.length} in list`;
 }
 
 function render() {
@@ -337,15 +344,19 @@ function renderKeepSelection() { render(); }
 
 function actionButtons(t) {
     const idAttr = `data-id="${t.id}"`;
-    const stop = `
-      <button class="row-btn" ${idAttr} data-act="toggle" title="Pause / Resume">
-        ${["running", "queued"].includes(t.state) ? "&#9646;&#8709;" : "&#10148;"}
+    const running = ["running", "queued"].includes(t.state);
+    // Completed rows have nothing to pause/resume.
+    const stop = t.state === "completed" ? "" : `
+      <button class="row-btn" ${idAttr} data-act="toggle" title="${running ? "Pause" : "Resume"}">
+        ${ico(running ? "pause" : "play")}
       </button>`;
+    const openFile = t.state === "completed" ? `
+      <button class="row-btn" ${idAttr} data-act="openFile" title="Open file">${ico("file")}</button>` : "";
     const open = `
-      <button class="row-btn" ${idAttr} data-act="openFolder" title="Open download folder">&#128446;</button>`;
+      <button class="row-btn" ${idAttr} data-act="openFolder" title="Open download folder">${ico("folder")}</button>`;
     const rm = `
-      <button class="row-btn" ${idAttr} data-act="deleteFiles" title="Delete from list AND disk">&#128465;</button>`;
-    return `<span class="actions">${stop}${open}${rm}</span>`;
+      <button class="row-btn" ${idAttr} data-act="deleteFiles" title="Delete from list AND disk">${ico("trash")}</button>`;
+    return `<span class="actions">${stop}${openFile}${open}${rm}</span>`;
 }
 
 function escapeHtml(s) {
@@ -451,11 +462,89 @@ function schedulePoll() {
 }
 document.addEventListener("visibilitychange", schedulePoll);
 
+/* Total-speed graph: 60 s rolling window, sampled on every poll tick. */
+const SPEED_WINDOW_MS = 60000;
+const speedHistory = []; // { t: epoch ms, v: bytes/sec }
+
+function sampleSpeed(bps) {
+    const now = Date.now();
+    speedHistory.push({ t: now, v: bps });
+    while (speedHistory.length > 2 && now - speedHistory[0].t > SPEED_WINDOW_MS) {
+        speedHistory.shift();
+    }
+}
+
+function drawSpeedGraph() {
+    const c = $("#speedgraph");
+    if (!c || !c.clientWidth) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth;
+    const h = c.clientHeight;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+        c.width = Math.round(w * dpr);
+        c.height = Math.round(h * dpr);
+    }
+    const ctx = c.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    // Baseline/grid.
+    ctx.strokeStyle = "#e3e7eb";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, h - 0.5);
+    ctx.lineTo(w, h - 0.5);
+    ctx.stroke();
+    if (speedHistory.length < 2) return;
+
+    const now = Date.now();
+    const peak = Math.max(1, ...speedHistory.map((p) => p.v));
+    const ymax = peak * 1.18; // headroom so the peak never touches the top
+    const px = (t) => w - ((now - t) / SPEED_WINDOW_MS) * w;
+    const py = (v) => h - 2 - (v / ymax) * (h - 4);
+
+    // Filled area under the curve.
+    ctx.beginPath();
+    ctx.moveTo(px(speedHistory[0].t), h);
+    for (const p of speedHistory) ctx.lineTo(px(p.t), py(p.v));
+    ctx.lineTo(px(speedHistory[speedHistory.length - 1].t), h);
+    ctx.closePath();
+    const fill = ctx.createLinearGradient(0, 0, 0, h);
+    fill.addColorStop(0, "rgba(53,162,53,.40)");
+    fill.addColorStop(1, "rgba(53,162,53,.04)");
+    ctx.fillStyle = fill;
+    ctx.fill();
+
+    // Speed line.
+    ctx.beginPath();
+    speedHistory.forEach((p, i) => {
+        const x = px(p.t);
+        const y = py(p.v);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = "#2f8f3a";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+}
+window.addEventListener("resize", drawSpeedGraph);
+
 function renderStatusbar() {
+    const totalSpeed = tasks.reduce((s, t) => s + (t.speed_bps || 0), 0);
+    sampleSpeed(totalSpeed);
+    const nowEl = $("#ss-now");
+    if (nowEl) nowEl.textContent = `${humans(totalSpeed)}/s`;
+    const avgEl = $("#ss-avg");
+    if (avgEl) {
+        const avg = speedHistory.length
+            ? speedHistory.reduce((s, p) => s + p.v, 0) / speedHistory.length
+            : 0;
+        avgEl.textContent = `${humans(Math.round(avg))}/s`;
+    }
+    drawSpeedGraph();
+
     if (Date.now() < statusFlashUntil) return; // flashing a message
-    const [countsTxt, speedTxt] = statusbarText();
+    const countsTxt = statusbarText();
     if (ST_COUNTS.textContent !== countsTxt) ST_COUNTS.textContent = countsTxt;
-    if (ST_SPEED.textContent !== speedTxt) ST_SPEED.textContent = speedTxt;
 }
 
 /* Toolbar */
@@ -578,8 +667,9 @@ async function installUpdate() {
         await invokeSafe("install_update");
         el.textContent = "Installer launched \u2014 follow its prompts; ripdl will close and reopen itself.";
     } catch (e) {
-        flashErr(String(e).replace(/^.*error: /, ""));
-        el.textContent = "Install failed \u2014 use \u201cOpen release page\u201d instead.";
+        const msg = String(e).replace(/^.*error: /, "").trim();
+        flashErr(msg);
+        el.textContent = `Install failed: ${msg.length > 200 ? msg.slice(0, 200) + "\u2026" : msg}`;
     }
 }
 

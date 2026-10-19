@@ -6,30 +6,60 @@
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- Inline SVG sprite: one source for toolbar/row/status icons. -->
+  <svg class="sprite" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-magnet" viewBox="0 0 24 24"><path d="M6 4v11a6 6 0 0 0 12 0V4h-4v11a2 2 0 0 1-4 0V4z"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h7M15 7h5M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="13" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3l9 16H3z"/><path d="M12 9v4M12 16.5v.01"/></symbol>
+      <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.5 3.5 5.5 3.5 8.5s-1 6-3.5 8.5c-2.5-2.5-3.5-5.5-3.5-8.5s1-6 3.5-8.5z"/></symbol>
+      <symbol id="i-film" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 5v14M17 5v14M3 9h4M3 15h4M17 9h4M17 15h4"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v11M7 10l5 5 5-5M5 21h14"/></symbol>
+      <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 21V10M7 15l5-5 5 5"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></symbol>
+    </defs>
+  </svg>
   <div id="menubar">
     <span data-menu="file">File</span><span data-menu="tasks">Tasks</span><span data-menu="help">Help</span>
   </div>
   <div id="menudrop" class="hidden"></div>
 
   <div id="toolbar">
-    <button id="btn-add" class="tb-btn" title="Add a download (Ctrl+N)">
-      <span class="tb-ico green">&#10133;</span><span>Add URL</span>
+    <button id="btn-add" class="tb-btn" title="Add URL (Ctrl+N)" aria-label="Add URL">
+      <svg class="ico green"><use href="#i-plus"/></svg>
     </button>
-    <button id="btn-add-torrent" class="tb-btn" title="Add a .torrent file (Ctrl+T)">
-      <span class="tb-ico green">&#127386;</span><span>Add Torrent</span>
+    <button id="btn-add-torrent" class="tb-btn" title="Add a .torrent file (Ctrl+T)" aria-label="Add torrent">
+      <svg class="ico green"><use href="#i-magnet"/></svg>
     </button>
-    <button id="btn-resume-all" class="tb-btn" title="Resume all paused / failed">
-      <span class="tb-ico blue">&#10148;</span><span>Resume All</span>
+    <button id="btn-resume-all" class="tb-btn" title="Resume all paused / failed" aria-label="Resume all">
+      <svg class="ico blue"><use href="#i-play"/></svg>
     </button>
-    <button id="btn-stop-all" class="tb-btn" title="Pause all running">
-      <span class="tb-ico amber">&#9646;&#8709;</span><span>Stop All</span>
+    <button id="btn-stop-all" class="tb-btn" title="Pause all running" aria-label="Pause all">
+      <svg class="ico amber"><use href="#i-pause"/></svg>
     </button>
-    <button id="btn-clear-done" class="tb-btn" title="Remove completed tasks from the list (files stay on disk)">
-      <span class="tb-ico gray">&#10005;</span><span>Clear Done</span>
+    <button id="btn-clear-done" class="tb-btn" title="Remove completed tasks from the list (files stay on disk)" aria-label="Clear completed">
+      <svg class="ico gray"><use href="#i-trash"/></svg>
     </button>
-    <button id="btn-settings" class="tb-btn right" title="Settings (daemon config)">
-      <span class="tb-ico blue">&#9881;</span><span>Settings</span>
+    <button id="btn-settings" class="tb-btn right" title="Settings (daemon config)" aria-label="Settings">
+      <svg class="ico blue"><use href="#i-sliders"/></svg>
     </button>
+  </div>
+
+  <!-- Total speed, last 60 s (JD-style strip; canvas scales with the window) -->
+  <div id="speedstrip" title="Total download speed over the last 60 seconds">
+    <span class="ss-label">Now <b id="ss-now">0 B/s</b></span>
+    <span class="ss-label">Avg <b id="ss-avg">0 B/s</b></span>
+    <canvas id="speedgraph"></canvas>
   </div>
 
   <div id="update-banner" class="hidden">
@@ -61,14 +91,13 @@
         </thead>
         <tbody id="task-rows"></tbody>
       </table>
-      <div id="empty-hint">No downloads in this view. Click <b>Add URL</b> to start one.</div>
+      <div id="empty-hint">No downloads in this view. Click the <b>+</b> button to start one.</div>
     </div>
   </div>
 
   <div id="statusbar">
     <span id="st-conn" class="st-pill st-off">connecting&hellip;</span>
     <span id="st-counts" class="st-gap">&mdash;</span>
-    <span id="st-speed" class="st-gap">0 B/s</span>
   </div>
 
   <!-- Add URL dialog -->
