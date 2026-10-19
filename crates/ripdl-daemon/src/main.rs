@@ -223,6 +223,50 @@ impl Daemon {
         Ok(())
     }
 
+    /// Fastresume bitfields live beside the queue, keyed by info hash. No
+    /// rqbit session DB is used, so this directory is the only state rqbit
+    /// keeps for us.
+    fn torrent_state_dir(&self) -> Option<PathBuf> {
+        self.queue_path.parent().map(|p| p.join("torrent-state"))
+    }
+
+    /// Drop bitfields for torrents the queue no longer knows: nothing else
+    /// clears them (rqbit's session store is unused), so a removed task would
+    /// leave a file behind forever. Runs at boot, before any session reads.
+    fn prune_fastresume(&self) {
+        let Some(dir) = self.torrent_state_dir() else {
+            return;
+        };
+        let keep: std::collections::HashSet<String> = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.info_hash.clone())
+            .collect();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("bitv") {
+                continue;
+            }
+            let known = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| keep.contains(stem));
+            if !known {
+                let _ = std::fs::remove_file(&path);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "pruned stale fastresume bitfields");
+        }
+    }
+
     /// Re-attach finished/paused torrent tasks to the shared session after a
     /// restart. librqbit keeps no state of its own, so the session starts
     /// empty: without this, `details` reports "torrent session not running"
@@ -266,20 +310,33 @@ impl Daemon {
             };
             match session.ensure(&cfg).await {
                 Ok(ensured) => {
+                    // Paused mid-download torrents would otherwise show 0 B
+                    // until the next runner sample: adopt the verified byte
+                    // count from the restored handle now (a hard kill never
+                    // ran the shutdown merge).
+                    let live = session
+                        .details(rec.info_hash.as_deref().unwrap_or_default())
+                        .ok()
+                        .map(|d| (d.downloaded, Some(d.total)));
                     // Re-read after the await: the user may have resumed the
                     // task (or removed it) while the hash-check ran. A runner
                     // now owns a Queued/Running task - leave it live.
                     let current = {
-                        let records = self.records.lock().unwrap();
-                        records
-                            .iter()
-                            .find(|r| r.id == rec.id)
-                            .map(|r| (r.state, r.seed_paused))
+                        let mut records = self.records.lock().unwrap();
+                        let Some(r) = records.iter_mut().find(|r| r.id == rec.id) else {
+                            continue; // removed during the restore
+                        };
+                        if let Some((downloaded, total)) = live {
+                            r.downloaded = downloaded;
+                            r.total = total;
+                        }
+                        let v = (r.state, r.seed_paused);
+                        let snapshot = records.clone();
+                        drop(records);
+                        let _ = self.persist(&snapshot);
+                        v
                     };
-                    let (state, seed_paused) = match current {
-                        Some(v) => v,
-                        None => continue, // removed during the restore
-                    };
+                    let (state, seed_paused) = current;
                     if state == TaskState::Completed
                         && self.conf().seed_enabled()
                         && !seed_paused
@@ -580,6 +637,20 @@ impl Daemon {
         }
         for (_, t) in self.seeders.lock().unwrap().drain() {
             t.token.cancel();
+        }
+        // Fold the last live byte counts into the records before persisting:
+        // otherwise a paused/boot-restored torrent reads 0 B until its next
+        // runner sample (the progress map is memory-only). Lock order is
+        // records -> progress, matching `set_completed`.
+        {
+            let mut records = self.records.lock().unwrap();
+            let progress = self.progress.lock().unwrap();
+            for r in records.iter_mut() {
+                if let Some(t) = progress.get(&r.id) {
+                    r.downloaded = t.last.downloaded;
+                    r.total = t.last.total;
+                }
+            }
         }
         let snapshot = self.records.lock().unwrap().clone();
         let _ = self.persist(&snapshot);
@@ -947,9 +1018,10 @@ impl Daemon {
             } else {
                 None
             };
-            let session = ripdl_core::torrent::TorrentSession::new(root, bind)
-                .await
-                .map_err(|e| e.to_string())?;
+            let session =
+                ripdl_core::torrent::TorrentSession::new(root, bind, self.torrent_state_dir())
+                    .await
+                    .map_err(|e| e.to_string())?;
             *guard = Some(Arc::new(session));
         }
         Ok(Arc::clone(guard.as_ref().unwrap()))
@@ -1701,10 +1773,17 @@ impl Daemon {
             // Byte-free progress (video sidecar): percent only, no speed.
             Some(_) => entry.speed = None,
             None => {
+                // Torrents carry their own smoothed rate from librqbit; trust
+                // it over the byte delta, which jumps when an existing payload
+                // is adopted (resume/adopt after a restart) and would read as
+                // a multi-GB/s "download". HTTP samples leave it None.
                 let dt = now.duration_since(entry.at).as_secs_f64().max(0.05);
-                let inst =
-                    ((p.downloaded as f64 - entry.last.downloaded as f64) / dt)
-                        .clamp(0.0, 1.0e12);
+                let inst = p
+                    .speed_bps
+                    .unwrap_or_else(|| {
+                        (p.downloaded as f64 - entry.last.downloaded as f64) / dt
+                    })
+                    .clamp(0.0, 1.0e12);
                 entry.speed = Some(match entry.speed {
                     Some(s) => 0.7 * inst + 0.3 * s,
                     None => inst,
@@ -2152,6 +2231,8 @@ async fn real_main() -> Result<()> {
     let config = DaemonConfig::load(&config_path);
     let daemon = Arc::new(Daemon::new(queue_path, config_path, config).context("init daemon")?);
     daemon.boot_resume().context("resume queue")?;
+    // Fastresume cache hygiene: drop bitfields for tasks that are gone.
+    daemon.prune_fastresume();
     // Re-attach completed/paused torrents in the background: this is what
     // keeps finished torrents seeding and their files/peers/trackers
     // inspectable after a daemon restart (librqbit keeps no state).

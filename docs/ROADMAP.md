@@ -191,6 +191,10 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       show `verifying` instead of a bogus hundreds-of-MB/s "download" that
       also poisoned the 60 s speed graph; the first real sample afterwards
       starts from a re-anchored baseline
+- [x] Byte counts survive a restart: the shutdown path folds the live
+      progress sample into the queue records (and boot restore adopts the
+      verified count straight off the restored handle), so a paused
+      mid-download torrent no longer reads `0 B` until its next sample
 
 ## P4 - browser integration (the killer feature)
 
@@ -262,9 +266,15 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       daemon, so active transfers come back downloading (torrents re-check
       on-disk data first, shown as `verifying`). Saving a changed bond toggle
       nudges that restart
-- [ ] Torrent fastresume: persist librqbit's piece bitfield (rqbit
-      `fastresume` + a ripdl-owned state folder) so a daemon restart skips
-      the full on-disk hash pass (29 GB re-read observed at ~500 MB/s)
+- [x] Torrent fastresume: librqbit gained `SessionOptions::fastresume_folder`
+      (vendored delta 4) pointing at `<data_dir>/ripdl/torrent-state`. Only
+      the bitfield half of the JSON store is used, so `<info-hash>.bitv` is
+      loaded/stored while no session/torrent state is restored (the queue
+      stays the single owner). A re-added torrent now validates a piece
+      sample instead of re-reading everything: a daemon restart went from a
+      ~60 s / 29 GB pass to <1 s and straight back to downloading. Boot
+      prunes bitfields for tasks no longer queued, `rm` drops the task's
+      bitfield, and the loopback test asserts the file is written
 - [ ] Bonding health: keep the default-route uplink and drop candidates that
       fail a reachability probe, so one dead-end adapter can never halve
       the peer connection success rate

@@ -215,7 +215,17 @@ Torrent resume/recheck is now a distinct `verifying` state: librqbit's
 `Initializing` phase reports *checked* bytes (a 29 GB torrent reads at disk
 speed), so `Progress.verifying` is set, the daemon skips its derived-rate
 EMA (which used to show ~500 MB/s and pollute the graph), and GUI/CLI label
-the row `verifying` with no speed until the check finishes.
+the row `verifying` with no speed until the check finishes. The daemon now
+also prefers the tool's own rate when a sample carries one (`Progress.
+speed_bps`, torrents only) over a byte delta, so adopting existing data on
+resume can't read as a multi-GB/s burst. Torrent fastresume landed too:
+vendored delta 4 (`SessionOptions::fastresume_folder`) points rqbit's
+bitfield factory at `<data_dir>/ripdl/torrent-state` without enabling its
+session store, so `<info-hash>.bitv` skips the full on-disk pass on
+restart (60 s -> <1 s for the 29 GB task) while `queue.json` stays the only
+task-state owner; boot prunes orphaned bitfields and `rm` deletes the
+task's own. Shutdown (and boot restore, for a hard kill) now folds live
+byte counts into the records so a paused torrent no longer shows `0 B`.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root
