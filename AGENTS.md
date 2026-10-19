@@ -176,10 +176,12 @@ video task comes back Paused after an upgrade), and `[Run]` uses
 v0.3.6 completes the elevation story: the updater launches Setup with the
 shell's *default verb* (never `"runas"`), so Setup itself elevates via UAC and
 still knows the original non-elevated user - `runasoriginaluser` can only drop
-privileges when Setup was started that way. Verified 0.3.2 -> 0.3.5 end to end
-(binaries hash-match the release, queue preserved). Same release: real About
-dialog (Help > About ripdl) with the running version from the new
-`app_version` command, licence, and source/releases/issues links.
+privileges when Setup was started that way. Verified 0.3.2 -> 0.3.5 and
+0.3.5 -> 0.3.6 end to end from the app's own banner (binaries hash-match each
+release, queue preserved, v0.3.6 relaunched the GUI *unelevated*: token check
+0). Same release: real About dialog (Help > About ripdl) with the running
+version from the new `app_version` command, licence, and source/releases/issues
+links.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root
