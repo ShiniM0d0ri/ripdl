@@ -665,7 +665,7 @@ async function installUpdate() {
     el.textContent = "Downloading & verifying the new setup\u2026";
     try {
         await invokeSafe("install_update");
-        el.textContent = "Installer launched \u2014 follow its prompts; ripdl will close and reopen itself.";
+        el.textContent = "Installer launched \u2014 approve the Windows prompt to finish installing.";
     } catch (e) {
         const msg = String(e).replace(/^.*error: /, "").trim();
         flashErr(msg);

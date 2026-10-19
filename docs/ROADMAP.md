@@ -193,7 +193,10 @@ M3.4 - tests / verification:
       v0.3.4 fixes the asset URL: downloads must use `browser_download_url`
       (the API `url` is JSON metadata, so every real install failed the
       SHA256SUMS gate); the GUI exe version now inherits the workspace
-      version instead of a stale `tauri.conf.json` literal.
+      version instead of a stale `tauri.conf.json` literal; the installer is
+      launched through `ShellExecuteW("runas")` so a non-elevated daemon gets
+      the UAC prompt instead of error 740 (silent/unattended runs skip when
+      not already elevated).
 - [ ] Packaging: winget / scoop / Homebrew, AUR
 - [ ] Website + README showdown (screenshots, honest feature table)
 - [ ] i18n

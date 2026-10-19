@@ -408,6 +408,10 @@ impl Daemon {
     }
 
     async fn run_update_install_inner(self: &Arc<Self>, silent: bool) -> anyhow::Result<()> {
+        // Silent mode must never raise a UAC prompt nobody can answer.
+        if silent && !ripdl_core::update::is_elevated() {
+            bail!("unattended install needs administrator rights; use Download & Install in the app");
+        }
         let info = ripdl_core::update::fetch_latest().await
             .context("update check failed")?;
         if !info.update_available {

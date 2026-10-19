@@ -161,7 +161,11 @@ install failed the SHA256SUMS gate; asset downloads now share one
 SVG state/row icons from one inline sprite, 60 s total-speed strip with
 now/avg readout, install failures shown inline), and the exe version is
 inherited from the workspace Cargo.toml (the stale `tauri.conf.json`
-`version` literal pinned every build to 0.3.2).
+`version` literal pinned every build to 0.3.2). Installer launch elevates via
+`ShellExecuteW("runas")` when the daemon is not admin (Inno's manifest is
+`requireAdministrator`, so `CreateProcess` used to fail with 740); the
+unattended `/VERYSILENT` path refuses to run without elevation so it can
+never raise a UAC prompt at boot.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

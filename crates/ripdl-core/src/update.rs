@@ -363,12 +363,86 @@ pub async fn download_setup(
     Ok(dest)
 }
 
+/// Whether this process already has administrator rights. Silent
+/// (unattended) installs only run when true - otherwise Windows would pop a
+/// UAC prompt with nobody to answer it.
+#[cfg(windows)]
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        let _ = CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated() -> bool {
+    false
+}
+
+/// Run the installer elevated through `ShellExecuteW("runas")`, which is what
+/// surfaces the UAC prompt. Error 1223 = the user declined it.
+#[cfg(windows)]
+fn shell_execute_runas(path: &std::path::Path, args: &str) -> Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let verb = wide("runas");
+    let file = wide(&path.to_string_lossy());
+    let params = wide(args);
+    // SW_SHOWNORMAL = 1; ShellExecute returns > 32 on success.
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            1,
+        )
+    } as isize;
+    if code <= 32 {
+        let why = if code == 1223 {
+            "elevation was cancelled".to_string()
+        } else {
+            format!("Windows refused to elevate (code {code})")
+        };
+        return Err(Error::Update(format!(
+            "installer needs administrator rights: {why}"
+        )));
+    }
+    Ok(())
+}
+
 /// Launch the downloaded installer (Inno Setup stops the running app and
 /// replaces it in place itself). `silent` = `/VERYSILENT /NORESTART`, the
-/// unattended auto-install path; only the UAC prompt shows.
+/// unattended auto-install path; a non-elevated process re-launches through
+/// ShellExecute so the UAC prompt appears instead of failing with error 740.
 pub fn run_installer(path: &std::path::Path, silent: bool) -> Result<()> {
     #[cfg(windows)]
     {
+        let args = if silent { "/VERYSILENT /NORESTART" } else { "" };
+        if !is_elevated() {
+            return shell_execute_runas(path, args);
+        }
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut cmd = std::process::Command::new(path);
