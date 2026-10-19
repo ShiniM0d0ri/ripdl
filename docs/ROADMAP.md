@@ -247,6 +247,15 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       Ethernet + tethering) by binding segments per interface
       (`bond_interfaces` in config.json / `ripdl download --bond` / GUI
       settings; per-IP server caps bypassed, VPN tunnels excluded)
+- [x] Uplink transparency: Settings shows exactly which uplinks bonding
+      would use (name, address, default route) and warns when only one is up
+      ("combining cannot add bandwidth"); `ripdl config` prints the same
+      `uplinks:` line. Settings grew a "Restart daemon" button so the
+      torrent session (bonding is fixed at session creation) can be rebuilt
+      on demand; saving a changed bond toggle nudges that restart
+- [ ] Bonding health: keep the default-route uplink and drop candidates that
+      fail a reachability probe, so one dead-end adapter can never halve
+      the peer connection success rate
 - [ ] Segment visibility in the GUI (active connections + ranges per task)
 
 ## P7 - core control (engine power features)

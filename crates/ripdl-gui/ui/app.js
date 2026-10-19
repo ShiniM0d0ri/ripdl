@@ -892,8 +892,7 @@ function bytesForEdit(v) {
 }
 
 async function openSettings() {
-    const err = $("#set-err");
-    err.classList.add("hidden");
+    const err = $("#set-err");    err.classList.add("hidden");
     SET_INPUTS.forEach((sel) => { $(sel).value = ""; });
     $("#set-tray").checked = true;
     $("#set-bond").checked = false;
@@ -912,12 +911,14 @@ async function openSettings() {
         $("#set-ytdlp").value = s.ytdlp_path ?? "";
         $("#set-tray").checked = s.hide_to_tray ?? true;
         $("#set-bond").checked = s.bond_interfaces ?? false;
+        bondAtOpen = s.bond_interfaces ?? false;
         $("#set-update").checked = s.update_check ?? true;
         $("#set-auto").checked = s.update_auto_install ?? false;
         // serde skips None on the wire: absent = built-in default.
         $("#set-seed").checked = s.seed_enabled ?? true;
         $("#set-ratio").value = s.seed_ratio ?? "1";
         $("#set-seedtime").value = s.seed_time_min ?? "0";
+        renderBondNics();
         $("#set-backdrop").classList.remove("hidden");
         $("#set-conc").focus();
     } catch (e) {
@@ -928,6 +929,33 @@ async function openSettings() {
 
 function closeSettings() {
     $("#set-backdrop").classList.add("hidden");
+}
+
+// Bonding value when the dialog opened: changing it only affects the
+// torrent session (created once per daemon run), so the save path nudges a
+// restart instead of pretending it applied.
+let bondAtOpen = false;
+
+// Show exactly which uplinks bonding would spread connections across: one
+// uplink cannot add bandwidth, and a dead-end adapter is the classic
+// "combining made it slower" trap.
+async function renderBondNics() {
+    const el = $("#set-bond-info");
+    try {
+        const nics = await invokeSafe("bond_nics");
+        if (!nics.length) {
+            el.textContent = "No internet uplink detected.";
+            return;
+        }
+        const list = nics
+            .map((n) => `${n.name} (${n.addr}${n.default ? ", default route" : ""})`)
+            .join(" \u00b7 ");
+        el.textContent = nics.length === 1
+            ? `1 uplink: ${list} \u2014 combining cannot add bandwidth.`
+            : `${nics.length} uplinks: ${list}`;
+    } catch (e) {
+        el.textContent = "";
+    }
 }
 
 async function saveSettings() {
@@ -973,7 +1001,12 @@ async function saveSettings() {
     try {
         await invokeSafe("set_config", { settings: payload });
         closeSettings();
-        flashStatus("settings saved");
+        const bondingChanged = $("#set-bond").checked !== bondAtOpen;
+        flashStatus(
+            bondingChanged
+                ? "settings saved - restart the daemon to apply bonding to torrents"
+                : "settings saved"
+        );
     } catch (e) {
         reject(String(e).replace(/^.*error: /, ""));
     }
@@ -987,6 +1020,16 @@ $("#set-dir-browse").onclick = async () => {
     try {
         const picked = await invokeSafe("pick_dir");
         if (picked) $("#set-dir").value = picked;
+    } catch (e) {
+        flashErr(String(e));
+    }
+};
+$("#set-restart").onclick = async () => {
+    if (!confirm("Restart the daemon?\nActive transfers pause and resume automatically; torrent sessions are rebuilt.")) return;
+    try {
+        await invokeSafe("restart_daemon");
+        flashStatus("daemon restarted");
+        await poll();
     } catch (e) {
         flashErr(String(e));
     }

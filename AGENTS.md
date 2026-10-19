@@ -202,6 +202,13 @@ instead of `<dest>/<name>/<name>`; the nested root is still reused when it
 already exists so resume/seeding never re-downloads. Magnet single-file
 torrents keep the nested root (the layout must be chosen before rqbit fetches
 metadata; revisit only if it can be done without a second metadata fetch).
+Also on main: bonding transparency — the Settings dialog and `ripdl config`
+now list the uplinks bonding would actually use (`name (addr[, default
+route])`) and flag a single-uplink machine, and Settings grew a "Restart
+daemon" button because torrent bonding is fixed when the shared session is
+created (HTTP tasks read the setting per download). Note rqbit's listener
+defaults to TCP-only (`ListenerMode::TcpOnly`, no uTP socket), so uTP is not
+a tuning lever.
 P3 merged-T3.1 landed (see ROADMAP M3.1/M3.2): `ripdl-core::torrent` over
 librqbit 9 — magnet/.torrent/.torrent-URL payloads, one shared daemon session
 (ephemeral ports, no rqbit persistence), task-owned `<dest>/<name>` root

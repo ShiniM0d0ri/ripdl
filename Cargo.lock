@@ -5164,6 +5164,7 @@ dependencies = [
  "dirs 6.0.0",
  "rfd",
  "ripdl-core",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",

@@ -223,6 +223,7 @@
         <div class="set-row"><label for="set-ytdlp">yt-dlp path</label><input id="set-ytdlp" type="text" placeholder="yt-dlp (on PATH)" /></div>
         <div class="set-row"><label for="set-tray">Minimize to tray on close</label><input id="set-tray" type="checkbox" class="chk-box" /></div>
         <div class="set-row"><label for="set-bond">Combine network connections (bond all NICs)</label><input id="set-bond" type="checkbox" class="chk-box" /></div>
+        <div id="set-bond-info" class="set-hint"></div>
 
         <div class="set-sec">Torrents</div>
         <div class="set-row"><label for="set-seed" title="Finished torrents stay in the swarm and upload to peers (files/peers stay visible in Details).">Seed finished torrents</label><input id="set-seed" type="checkbox" class="chk-box" /></div>
@@ -234,6 +235,7 @@
         <div class="set-row"><label for="set-auto" title="When a startup check finds a newer release: download the SHA256-verified installer and run it unattended (only the UAC prompt shows)">Download &amp; install updates automatically</label><input id="set-auto" type="checkbox" class="chk-box" /></div>
       </div>
       <div class="set-actions">
+        <button id="set-restart" title="Stop the daemon and start a fresh one. Active transfers resume; torrents re-attach to the new session (needed after changing NIC bonding).">Restart daemon</button>
         <button id="set-cancel">Cancel</button>
         <button id="set-ok" class="primary">Save</button>
       </div>

@@ -461,6 +461,29 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             );
             println!("hide_to_tray:         {}", settings.hide_to_tray.unwrap_or(true));
             println!("bond_interfaces:      {}", settings.bond_interfaces.unwrap_or(false));
+            // What bonding would actually spread connections across (same
+            // discovery the daemon uses). One uplink = a no-op; a second
+            // dead-end adapter is the classic "combining got slower" cause.
+            let nics = ripdl_core::engine::bonded_nics();
+            let list = if nics.is_empty() {
+                "(none detected)".to_string()
+            } else {
+                nics.iter()
+                    .map(|n| {
+                        format!(
+                            "{} ({}{})",
+                            n.name,
+                            n.addr,
+                            if n.is_default_route { ", default route" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ")
+            };
+            println!("uplinks:              {list}");
+            if settings.bond_interfaces() && nics.len() < 2 {
+                println!("note:                 only one uplink - combining cannot add bandwidth");
+            }
             println!("update_check:         {}", settings.update_check.unwrap_or(true));
             println!("update_auto_install:  {}", settings.update_auto_install.unwrap_or(false));
             println!("seed_enabled:         {}", settings.seed_enabled());

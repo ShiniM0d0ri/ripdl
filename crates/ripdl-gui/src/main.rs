@@ -355,6 +355,44 @@ async fn get_config() -> Result<DaemonSettings, String> {
     }
 }
 
+/// One internet uplink bonding would spread connections across. Shown in
+/// Settings so a single-uplink machine can see the toggle is a no-op.
+#[derive(serde::Serialize)]
+struct UplinkView {
+    name: String,
+    addr: String,
+    default: bool,
+}
+
+/// Uplinks detected right now (same discovery the daemon uses for torrent
+/// bonding; HTTP tasks read it per download).
+#[tauri::command]
+fn bond_nics() -> Vec<UplinkView> {
+    ripdl_core::engine::bonded_nics()
+        .into_iter()
+        .map(|n| UplinkView {
+            name: n.name,
+            addr: n.addr.to_string(),
+            default: n.is_default_route,
+        })
+        .collect()
+}
+
+/// Stop the daemon and let the bridge spawn a fresh one. Needed for settings
+/// fixed at torrent-session creation (NIC bonding); active transfers resume
+/// from their records/sidecars.
+#[tauri::command]
+async fn restart_daemon() -> Result<(), String> {
+    let _ = rpc_once(Command::Shutdown).await;
+    for _ in 0..60 {
+        if transport::connect_daemon().await.is_err() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    rpc(Command::List).await.map(|_| ())
+}
+
 /// Replace the daemon settings (validation happens daemon-side; the reply
 /// carries the normalized values). Also flips the tray preference live.
 #[tauri::command]
@@ -424,6 +462,8 @@ fn main() {
             download_root_path,
             get_config,
             set_config,
+            bond_nics,
+            restart_daemon,
             check_update,
             install_update,
             app_version,
