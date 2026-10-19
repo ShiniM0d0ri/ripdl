@@ -1003,6 +1003,22 @@ mod tests {
         let torfile = tmp.join("fpair.torrent");
         std::fs::write(&torfile, &bytes).unwrap();
 
+        // File order in the metainfo follows the filesystem's directory
+        // order (create_torrent doesn't sort), which differs between
+        // Windows and Linux — resolve the index of f1.bin from the
+        // metainfo instead of assuming it.
+        let parsed = librqbit::torrent_from_bytes(&bytes).expect("parse metainfo");
+        let want = parsed
+            .info
+            .data
+            .validate()
+            .expect("validate metainfo")
+            .iter_file_details()
+            .enumerate()
+            .find(|(_, d)| d.filename.to_string().ends_with("f1.bin"))
+            .map(|(i, _)| i)
+            .expect("f1.bin present in metainfo");
+
         // Seeder as a plain rqbit session (exact loopback hygiene like the
         // roundtrip test below).
         let seed_opts = librqbit::SessionOptions {
@@ -1042,7 +1058,7 @@ mod tests {
             id: "only-1".into(),
             payload: torfile.to_string_lossy().into_owned(),
             dest_dir: dest.clone(),
-            only_files: Some(vec![1]),
+            only_files: Some(vec![want]),
             sequential: false,
         };
         let token = CancellationToken::new();
