@@ -855,6 +855,13 @@ fn handle_name_guess(st: &TorrentStats) -> bool {
 fn emit(id: &str, st: &TorrentStats, on_progress: &mut impl FnMut(Progress)) {
     let speed = st.live.as_ref().map(|l| l.download_speed.as_bytes() as f64);
     let upload = st.live.as_ref().map(|l| l.upload_speed.as_bytes() as f64);
+    // `Initializing` with checked bytes on disk is the resume/recheck hash
+    // pass: progress_bytes counts verified bytes and races at disk speed.
+    // Flag it so no layer mistakes that for a download rate. (A magnet still
+    // fetching metadata also sits in Initializing, but with zero checked
+    // bytes - that is the "metadata" phase, not a check.)
+    let verifying =
+        st.progress_bytes > 0 && matches!(st.state, TorrentStatsState::Initializing { .. });
     // percent left to None: bytes + total drive the bar, and the daemon's
     // percent branch would otherwise clear its derived speed.
     on_progress(Progress {
@@ -868,12 +875,53 @@ fn emit(id: &str, st: &TorrentStats, on_progress: &mut impl FnMut(Progress)) {
         // A finished torrent is already being served while the loop emits
         // its final sample; the daemon's seeding watcher takes over after.
         seeding: st.finished,
+        verifying,
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resume hash pass must be flagged as `verifying` (and a magnet still
+    /// fetching metadata must not): the daemon keys its speed suppression on
+    /// this flag, so checked bytes at disk speed never read as a download.
+    #[test]
+    fn emit_flags_disk_check_but_not_metadata_fetch() {
+        fn stats(state: TorrentStatsState, progress: u64, total: u64) -> TorrentStats {
+            TorrentStats {
+                state,
+                file_progress: Vec::new(),
+                error: None,
+                progress_bytes: progress,
+                uploaded_bytes: 0,
+                total_bytes: total,
+                finished: false,
+                live: None,
+            }
+        }
+
+        let mut seen = Vec::new();
+        // Magnet metadata fetch: Initializing, nothing checked on disk.
+        emit("t", &stats(TorrentStatsState::Initializing { paused: false }, 0, 0), &mut |p| {
+            seen.push((p.verifying, p.downloaded))
+        });
+        assert_eq!(seen, vec![(false, 0)]);
+
+        // Resume/recheck: Initializing with checked bytes on disk.
+        let mut seen = Vec::new();
+        emit("t", &stats(TorrentStatsState::Initializing { paused: false }, 2048, 4096), &mut |p| {
+            seen.push((p.verifying, p.downloaded))
+        });
+        assert_eq!(seen, vec![(true, 2048)]);
+
+        // Live: real downloading, not verifying.
+        let mut seen = Vec::new();
+        emit("t", &stats(TorrentStatsState::Live, 2048, 4096), &mut |p| {
+            seen.push(p.verifying)
+        });
+        assert_eq!(seen, vec![false]);
+    }
 
     // -- offline integration: local seeder <-> our download loop ----------
     //

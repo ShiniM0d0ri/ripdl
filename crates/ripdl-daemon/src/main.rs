@@ -1158,7 +1158,7 @@ impl Daemon {
         let tasks = records
             .iter()
             .map(|r| {
-                 let (downloaded, total, speed_bps, percent, uploaded, upload_bps) =
+                 let (downloaded, total, speed_bps, percent, uploaded, upload_bps, verifying) =
                     match progress.get(&r.id) {
                         Some(t) => (
                             t.last.downloaded,
@@ -1167,6 +1167,7 @@ impl Daemon {
                             t.last.percent,
                             t.last.uploaded.max(r.uploaded),
                             r.upload_bps.or(t.last.upload_bps),
+                            t.last.verifying,
                         ),
                         None => (
                             r.downloaded,
@@ -1175,6 +1176,7 @@ impl Daemon {
                             r.total.map(|_| 100.0),
                             r.uploaded,
                             r.upload_bps,
+                            false,
                         ),
                     };
                 TaskInfo {
@@ -1190,6 +1192,7 @@ impl Daemon {
                     seeding: r.seeding,
                     seeding_stopped: r.seed_paused,
                     peers: r.peers,
+                    verifying,
                     error: r.error.clone(),
                     start_at: r.start_at,
                     kind: r.kind,
@@ -1684,6 +1687,16 @@ impl Daemon {
             at: Instant::now(),
         });
         let now = Instant::now();
+        // Resume/recheck hash pass: `downloaded` counts verified bytes and
+        // climbs at disk speed, so a derived rate would show hundreds of MB/s
+        // and poison the 60 s speed graph. Report no speed; the baseline is
+        // re-anchored here so the first real sample after the pass is sane.
+        if p.verifying {
+            entry.speed = None;
+            entry.last = p;
+            entry.at = now;
+            return;
+        }
         match p.percent {
             // Byte-free progress (video sidecar): percent only, no speed.
             Some(_) => entry.speed = None,

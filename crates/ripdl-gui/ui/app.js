@@ -151,6 +151,9 @@ function stateLabel(t) {
     // Finished torrent still serving the swarm: distinct row label + icon.
     if (t.state === "completed" && t.seeding) return "seeding";
     if (t.state === "running" && t.kind === "video") return "hunt";
+    // Torrent hashing on-disk data (resume/recheck): progress moves at disk
+    // speed, so the row must not read as a download.
+    if (t.state === "running" && t.verifying) return "verifying";
     // Torrent still fetching metadata: no bytes and no total yet.
     if (t.state === "running" && t.kind === "torrent" && !t.total) return "metadata";
     return t.state;

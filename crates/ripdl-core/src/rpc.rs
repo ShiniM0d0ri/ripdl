@@ -335,6 +335,10 @@ pub struct TaskInfo {
     /// Torrent-only: connected peers (last sample).
     #[serde(default)]
     pub peers: u32,
+    /// Torrent-only: hashing on-disk data (resume/recheck) rather than
+    /// downloading; speed is suppressed while true.
+    #[serde(default)]
+    pub verifying: bool,
     #[serde(default)]
     pub error: Option<String>,
     /// Unix seconds when the task may start (None = immediately).

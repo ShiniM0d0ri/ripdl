@@ -77,6 +77,11 @@ pub struct Progress {
     /// served. The daemon maps this to the "seeding" row label.
     #[serde(default)]
     pub seeding: bool,
+    /// Torrent-only: the engine is hashing on-disk data (a resume/recheck)
+    /// instead of downloading. `downloaded` then climbs at *disk* speed, so
+    /// the daemon must not derive a rate from it; frontends show "verifying".
+    #[serde(default)]
+    pub verifying: bool,
 }
 
 impl Default for Progress {
@@ -90,6 +95,7 @@ impl Default for Progress {
             uploaded: 0,
             upload_bps: None,
             seeding: false,
+            verifying: false,
         }
     }
 }

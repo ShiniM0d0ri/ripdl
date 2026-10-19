@@ -179,6 +179,7 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
 .st-ico .ico { width: 13px; height: 13px; }
 .st-err { color: #b02a2a; font-weight: 400; font-size: 11px; max-width: 150px; white-space: normal; line-height: 1.15; }
 .st-timed { color: #9a7d3c; font-weight: 600; }
+.st-verifying { color: #7a5ca8; font-weight: 600; }
 
 /* Update banner: only ever shown when a newer GitHub release exists. */
 #update-banner {
