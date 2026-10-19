@@ -78,7 +78,9 @@ the single-stream path.
   Sources relative to repo root), `ripdl-vX.Y.Z-x86_64-linux.tar.gz`,
   deb+rpm via nfpm (`packaging/linux/nfpm.yaml`, installed with go),
   `ripdl-browser-extension-vX.Y.Z.zip` + `SHA256SUMS.txt` in the release
-  job. Cut releases by bumping the workspace version, then:
+  job. Cut releases by bumping the workspace version *and* `ext/manifest.json`
+  (the extension zip ships that manifest; Chrome only reads it for Web Store
+  uploads, but keep it matching), then:
   `git tag -a vX.Y.Z; git push origin vX.Y.Z`.
   Proven against v0.2.0 (2026-10-18): release published with all 7 assets.
   Gotchas folded in: CLI bin is `ripdl` (packaging must not invent names),
@@ -129,7 +131,7 @@ sweep so the pause path can no longer resurrect a sidecar after deletion
 page reads remain user-confirmable only in a real browser session.
 112 tests pass offline (`cargo test --workspace`), including an in-proc
 seeder↔leecher torrent round-trip.
-HTTP resilience pass (2026-10-20, verified live): a per-IP quota host (OVH
+v0.3.9: HTTP resilience pass (verified live): a per-IP quota host (OVH
 answers 429 to ranged GETs after ~37 MiB) used to fail the task mid-flight; it
 now completes. Engine: transient statuses (408/429/5xx) and transport faults
 retry, a refused probe is retried instead of killing a fresh task, a
