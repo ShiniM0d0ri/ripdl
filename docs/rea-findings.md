@@ -503,6 +503,35 @@ Reject:
 - `org.jdownloader.extensions.extraction.gui.bubble` notification semantics for
   GUI polish parity.
 
+## qBittorrent options inventory (clean-room, 2026-10-19)
+
+- Target: qBittorrent release-5.2.4 (2026-09-28), master `d494d1b` for delta.
+- Method: read the official option wiki plus Qt UI definitions and menu
+  construction, then count controls per Preferences page. No GPL code, XML,
+  styles, icons, or long strings copied; labels are facts, summaries are ours.
+- Count: **9 Preferences pages, 275 user-settable controls** in 5.2.4
+  (Behavior 43, Downloads 41, Connection 29, Speed 11, BitTorrent 26,
+  Search 3, RSS 7, WebUI 31, Advanced 84). Master: 287 (+12).
+- Counting method: one checkbox/checkable group/radio/combo/spin/time/line/
+  path/multiline editor = 1; action buttons and labels excluded; master
+  toggles and dependent fields counted separately. ~230 if obvious pairs are
+  merged.
+- Other surfaces: add-torrent dialog (~17 controls incl. start paused, skip
+  hash check, sequential, first/last pieces), per-torrent options dialog
+  (speed, share limits, DHT/PeX/LSD overrides), ~30 row actions (force start,
+  queue priority, recheck, reannounce, export `.torrent`, copy magnet/hash,
+  super seeding).
+- Sources:
+  https://github.com/qbittorrent/qBittorrent/wiki/Explanation-of-Options-in-qBittorrent
+  https://github.com/qbittorrent/qBittorrent/tree/release-5.2.4/src/gui
+  https://github.com/qbittorrent/qBittorrent/releases/tag/release-5.2.4
+- Full tab-by-tab inventory, context menu, ripdl gap matrix, and recommended
+  next 5: `docs/qbittorrent-options.md`.
+- Top gaps for ripdl after the 2026-10-19 seeding pass: per-torrent/global
+  bandwidth limits, queue policy beyond `max_concurrent`, integrity actions,
+  add-dialog defaults. Not planned: WebUI/API parity, RSS engine, search
+  plugins, anonymous mode, piracy presets.
+
 ## Template for entries
 
 - Target / version
