@@ -1062,14 +1062,26 @@ mod tests {
     #[test]
     fn dev_build_paths_are_recognized() {
         use std::path::Path;
-        assert!(dev_build_path(Path::new(r"D:\ripdl\target\debug\ripdl.exe")));
-        assert!(dev_build_path(Path::new("/home/x/ripdl/target/release/ripdl")));
-        assert!(!dev_build_path(Path::new(
-            r"C:\Program Files\ripdl\ripdl.exe"
-        )));
-        // A "debug"/"release" folder that is not a cargo target dir is a
-        // real install location, not a dev artifact.
-        assert!(!dev_build_path(Path::new(r"C:\tools\debug\ripdl.exe")));
+        // Paths only carry the running platform's separator, so `parent()`
+        // only descends on the platform that produced them.
+        #[cfg(windows)]
+        {
+            assert!(dev_build_path(Path::new(r"D:\ripdl\target\debug\ripdl.exe")));
+            assert!(dev_build_path(Path::new(r"D:\ripdl\target\release\ripdl.exe")));
+            assert!(!dev_build_path(Path::new(
+                r"C:\Program Files\ripdl\ripdl.exe"
+            )));
+            // A "debug"/"release" folder that is not a cargo target dir is a
+            // real install location, not a dev artifact.
+            assert!(!dev_build_path(Path::new(r"C:\tools\debug\ripdl.exe")));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(dev_build_path(Path::new("/home/x/ripdl/target/release/ripdl")));
+            assert!(dev_build_path(Path::new("/home/x/ripdl/target/debug/ripdl")));
+            assert!(!dev_build_path(Path::new("/usr/bin/ripdl")));
+            assert!(!dev_build_path(Path::new("/opt/ripdl/debug/ripdl")));
+        }
         assert!(!dev_build_path(Path::new("ripdl.exe")));
     }
 
