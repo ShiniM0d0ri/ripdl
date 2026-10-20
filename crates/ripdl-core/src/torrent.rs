@@ -131,6 +131,9 @@ pub struct TorrentSeedStats {
     pub peers: u32,
     pub finished: bool,
     pub paused: bool,
+    /// Hashing on-disk pieces (a restore/recheck); the torrent is neither
+    /// live nor paused yet, and a paused add parks itself when this ends.
+    pub initializing: bool,
 }
 
 /// One row of the pre-add file list (qB-style file picking before the
@@ -364,43 +367,79 @@ pub struct TorrentSession {
 }
 
 impl TorrentSession {
-    /// Start the session (explicit random ports; no rqbit-side persistence
-    /// - the queue record is the source of truth, and separate sessions
-    /// must never collide on one DHT/resource).
+    /// Start the session.
+    ///
+    /// The queue record stays the source of truth for *task* state, but three
+    /// small caches live next to it, because starting from absolute zero is
+    /// what makes a swarm feel slow (qBittorrent restarts warm):
+    ///
+    /// - a stable listen port plus UPnP: incoming peers are a large part of
+    ///   the ramp on public swarms, and an ephemeral port per daemon start
+    ///   means the router mapping is re-created (or never) every time;
+    /// - DHT persistence (`<data_dir>/torrent-state/dht-nodes.json`): a
+    ///   routing table to bootstrap from instead of a cold bootstrapping;
+    /// - fastresume bitfields so a re-added torrent validates a sample of its
+    ///   data instead of re-reading every piece.
     ///
     /// `bind_ips`: when set (bonding on), every outgoing peer connection is
     /// bound to one of these local addresses round-robin (see
     /// `SessionOptions::bind_ips` in the vendored librqbit). The listener and
     /// DHT stay OS-routed; uTP, once TCP loses the race, also stays
     /// OS-routed — bonding redistributes the TCP peer load.
-    ///
-    /// `fastresume_dir`: keep rqbit's piece bitfields there so a re-added
-    /// torrent validates a sample of its on-disk data instead of re-reading
-    /// every piece (29 GB at disk speed, observed as one bogus "download"
-    /// burst per restart). No torrent/session state is restored from it.
     pub async fn new(
         default_output_folder: PathBuf,
         bind: Option<Vec<IpAddr>>,
         fastresume_dir: Option<PathBuf>,
     ) -> Result<Self> {
-        let opts = librqbit::SessionOptions {
-            bind_ips: bind,
+        let dht_state = fastresume_dir.as_ref().map(|d| d.join("dht-nodes.json"));
+        let build = |port: u16| librqbit::SessionOptions {
+            bind_ips: bind.clone(),
             fastresume_folder: fastresume_dir.clone(),
             dht: Some(librqbit::DhtSessionConfig {
                 bootstrap_addrs: None,
-                port: Some(0),          // ephemeral: never collide
-                persistence: None,      // our records own state
+                // None = reuse the port saved with the routing table.
+                port: None,
+                persistence: dht_state
+                    .clone()
+                    .map(|p| librqbit::dht::DhtPersistenceConfig {
+                        config_filename: Some(p),
+                        ..Default::default()
+                    }),
             }),
             listen: Some(librqbit::ListenerOptions {
-                listen_addr: "[::]:0".parse().unwrap(),
+                listen_addr: std::net::SocketAddr::from((
+                    std::net::Ipv6Addr::UNSPECIFIED,
+                    port,
+                )),
+                // A reachable port is worth more than the discovery traffic:
+                // peers connect back instead of the swarm only ever seeing us
+                // dial out.
+                enable_upnp_port_forwarding: true,
                 ..librqbit::ListenerOptions::default()
+            }),
+            connect: Some(librqbit::ConnectionOptions {
+                enable_tcp: true,
+                proxy_url: None,
+                peer_opts: Some(librqbit::PeerConnectionOptions {
+                    // rqbit defaults to 10 s per connect. On a machine with a
+                    // second (e.g. tethered) uplink, the connects that land
+                    // there burn the whole timeout and hold up the ramp.
+                    connect_timeout: Some(Duration::from_secs(6)),
+                    ..Default::default()
+                }),
             }),
             ..librqbit::SessionOptions::default()
         };
-        Ok(Self {
-            session: Session::new_with_opts(default_output_folder, opts).await?,
-            fastresume_dir,
-        })
+        // Preferred port first so UPnP keeps pointing at the same mapping;
+        // random only when every candidate is taken.
+        let mut last = None;
+        for port in [4240u16, 4241, 4242, 4243, 0] {
+            match Session::new_with_opts(default_output_folder.clone(), build(port)).await {
+                Ok(session) => return Ok(Self { session, fastresume_dir }),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("at least one port attempt").into())
     }
 
     /// Inner session (peers/trackers/files for the future Details RPC).
@@ -408,15 +447,16 @@ impl TorrentSession {
         &self.session
     }
 
-    /// Make sure the torrent is managed and running. Idempotent per
-    /// info-hash: an already-managed (paused) torrent is unpaused; a fresh
-    /// one is added with this task's destination and file selection.
+    /// Make sure the torrent is managed, in the requested run state.
+    /// Idempotent per info-hash: an already-managed torrent is paused or
+    /// unpaused to match `running`; a fresh one is added with this task's
+    /// destination, file selection and start state.
     ///
     /// Always returns the task-owned root: `<dest_dir>/<display name>` (or
     /// `<dest_dir>/ripdl-torrent-<id>` when no name is known yet). rqbit
     /// writes files directly into its output folder, so ripdl sets
     /// `sub_folder` itself to keep artifacts contained and deletable.
-    pub async fn ensure(&self, cfg: &TorrentConfig) -> Result<Ensured> {
+    pub async fn ensure(&self, cfg: &TorrentConfig, running: bool) -> Result<Ensured> {
         let (add, info) = resolve_payload(&cfg.payload).await?;
         let sub = match &info.name {
             Some(n) => sanitize_component(n),
@@ -444,6 +484,11 @@ impl TorrentSession {
         // combined task-owned root directly.
         let mut opts = AddTorrentOptions {
             output_folder: Some(output_folder.to_string_lossy().into_owned()),
+            // Boot restore and seeding pass `running = false`/true as the
+            // record says: without this flag a restored paused torrent is
+            // added Live (it starts downloading and uploading immediately,
+            // then has to be paused again).
+            paused: !running,
             // Reuse files already on disk (resume/boot-restore/partial data):
             // with the default (false) rqbit refuses to open existing files
             // and the task fails with "error creating a new file". Overwrite
@@ -456,8 +501,25 @@ impl TorrentSession {
         }
         match self.session.add_torrent(add, Some(opts)).await? {
             AddTorrentResponse::AlreadyManaged(_, h) => {
-                if h.is_paused() {
-                    self.session.unpause(&h).await?;
+                // The add flags only apply to a fresh torrent. librqbit's
+                // `paused` flag is the *intention* (it can disagree with the
+                // state: a paused add parks the torrent only after its hash
+                // check, and unpausing one that is already Live bails), so
+                // treat the flag as best effort here. A check that parks the
+                // torrent afterwards is woken by the runner/watcher loop.
+                let state = h.stats().state;
+                let parked = matches!(state, TorrentStatsState::Paused)
+                    || matches!(state, TorrentStatsState::Initializing { paused: true });
+                let checking = matches!(state, TorrentStatsState::Initializing { paused: false });
+                if running {
+                    if let Err(e) = self.session.unpause(&h).await {
+                        tracing::debug!(error = %e, "torrent unpause skipped");
+                    }
+                } else if !parked && !checking {
+                    // During the hash check rqbit latches the *add* start
+                    // flag, so a pause here would be undone when the check
+                    // ends (that was the "seeds while paused" leak).
+                    let _ = self.session.pause(&h).await;
                 }
                 Ok(Ensured { handle: h, root })
             }
@@ -551,6 +613,7 @@ impl TorrentSession {
             peers: live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
             finished: st.finished,
             paused,
+            initializing: matches!(st.state, TorrentStatsState::Initializing { .. }),
         })
     }
 
@@ -559,6 +622,18 @@ impl TorrentSession {
     pub async fn pause_by_hash(&self, info_hash_hex: &str) {
         if let Some(h) = self.find(info_hash_hex) {
             self.pause(&h).await;
+        }
+    }
+
+    /// Wake a parked torrent by info-hash (best effort). rqbit parks a torrent
+    /// that was added paused only *after* its hash check, so the runner and
+    /// the seeding watcher call this when they see the torrent paused while
+    /// the record still says "running/seeding".
+    pub async fn unpause_by_hash(&self, info_hash_hex: &str) {
+        if let Some(h) = self.find(info_hash_hex) {
+            if let Err(e) = self.session.unpause(&h).await {
+                tracing::debug!(error = %e, "torrent unpause skipped");
+            }
         }
     }
 
@@ -725,7 +800,7 @@ pub async fn download(
     if token.is_cancelled() {
         return Err(Error::Cancelled);
     }
-    let ensured = session.ensure(cfg).await?;
+    let ensured = session.ensure(cfg, true).await?;
     on_meta(TorrentMeta {
         info_hash: ensured.handle.info_hash().as_string(),
         name: ensured.handle.name(),
@@ -743,25 +818,53 @@ pub async fn download(
         None
     };
 
+    let result = run_until_done(session, &ensured, cfg, token, &mut on_progress).await;
+    if result.is_err() {
+        // A runner that bails must not leave the swarm live. rqbit keeps a
+        // managed torrent running on its own, so a failed/aborted run used
+        // to keep downloading *and* uploading while the row said failed -
+        // which is exactly what "it seeds even when paused" looked like.
+        let _ = session.pause(&ensured.handle).await;
+    }
+    result
+}
+
+/// The sampling loop: finish, cancel or fail. Sequential drain and pausing
+/// are the caller's business.
+async fn run_until_done(
+    session: &TorrentSession,
+    ensured: &Ensured,
+    cfg: &TorrentConfig,
+    token: &CancellationToken,
+    on_progress: &mut (impl FnMut(Progress) + Send),
+) -> Result<TorrentOutput> {
+    let mut woke_parked = false;
     loop {
         if token.is_cancelled() {
             // piece state survives on disk; unpause will resume cheaply
-            let _ = session.pause(&ensured.handle).await;
             return Err(Error::Cancelled);
         }
         let stats = ensured.handle.stats();
+        // A torrent added paused parks itself once its hash check finishes,
+        // and the check can outlive `ensure`; the runner owns "running", so
+        // wake it (cancellation is checked above, so a user pause wins).
+        if !woke_parked && matches!(stats.state, TorrentStatsState::Paused) {
+            woke_parked = true;
+            session.unpause_by_hash(&ensured.handle.info_hash().as_string()).await;
+            continue;
+        }
         let phase = classify(&stats);
         if let TorrentPhaseKind::Failed(e) = &phase {
             return Err(Error::State(e.clone()));
         }
         if stats.finished {
-            emit(&cfg.id, &stats, &mut on_progress);
+            emit(&cfg.id, &stats, on_progress);
             return Ok(TorrentOutput {
-                root: ensured.root,
+                root: ensured.root.clone(),
                 info_hash: ensured.handle.info_hash().as_string(),
             });
         }
-        emit(&cfg.id, &stats, &mut on_progress);
+        emit(&cfg.id, &stats, on_progress);
         // While only metadata fetching is happening (no bytes yet) poll a
         // bit faster so progress emits regularly but not aggressively.
         let tick = if matches!(phase, TorrentPhaseKind::Fetching) { 500 } else { 1000 };

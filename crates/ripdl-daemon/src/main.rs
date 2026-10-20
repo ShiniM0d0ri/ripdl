@@ -323,8 +323,8 @@ impl Daemon {
                 only_files: rec.only_files.clone(),
                 sequential: false,
             };
-            match session.ensure(&cfg).await {
-                Ok(ensured) => {
+            match session.ensure(&cfg, false).await {
+                Ok(_ensured) => {
                     // Paused mid-download torrents would otherwise show 0 B
                     // until the next runner sample: adopt the verified byte
                     // count from the restored handle now (a hard kill never
@@ -357,12 +357,11 @@ impl Daemon {
                         && !seed_paused
                     {
                         self.start_seeding(&rec.id);
-                    } else if matches!(state, TaskState::Completed | TaskState::Paused) {
-                        // A paused download stays paused; a stopped seeder is
-                        // paused too - both remain in the session so the
-                        // details dialog keeps working after a restart.
-                        session.pause(&ensured.handle).await;
                     }
+                    // Everything else arrived paused (ensure(running=false)),
+                    // which keeps a stopped seeder from uploading and a
+                    // paused download from resuming on its own, while the
+                    // handle stays in the session so details still work.
                 }
                 Err(e) => tracing::warn!(id = %rec.id, error = %e, "torrent restore failed"),
             }
@@ -478,7 +477,7 @@ impl Daemon {
                     return;
                 }
             }
-            if let Err(e) = session.ensure(&cfg).await {
+            if let Err(e) = session.ensure(&cfg, true).await {
                 tracing::warn!(error = %e, "seeding watcher: torrent ensure failed");
                 this.abort_seed_watch(&id, generation);
                 return;
@@ -497,6 +496,12 @@ impl Daemon {
             let started = Instant::now();
             let mut last_persist = Instant::now();
             let mut should_pause = false;
+            // A torrent restored paused parks itself when its hash check
+            // finishes (rqbit latches the add-time start flag), which the
+            // watcher has to undo: it owns "seeding" until the token is
+            // cancelled. Bounded, so a torrent that cannot go live ends the
+            // watch instead of spinning.
+            let mut parked_wakes = 0u8;
 
             loop {
                 if token.is_cancelled() {
@@ -514,6 +519,10 @@ impl Daemon {
                 let Some(stats) = session.seed_stats(&hash) else {
                     break; // forgotten from the session
                 };
+                if stats.paused && parked_wakes < 5 {
+                    parked_wakes = parked_wakes.saturating_add(1);
+                    session.unpause_by_hash(&hash).await;
+                }
                 let uploaded = base_lifetime
                     .saturating_add(stats.uploaded.saturating_sub(base_session));
                 let ratio = if downloaded > 0 {
@@ -529,7 +538,7 @@ impl Daemon {
                 // A restored torrent hash-checks first: `finished` is false
                 // for a few ticks, which is not a reason to stop. Only an
                 // explicit pause or a reached limit ends the watch.
-                let stop = limit_hit || stats.paused;
+                let stop = limit_hit || (stats.paused && parked_wakes >= 5);
                 {
                     let mut records = this.records.lock().unwrap();
                     let Some(r) = records.iter_mut().find(|r| r.id == id) else {
@@ -569,7 +578,13 @@ impl Daemon {
                             .unwrap_or(false);
                         break;
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    _ = tokio::time::sleep(if stats.initializing {
+                        // A restored torrent is hashing: wake it the moment
+                        // the check parks it, not two seconds later.
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::from_secs(2)
+                    }) => {}
                 }
             }
 
@@ -795,7 +810,7 @@ impl Daemon {
             Command::UpdateTorrentSelection { id, only_files } => {
                 self.cmd_update_selection(req.id, &id, only_files).await
             }
-            Command::Pause { id } => self.cmd_pause(req.id, &id),
+            Command::Pause { id } => self.cmd_pause(req.id, &id).await,
             Command::Resume { id } => self.cmd_resume(req.id, &id),
             Command::Remove { id, delete_files } => {
                 self.cmd_remove(req.id, &id, delete_files).await
@@ -1542,7 +1557,7 @@ impl Daemon {
         Response { id: req_id, reply: Reply::Tasks { tasks } }
     }
 
-    fn cmd_pause(self: &Arc<Self>, req_id: u64, id: &str) -> Response {
+    async fn cmd_pause(self: &Arc<Self>, req_id: u64, id: &str) -> Response {
         // A finished torrent may be seeding: stop the watcher and remember
         // the user's choice so the next boot does not resume uploading.
         let seed_token = self
@@ -1563,12 +1578,18 @@ impl Daemon {
                 records.clone()
             };
             let _ = self.persist(&snapshot);
+            self.pause_torrent_in_session(id).await;
             return Response { id: req_id, reply: Reply::Ok };
         }
         let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
         match token {
             Some(t) => {
                 t.cancel();
+                // The runner pauses the torrent on its way out. Also pause
+                // by hash: a torrent can be live in the shared session with
+                // no runner (a failed spawn, a restart race), and that leak
+                // is exactly what "it uploads while paused" looked like.
+                self.pause_torrent_in_session(id).await;
                 Response { id: req_id, reply: Reply::Ok }
             }
             None => {
@@ -1586,6 +1607,7 @@ impl Daemon {
                                     && r.kind == TaskKind::Torrent))
                     });
                 if parked {
+                    self.pause_torrent_in_session(id).await;
                     Response { id: req_id, reply: Reply::Ok }
                 } else {
                     Response {
@@ -1594,6 +1616,24 @@ impl Daemon {
                     }
                 }
             }
+        }
+    }
+
+    /// Park a torrent task's swarm sockets (best effort; a torrent that was
+    /// never added or is already paused is fine). Keeps `details` working
+    /// because the handle stays in the session.
+    async fn pause_torrent_in_session(&self, id: &str) {
+        let hash = {
+            let records = self.records.lock().unwrap();
+            records
+                .iter()
+                .find(|r| r.id == id && r.kind == TaskKind::Torrent)
+                .and_then(|r| r.info_hash.clone())
+        };
+        let Some(hash) = hash else { return };
+        let session = self.torrents.lock().await.clone();
+        if let Some(session) = session {
+            session.pause_by_hash(&hash).await;
         }
     }
 
@@ -1902,10 +1942,31 @@ impl Daemon {
     fn set_state(&self, id: &str, state: TaskState, error: Option<String>) {
         {
             let mut records = self.records.lock().unwrap();
+            // Fold the last live sample into the record on pause: a torrent
+            // has no sidecar, so without this a paused mid-flight task reads
+            // "0 B / unknown" until the next daemon boot re-checks it.
+            let last = if state == TaskState::Paused {
+                self.progress.lock().unwrap().get(id).map(|t| {
+                    (t.last.downloaded, t.last.total, t.last.dest_file.clone())
+                })
+            } else {
+                None
+            };
             match records.iter_mut().find(|r| r.id == id) {
                 Some(r) => {
                     r.state = state;
                     r.error = error;
+                    if let Some((downloaded, total, dest_file)) = last {
+                        if downloaded > 0 {
+                            r.downloaded = downloaded;
+                        }
+                        if total.is_some() {
+                            r.total = total;
+                        }
+                        if r.dest_file.is_none() {
+                            r.dest_file = dest_file;
+                        }
+                    }
                 }
                 None => return, // removed meanwhile: never resurrect it
             }
@@ -2541,25 +2602,27 @@ mod tests {
             "restored completed torrent starts seeding"
         );
 
-        // Details (files/peers/trackers) work without any runner alive.
+        // Details (files/peers/trackers) work without any runner alive. A
+        // restored torrent is added paused, hash-checks, and is then woken by
+        // the seeding watcher - so wait for "finished and live", not just
+        // "finished".
         let mut details = None;
         for _ in 0..100 {
             if let Ok(d) = session.details(&pv.info_hash) {
-                if d.finished {
+                if d.finished && !d.paused {
                     details = Some(d);
                     break;
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let d = details.expect("restored torrent reaches finished state");
+        let d = details.expect("restored torrent reaches finished state and seeds");
         assert_eq!(d.files.len(), 1, "file list visible after restore");
         assert_eq!(d.total, data.len() as u64);
-        assert!(!d.paused, "seeding torrent is live");
 
         // The row's pause/resume pair drives seeding without forgetting the
         // torrent: stop = kept in the session (inspectable), resume = serve.
-        let _ = daemon.cmd_pause(1, "tor");
+        let _ = daemon.cmd_pause(1, "tor").await;
         {
             let records = daemon.records.lock().unwrap();
             let r = records.iter().find(|r| r.id == "tor").unwrap();
