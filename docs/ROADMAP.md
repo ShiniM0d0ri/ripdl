@@ -82,7 +82,9 @@ Guiding rules:
       [key=value ...]`, concurrency applies live, the rest on next task
 - [x] System tray + minimize-to-tray (Tauri tray icon: left click shows,
       menu "Show ripdl"/"Exit"; close minimizes to tray unless
-      `hide_to_tray=false`; preference lives in config.json)
+      `hide_to_tray=false`; preference lives in config.json; a second launch
+      never opens a second window - if the owner cannot be poked (UIPI, an
+      elevated GUI) it still exits and the tray icon brings the first one back)
 - [x] Row titles use the file the engine actually writes, so a
       Content-Disposition name or a `.torrent` payload name beats an opaque
       URL tail (`.../12e29558-...?rscd=...filename=X`) and the file-type

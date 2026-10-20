@@ -359,6 +359,12 @@ visible flag, never the webview's, so `SetIsVisible(false)` is mandatory or
 `TrySuspend` fails with ERROR_INVALID_STATE; resident memory also takes ~30-60 s
 to be trimmed after suspension, so measure late. Resume paints the last frame
 and the pending poll fires at once (verified hide -> 50 s -> reveal).
+On main after the tag: the single-instance guard no longer fails open when an
+instance owns the pipe but cannot be poked - a GUI relaunched by an elevated
+installer runs elevated, and a normal-integrity second launch cannot write to
+its pipe (UIPI), which used to start a second window on the same daemon (seen
+as three windows after a `-Verb RunAs` install). It now treats the "show" hint
+as best effort and exits; the tray icon still restores the first window.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap,
