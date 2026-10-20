@@ -173,6 +173,11 @@ enum Cmd {
         /// Native host name (reverse dotted name; org.ripdl.host).
         #[arg(long, default_value = "org.ripdl.host")]
         host: String,
+        /// Register even when this is a dev build (`target\debug` /
+        /// `target\release`) that would replace a registration pointing at an
+        /// installed ripdl.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -283,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Cmd::RegisterHost { ext_id, host } => register_host(&ext_id, &host),
+        Cmd::RegisterHost { ext_id, host, force } => register_host(&ext_id, &host, force),
         Cmd::Ls => rpc(Command::List).await,
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
@@ -842,7 +847,7 @@ fn parse_header(s: &str) -> anyhow::Result<(String, String)> {
 
 /// Write the native-messaging manifest and point the browser's registry keys
 /// at it (HKCU, so no admin window ever appears).
-fn register_host(ext_ids: &[String], host: &str) -> anyhow::Result<()> {
+fn register_host(ext_ids: &[String], host: &str, force: bool) -> anyhow::Result<()> {
     if host.is_empty()
         || !host
             .chars()
@@ -868,25 +873,55 @@ fn register_host(ext_ids: &[String], host: &str) -> anyhow::Result<()> {
     if let Some(parent) = manifest_path.parent() {
         std::fs::create_dir_all(parent).context("create manifest directory")?;
     }
-    if let Ok(bytes) = std::fs::read(&manifest_path) {
+    let existing = std::fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    if let Some(existing) = &existing {
         // Re-registrations must never strand an extension that worked
         // before: carry the previous origins forward (shape-checked).
-        if let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            if let Some(list) = existing["allowed_origins"].as_array() {
-                for o in list.iter().filter_map(|v| v.as_str()) {
-                    let Some(rest) = o.strip_prefix("chrome-extension://") else {
-                        continue;
-                    };
-                    if !rest.ends_with('/') {
-                        continue;
-                    }
-                    let id = rest.trim_end_matches('/');
-                    if validate_ext_id(id, true).is_ok() && !origins.contains(&o.to_string()) {
-                        origins.push(o.to_string());
-                    }
+        if let Some(list) = existing["allowed_origins"].as_array() {
+            for o in list.iter().filter_map(|v| v.as_str()) {
+                let Some(rest) = o.strip_prefix("chrome-extension://") else {
+                    continue;
+                };
+                if !rest.ends_with('/') {
+                    continue;
+                }
+                let id = rest.trim_end_matches('/');
+                if validate_ext_id(id, true).is_ok() && !origins.contains(&o.to_string()) {
+                    origins.push(o.to_string());
                 }
             }
         }
+    }
+
+    // A dev build must not silently take over the browser integration of an
+    // installed ripdl (that is how a stale `target\debug\ripdl.exe` ended up
+    // serving a release install). Explicit `--force` keeps E2E testing alive.
+    if !force {
+        if let Some(previous) = existing
+            .as_ref()
+            .and_then(|m| m["path"].as_str())
+            .map(std::path::PathBuf::from)
+        {
+            if dev_build_path(&exe)
+                && previous != exe
+                && previous.exists()
+                && !dev_build_path(&previous)
+            {
+                bail!(
+                    "refusing to point the browser host at a dev build\n  new:      {}\n  installed: {}\n  re-run with --force if this is intentional",
+                    exe.display(),
+                    previous.display()
+                );
+            }
+        }
+    }
+    if dev_build_path(&exe) {
+        eprintln!(
+            "warning: registering a DEV build ({}) - browser downloads will use it until the installed ripdl re-registers",
+            exe.display()
+        );
     }
 
     let manifest = serde_json::json!({
@@ -939,8 +974,30 @@ fn register_host(ext_ids: &[String], host: &str) -> anyhow::Result<()> {
         }
     }
     println!("host manifest: {}", manifest_path.display());
-    println!("next: load the extension unpacked (chrome://extensions -> Developer mode -> Load unpacked), then reload it after every `cargo build`");
+    if dev_build_path(&exe) {
+        println!("next: load the extension unpacked (chrome://extensions -> Developer mode -> Load unpacked), then reload it after every `cargo build`");
+        println!("note: an installed ripdl re-registers itself at install time, replacing this dev build");
+    } else {
+        println!("next: load the extension unpacked (chrome://extensions -> Developer mode -> Load unpacked)");
+    }
     Ok(())
+}
+
+/// `true` when the exe lives in a cargo build tree (`…\target\debug\x.exe`
+/// or `…\target\release\x.exe`): a dev artifact, not an installed copy.
+fn dev_build_path(exe: &std::path::Path) -> bool {
+    let Some(profile) = exe.parent().and_then(|p| p.file_name()) else {
+        return false;
+    };
+    let profile = profile.to_string_lossy().to_ascii_lowercase();
+    if profile != "debug" && profile != "release" {
+        return false;
+    }
+    exe.parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().eq_ignore_ascii_case("target"))
+        .unwrap_or(false)
 }
 
 /// A Chromium extension ID is 32 base-16-ish chars (letters a..p). With an
@@ -1001,6 +1058,20 @@ fn parse_only(spec: &str) -> anyhow::Result<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_build_paths_are_recognized() {
+        use std::path::Path;
+        assert!(dev_build_path(Path::new(r"D:\ripdl\target\debug\ripdl.exe")));
+        assert!(dev_build_path(Path::new("/home/x/ripdl/target/release/ripdl")));
+        assert!(!dev_build_path(Path::new(
+            r"C:\Program Files\ripdl\ripdl.exe"
+        )));
+        // A "debug"/"release" folder that is not a cargo target dir is a
+        // real install location, not a dev artifact.
+        assert!(!dev_build_path(Path::new(r"C:\tools\debug\ripdl.exe")));
+        assert!(!dev_build_path(Path::new("ripdl.exe")));
+    }
 
     #[test]
     fn parses_speed_caps() {
