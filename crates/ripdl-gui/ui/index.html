@@ -182,7 +182,8 @@
   <!-- Row context menu (icons; the toggle entry is retitled per task) -->
   <div id="ctx" class="hidden">
     <div data-act="toggle"><svg class="ico" id="ctx-toggle-ico"><use href="#i-pause"/></svg><span id="ctx-toggle-lbl">Pause</span></div>
-    <div data-act="details" class="ctx-torrent"><svg class="ico"><use href="#i-info"/></svg>Torrent details&hellip;</div>
+    <div data-act="details"><svg class="ico"><use href="#i-info"/></svg><span id="ctx-details-lbl">Details&hellip;</span></div>
+    <div data-act="refresh"><svg class="ico"><use href="#i-globe"/></svg>Refresh address&hellip;</div>
     <div data-act="openFile"><svg class="ico"><use href="#i-file"/></svg>Open file</div>
     <div data-act="openFolder"><svg class="ico"><use href="#i-folder"/></svg>Open download folder</div>
     <hr />
@@ -204,6 +205,35 @@
         <button id="tdg-apply" class="hidden" disabled>Apply selection</button>
       </div>
       <div id="tdg-body"></div>
+    </div>
+  </div>
+
+  <!-- Details for plain HTTP/video tasks: address, file, segment map -->
+  <div id="hdt-backdrop" class="hidden">
+    <div id="hdt">
+      <div class="tdg-title"><span id="hdt-name"></span><button id="hdt-close">&times;</button></div>
+      <div class="tdg-summary" id="hdt-summary"></div>
+      <div id="hdt-body"></div>
+      <div id="hdt-actions">
+        <button id="hdt-refresh"><svg class="ico"><use href="#i-globe"/></svg>Refresh address&hellip;</button>
+        <span class="hdt-gap"></span>
+        <button id="hdt-open"><svg class="ico"><use href="#i-file"/></svg>Open file</button>
+        <button id="hdt-folder"><svg class="ico"><use href="#i-folder"/></svg>Open folder</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Refresh download address (expired signed link, same file) -->
+  <div id="rdlg-backdrop" class="hidden">
+    <div id="rdlg">
+      <div class="dlg-title">Refresh download address<em> same file, fresh link</em></div>
+      <div class="rdlg-hint" id="rdlg-hint"></div>
+      <textarea id="rdlg-url" rows="3" spellcheck="false" placeholder="https://example.com/file.zip?token=..."></textarea>
+      <div class="dlg-actions">
+        <button id="rdlg-cancel">Cancel</button>
+        <button id="rdlg-ok" class="primary">Refresh &amp; resume</button>
+      </div>
+      <div id="rdlg-err" class="hidden"></div>
     </div>
   </div>
 

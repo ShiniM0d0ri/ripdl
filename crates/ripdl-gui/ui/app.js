@@ -210,8 +210,8 @@ const CAT_ICON = {
 // HTTP download at a glance (and hints that torrent rows have a details view).
 const KIND = {
     torrent: { icon: "magnet", cls: "green", label: "BitTorrent", hint: "double-click for files, peers and trackers" },
-    http: { icon: "download", cls: "blue", label: "HTTP", hint: "multi-segment download" },
-    video: { icon: "film", cls: "violet", label: "Video", hint: "stream page handled by yt-dlp" },
+    http: { icon: "download", cls: "blue", label: "HTTP", hint: "multi-segment download - double-click for segments" },
+    video: { icon: "film", cls: "violet", label: "Video", hint: "stream page handled by yt-dlp - double-click for details" },
 };
 
 function kindOf(t) {
@@ -421,7 +421,8 @@ function escapeHtml(s) {
 
 function showCtx(x, y) {
     // Retitle the toggle per task (Pause/Resume vs seed start/stop) and hide
-    // entries that do not apply: only torrent rows have a details view.
+    // entries that do not apply: details exist for every kind, refresh only
+    // for HTTP downloads that have not finished.
     const t = selectedId ? findTask(selectedId) : null;
     const running = !!t && ["running", "queued"].includes(t.state);
     const seedable = !!t && t.state === "completed" && t.kind === "torrent";
@@ -433,7 +434,12 @@ function showCtx(x, y) {
         ? (t.seeding ? "Stop seeding" : "Start seeding")
         : (running ? "Pause" : "Resume");
     toggle.classList.toggle("hidden", !!t && t.state === "completed" && t.kind !== "torrent");
-    $("#ctx .ctx-torrent").classList.toggle("hidden", !t || t.kind !== "torrent");
+    $("#ctx [data-act=details]").classList.toggle("hidden", !t);
+    $("#ctx-details-lbl").textContent = t && t.kind === "torrent" ? "Torrent details…" : "Details…";
+    $("#ctx [data-act=refresh]").classList.toggle(
+        "hidden",
+        !t || t.kind !== "http" || t.state === "completed"
+    );
 
     const menu = $("#ctx");
     menu.classList.remove("hidden");
@@ -461,8 +467,9 @@ async function doTaskAction(act, id) {
             if (!confirm(`Delete the downloaded file(s) for "${rowName(t)}" from disk?\nThis cannot be undone.`)) return;
             await invokeSafe("remove_task", { id, deleteFiles: true });
         } else if (act === "details") {
-            if (t.kind !== "torrent") { flashErr("Details are only available for torrent tasks."); return; }
             await openDetails(id);
+        } else if (act === "refresh") {
+            openRefreshDialog(id);
         } else if (act === "openFolder") {
             await invokeSafe("open_path", { path: t.dest_dir || "", reveal: null });
         } else if (act === "openFile") {
@@ -1068,7 +1075,7 @@ $("#set-dir").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 // True while any dialog is open: global accelerators shouldn't fire into
 // them (Ctrl+N while typing in the Add dialog would wipe the typed URL).
 function dialogOpen() {
-    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop", "#abt-backdrop"]
+    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop", "#hdt-backdrop", "#rdlg-backdrop", "#abt-backdrop"]
         .some((s) => !$(s).classList.contains("hidden"));
 }
 
@@ -1077,6 +1084,8 @@ document.addEventListener("keydown", (ev) => {
         $("#dlg-backdrop").classList.add("hidden");
         torrentPick = null;
         closeDetails();
+        closeHttpDetails();
+        closeRefreshDialog();
         closeSettings();
         closeAbout();
         closeMenus();
@@ -1121,7 +1130,15 @@ function wantsFile(idx, fallback) {
 
 async function openDetails(id) {
     const t = findTask(id);
+    if (!t) return;
+    if (t.kind === "torrent") return openTorrentDetails(id);
+    return openHttpDetails(id);
+}
+
+async function openTorrentDetails(id) {
+    const t = findTask(id);
     if (!t || t.kind !== "torrent") return;
+    closeHttpDetails();
     detailsTaskId = id;
     detailsTab = "files";
     filesRenderKey = "";
@@ -1361,6 +1378,201 @@ $("#tdg-apply").onclick = async () => {
         flashErr(String(e).replace(/^.*error: /, ""));
         $("#tdg-apply").disabled = !pendingSel || pendingSel.size === 0;
     }
+};
+
+/* HTTP / video task details dialog */
+let httpDetailsId = null;
+let httpDetailsTimer = null;
+let httpDetailsBusy = false;
+// JS cannot represent u64::MAX exactly; no real byte-range end comes close.
+const UNBOUNDED_END = Number.MAX_SAFE_INTEGER;
+
+async function openHttpDetails(id) {
+    const t = findTask(id);
+    if (!t) return;
+    closeDetails(); // the torrent dialog and this one never stack
+    httpDetailsId = id;
+    $("#hdt-name").textContent = rowName(t);
+    $("#hdt-body").innerHTML = "";
+    $("#hdt-summary").textContent = "";
+    $("#hdt-backdrop").classList.remove("hidden");
+    await refreshHttpDetails();
+    clearInterval(httpDetailsTimer);
+    httpDetailsTimer = setInterval(() => {
+        if (!httpDetailsId || $("#hdt-backdrop").classList.contains("hidden")) return;
+        if (!findTask(httpDetailsId)) { closeHttpDetails(); return; }
+        refreshHttpDetails();
+    }, 1000);
+}
+
+function closeHttpDetails() {
+    httpDetailsId = null;
+    clearInterval(httpDetailsTimer);
+    $("#hdt-backdrop").classList.add("hidden");
+}
+
+async function refreshHttpDetails() {
+    if (!httpDetailsId || httpDetailsBusy) return;
+    httpDetailsBusy = true;
+    try {
+        const d = await invokeSafe("task_details", { id: httpDetailsId });
+        renderHttpDetails(d);
+    } catch (e) {
+        $("#hdt-body").innerHTML = `<div class="trk-off">${escapeHtml(String(e).replace(/^.*error: /, ""))}</div>`;
+    } finally {
+        httpDetailsBusy = false;
+    }
+}
+
+// Address, output file, resume identity and the engine's byte-range map.
+// Everything comes from the sidecar the engine resumes from, so what the
+// dialog shows is exactly what a resume would do.
+function renderHttpDetails(d) {
+    const t = findTask(d.id);
+    $("#hdt-name").textContent = t ? rowName(t) : urlName(d.url);
+    const pct = d.percent != null ? d.percent : (d.total ? (d.downloaded / d.total) * 100 : null);
+    const kind = d.kind === "video" ? "yt-dlp stream" : "HTTP ranges";
+    $("#hdt-summary").textContent =
+        `${kind} \u00b7 ${t ? stateLabel(t) : d.state}` +
+        `\n${humans(d.downloaded)}${d.total ? " / " + humans(d.total) : ""}` +
+        `${pct != null ? ` (${pct.toFixed(1)}%)` : ""}`;
+
+    const meta = [`<tr><th>Address</th><td class="hdt-url">${escapeHtml(d.url)}</td></tr>`];
+    if (d.dest_file) {
+        meta.push(`<tr><th>File</th><td class="hdt-url">${escapeHtml(d.dest_file)}</td></tr>`);
+    } else if (t && t.dest_dir) {
+        meta.push(`<tr><th>Folder</th><td class="hdt-url">${escapeHtml(t.dest_dir)}</td></tr>`);
+    }
+    if (d.etag) meta.push(`<tr><th>ETag</th><td>${escapeHtml(d.etag)}</td></tr>`);
+    if (d.error) {
+        const hint = errorHint(d.error);
+        meta.push(
+            `<tr><th>Last error</th><td class="hdt-err">${escapeHtml(d.error)}` +
+            `${hint ? `<div class="trk-off">${escapeHtml(hint)}</div>` : ""}</td></tr>`
+        );
+    }
+    let html = `<table>${meta.join("")}</table>`;
+
+    const segs = d.segments || [];
+    if (segs.length) {
+        const finished = segs.filter((s) => s.end > UNBOUNDED_END || s.done >= s.end - s.start + 1).length;
+        html += `<div class="hdt-segs-title">${segs.length} segment${segs.length === 1 ? "" : "s"} \u00b7 ${finished} finished</div>`;
+        html += `<table><tr><th>#</th><th>Byte range</th><th>Progress</th><th class="r">Durable</th></tr>`;
+        for (const s of segs) {
+            const open = s.end > UNBOUNDED_END;
+            const span = open ? 0 : s.end - s.start + 1;
+            const p = open || !span ? null : Math.min(100, (s.done / span) * 100);
+            const range = open ? `${humans(s.start)} \u2013 end` : `${humans(s.start)} \u2013 ${humans(s.end)}`;
+            const bar = p == null
+                ? `<span class="trk-off">single stream</span>`
+                : `<div class="hdt-bar"><i class="${p >= 100 ? "full" : ""}" style="width:${p.toFixed(1)}%"></i></div>` +
+                  `<span class="hdt-pct">${p.toFixed(0)}%</span>`;
+            html += `<tr>
+              <td>${s.index}</td>
+              <td class="hdt-range">${range}</td>
+              <td>${bar}</td>
+              <td class="r">${humans(s.done)}${open || !span ? "" : " / " + humans(span)}</td>
+            </tr>`;
+        }
+        html += `</table>`;
+    } else if (d.kind === "http") {
+        html += `<div class="trk-off">No byte-range plan yet - the engine writes it once the download starts.</div>`;
+    }
+    $("#hdt-body").innerHTML = html;
+
+    $("#hdt-refresh").classList.toggle("hidden", d.kind !== "http" || d.state === "completed");
+    // A partial file is not worth launching; reveal it in Explorer instead.
+    $("#hdt-open").disabled = d.state !== "completed" || !d.dest_file;
+    $("#hdt-folder").disabled = !(d.dest_file || (t && t.dest_dir));
+}
+
+$("#hdt-close").onclick = closeHttpDetails;
+$("#hdt-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeHttpDetails(); };
+$("#hdt-refresh").onclick = () => { if (httpDetailsId) openRefreshDialog(httpDetailsId); };
+$("#hdt-open").onclick = async () => {
+    try {
+        const d = await invokeSafe("task_details", { id: httpDetailsId });
+        if (d.dest_file) await invokeSafe("open_path", { path: d.dest_file, reveal: null });
+    } catch (e) {
+        flashErr(String(e).replace(/^.*error: /, ""));
+    }
+};
+$("#hdt-folder").onclick = async () => {
+    try {
+        const d = await invokeSafe("task_details", { id: httpDetailsId });
+        const t = findTask(httpDetailsId);
+        if (d.dest_file) {
+            const dir = d.dest_file.replace(/[^\\/]+$/, "");
+            await invokeSafe("open_path", { path: dir, reveal: baseName(d.dest_file) });
+        } else if (t && t.dest_dir) {
+            await invokeSafe("open_path", { path: t.dest_dir, reveal: null });
+        }
+    } catch (e) {
+        flashErr(String(e).replace(/^.*error: /, ""));
+    }
+};
+
+/* Refresh download address (expired signed links, same file) */
+let refreshTargetId = null;
+
+function openRefreshDialog(id) {
+    const t = findTask(id);
+    if (!t) return;
+    if (t.kind !== "http") { flashErr("Only HTTP downloads can refresh their address."); return; }
+    if (t.state === "completed") { flashErr("This download already finished."); return; }
+    refreshTargetId = id;
+    $("#rdlg-url").value = t.url || "";
+    $("#rdlg-hint").textContent =
+        "Paste a fresh link for the same file (signed URLs expire). ripdl keeps the bytes already on disk and continues from there; the new link must serve the same file name and size and support byte ranges." +
+        (["running", "queued"].includes(t.state) ? " The download is paused first." : "");
+    $("#rdlg-err").classList.add("hidden");
+    $("#rdlg-err").textContent = "";
+    $("#rdlg-backdrop").classList.remove("hidden");
+    const field = $("#rdlg-url");
+    field.focus();
+    field.setSelectionRange(field.value.length, field.value.length);
+}
+
+function closeRefreshDialog() {
+    refreshTargetId = null;
+    $("#rdlg-backdrop").classList.add("hidden");
+}
+
+function refreshError(msg) {
+    const el = $("#rdlg-err");
+    el.textContent = msg;
+    el.classList.remove("hidden");
+}
+
+async function submitRefresh() {
+    if (!refreshTargetId) return;
+    const id = refreshTargetId;
+    const url = $("#rdlg-url").value.trim();
+    if (!url) { refreshError("Paste the fresh URL first."); return; }
+    const btn = $("#rdlg-ok");
+    btn.disabled = true;
+    try {
+        const out = await invokeSafe("refresh_url", { id, url });
+        const kept = out && out.kept != null
+            ? ` (kept ${humans(out.kept)}${out.total ? " of " + humans(out.total) : ""})`
+            : "";
+        closeRefreshDialog();
+        flashStatus(`address refreshed${kept} - resuming`);
+        await poll();
+        if (httpDetailsId === id) await refreshHttpDetails();
+    } catch (e) {
+        refreshError(String(e).replace(/^.*error: /, ""));
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+$("#rdlg-cancel").onclick = closeRefreshDialog;
+$("#rdlg-ok").onclick = submitRefresh;
+$("#rdlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeRefreshDialog(); };
+$("#rdlg-url").onkeydown = (ev) => {
+    // A URL has no newlines: Enter submits, Shift+Enter still breaks the line.
+    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); submitRefresh(); }
 };
 
 setConn(false);

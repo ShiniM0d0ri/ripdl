@@ -315,6 +315,41 @@ async fn torrent_details(id: String) -> Result<ripdl_core::torrent::TorrentDetai
     }
 }
 
+/// Engine view for an HTTP/video task: output file, resume identity and the
+/// byte-range segment map (what the details dialog renders).
+#[tauri::command]
+async fn task_details(id: String) -> Result<ripdl_core::rpc::TaskDetailsSnapshot, String> {
+    match rpc(Command::Details { id }).await? {
+        Reply::TaskDetails { details } => Ok(details),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RefreshOutcome {
+    /// Durable bytes kept on disk.
+    kept: u64,
+    total: Option<u64>,
+}
+
+/// Point a paused/failed download at a fresh URL (expired signed link) and
+/// resume it: the daemon keeps the bytes already downloaded.
+#[tauri::command]
+async fn refresh_url(id: String, url: String) -> Result<RefreshOutcome, String> {
+    match rpc(Command::RefreshUrl {
+        id,
+        url,
+        resume: true,
+    })
+    .await?
+    {
+        Reply::Refreshed { kept, total, .. } => Ok(RefreshOutcome { kept, total }),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
 /// Open the task's folder (or reveal the completed file in it).
 #[tauri::command]
 async fn open_path(path: String, reveal: Option<String>) -> Result<(), String> {
@@ -527,6 +562,8 @@ fn main() {
             pick_dir,
             pick_file,
             torrent_details,
+            task_details,
+            refresh_url,
             open_path,
             download_root_path,
             get_config,
