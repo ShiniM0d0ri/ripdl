@@ -297,7 +297,18 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
 - [ ] Bonding health: keep the default-route uplink and drop candidates that
       fail a reachability probe, so one dead-end adapter can never halve
       the peer connection success rate
-- [ ] Segment visibility in the GUI (active connections + ranges per task)
+- [x] Segment visibility in the GUI: double-click (or Details) on an HTTP /
+      video row opens its own dialog - address, output file, resume ETag and
+      the live byte-range map from the sidecar (per-segment durable bytes and
+      progress bars), refreshed every second, with Open file/folder. Partial
+      downloads now record their destination as soon as the URL is probed
+      (`Progress.dest_file`), so open/delete/details work before completion
+- [x] Refresh download address (IDM parity): a paused, failed or running HTTP
+      task can be re-pointed at a fresh URL (signed links expire) without
+      losing progress. The daemon pauses a live runner, probes the new
+      address, refuses it unless it serves the same file (name + size) with
+      byte ranges, then swaps url+ETag in the sidecar and resumes; GUI
+      dialog + context entry, CLI `ripdl refresh <id> <url> [--resume]`
 
 ## P7 - core control (engine power features)
 
@@ -314,8 +325,9 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
 - [ ] Mid-download re-division: split a slow segment's range off its
       neighbours (today the gate only widens/narrows the in-flight cap)
 - [ ] Global daemon speed cap exposed in GUI (engine + config already have it)
-- [ ] Mid-download segment map: active connections, byte ranges, stalls;
-      re-divide a stalled segment from busy neighbours
+- [ ] Mid-download segment map: stall detection + re-division of a stalled
+      segment from busy neighbours (the details dialog already shows the live
+      range map; the engine still only widens/narrows the in-flight cap)
 - [ ] Post-download checksum: sha256 verify when a hash is known
       (sidecar/manifest/`--sha256`), warn on mismatch
 
@@ -330,9 +342,9 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       check)
 - [x] Torrent vs HTTP at a glance: dedicated icon-only kind column (magnet /
       download / film with tooltips), category-coloured file-type glyph in the
-      name cell, kind hint in the row tooltip, "Torrent details..." hidden for
-      non-torrent rows, icon context menu (toggle retitled Pause/Resume per
-      row); volatile cells now addressed by class so columns can't shift them
+      name cell, kind hint in the row tooltip, per-kind details entry in the
+      icon context menu (retitled Pause/Resume per row); volatile cells now
+      addressed by class so columns can't shift them
 - [x] Seeding UX: teal "seeding" row state with upload rate, Files/Peers/
       Trackers stay available after completion and restarts, seed start/stop
       from the row + context menu, ratio/time limits in Settings

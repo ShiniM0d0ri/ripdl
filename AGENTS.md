@@ -300,6 +300,28 @@ row/context toggle starts/stops seeding (pause keeps the torrent inspectable).
 GUI shows a teal "seeding" state with ↑ rate; details summary adds
 uploaded/ratio/peers; qBittorrent clean-room options inventory lives at
 `docs/qbittorrent-options.md` (275 controls across 9 pages).
+v0.3.12: HTTP task parity with IDM. Two things landed, one protocol addition
+each (`Reply::TaskDetails`, `Command::RefreshUrl`/`Reply::Refreshed`):
+(1) **Refresh download address** - `ripdl-core::refresh` validates a new URL
+against the paused sidecar (same file name + size, byte ranges advertised,
+segments bounded) and re-points `url`+`etag` without touching offsets; the
+daemon (`cmd_refresh_url`) first pauses a live runner and waits for its
+paused sidecar to land, then probes, swaps and optionally resumes. GUI:
+"Refresh address..." in the context menu and the new HTTP details dialog,
+with a dialog that pre-fills the old URL and a "kept X of Y" readout; CLI
+`ripdl refresh <id> <url> [--resume]`. Verified offline against a
+loopback token-expiry server: 40% paused -> expired link -> refresh kept
+10.5 MB, resumed mid-segment, SHA256 matched (core integration test
+`refreshed_address_resumes_from_sidecar` plus a live daemon run; the
+"different file" guard reports both sizes).
+(2) **Details for normal downloads** - `Details` now dispatches by kind:
+torrents keep files/peers/trackers, HTTP/video tasks answer
+`Reply::TaskDetails` (address, output file, ETag, last error, per-segment
+durable bytes) read from the same sidecar resume uses. Double-click (or the
+context entry, now labelled per kind) opens the new dialog, refreshed every
+second while open, with Open file/folder. Partial HTTP tasks now record
+`dest_file` from `Progress.dest_file` on the first engine tick, so partial
+paths show in the row and `rm --files` no longer needs the URL scan there.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap,
