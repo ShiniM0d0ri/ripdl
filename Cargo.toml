@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon", "crates/ripdl-gui", "vendor/librqbit"]
 
 [workspace.package]
-version = "0.3.13"
+version = "0.3.14"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "ripdl - free, ad-free, multi-segment download manager"

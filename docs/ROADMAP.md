@@ -83,6 +83,17 @@ Guiding rules:
 - [x] System tray + minimize-to-tray (Tauri tray icon: left click shows,
       menu "Show ripdl"/"Exit"; close minimizes to tray unless
       `hide_to_tray=false`; preference lives in config.json)
+- [x] Row titles use the file the engine actually writes, so a
+      Content-Disposition name or a `.torrent` payload name beats an opaque
+      URL tail (`.../12e29558-...?rscd=...filename=X`) and the file-type
+      glyph/category/icon pick the real extension
+- [x] Tray footprint: the WebView2 is suspended while the window is hidden
+      (`webview_mem.rs` - controller visible flag, `TrySuspend`, Low memory
+      target; `reveal()` resumes before showing), and the webview runs
+      software-composited (`--disable-gpu` + wry's default
+      `msWebOOUI,msPdfOOUI,msSmartScreenProtection` off): idle private went
+      192 -> ~101 MB, resident 418 -> 316 MB shown and ~34 MB after a minute
+      in the tray, hidden CPU ~0 (the JS poll is frozen)
 
 ## P3 - torrent support (via librqbit, Apache-2.0 — never a GPL client)
 

@@ -23,3 +23,10 @@ tauri-build = "2"
 [dependencies.tauri]
 version = "2"
 features = ["tray-icon"]
+
+# Suspend the WebView2 while the window sits in the tray (webview_mem.rs).
+# Both crates are already in the tree through wry; pin to the versions wry
+# resolves so the COM interface types stay identical.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"

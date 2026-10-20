@@ -339,6 +339,26 @@ re-created the hijack, the app updated through its own banner, and Setup's
 [Run] put the manifest back on `C:\Program Files\ripdl\ripdl.exe` - a framed
 `list` on stdin/stdout then answered from the installed host against the
 installed daemon.
+v0.3.14: the tray icon stopped costing what a browser tab costs (GUI side
+only, no protocol change). (1) Rows are titled with the file the engine
+writes (`dest_file` basename) instead of the URL tail, so a GitHub release
+asset reads `ripdl-v0.3.3-x86_64-windows-setup.exe` instead of
+`12e29558-517b-4c69-a649-8415f4e2f08f`, and the file-type glyph/category/icon
+follow the real extension. (2) Hiding to the tray suspends the WebView2
+(`crates/ripdl-gui/src/webview_mem.rs`: `SetIsVisible(false)` then
+`SetMemoryUsageTargetLevel(Low)` and `TrySuspend`; every reveal path - tray
+click/menu, second-instance forward - goes through `reveal()`, which resumes
+before showing), and the webview is software-composited
+(`additionalBrowserArgs = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection
+--disable-gpu"`; setting it replaces wry's defaults, so they are repeated).
+Measured here (2 completed tasks): idle private 192 -> 101 MB, resident 418 ->
+316 MB shown, ~34 MB a minute after hiding, hidden CPU ~0 % (the poll timer is
+frozen with the page). Two traps worth remembering: a plain hide frees nothing
+(WebView2 keeps everything resident) and Tauri only flips the *window's*
+visible flag, never the webview's, so `SetIsVisible(false)` is mandatory or
+`TrySuspend` fails with ERROR_INVALID_STATE; resident memory also takes ~30-60 s
+to be trimmed after suspension, so measure late. Resume paints the last frame
+and the pending poll fires at once (verified hide -> 50 s -> reveal).
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap,

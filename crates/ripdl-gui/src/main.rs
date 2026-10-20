@@ -15,6 +15,7 @@ use ripdl_core::transport;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 mod single_instance;
+mod webview_mem;
 
 /// Set once an in-app update has handed over to the installer. While it is
 /// set the GUI must not help: polling would auto-spawn the daemon the
@@ -536,6 +537,15 @@ fn expect_ok(reply: Reply) -> Result<(), String> {
     }
 }
 
+/// Bring the task window forward, waking the webview first: it is suspended
+/// whenever the window has been hidden to the tray.
+fn reveal(window: &tauri::WebviewWindow) {
+    webview_mem::resume(window);
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
 fn main() {
     // One GUI per machine: a second launch asks the running window to come
     // forward and exits before any window or tray icon is created.
@@ -585,9 +595,7 @@ fn main() {
                 let handle = app.handle().clone();
                 guard.spawn_listener(move || {
                     if let Some(w) = handle.get_webview_window("main") {
-                        let _ = w.show();
-                        let _ = w.unminimize();
-                        let _ = w.set_focus();
+                        reveal(&w);
                     }
                 });
             }
@@ -617,9 +625,7 @@ fn main() {
                 .on_menu_event(|app, ev| match ev.id().as_ref() {
                     "tray-show" => {
                         if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
+                            reveal(&w);
                         }
                     }
                     "tray-quit" => app.exit(0),
@@ -634,9 +640,7 @@ fn main() {
                     } = ev
                     {
                         if let Some(w) = tray.app_handle().get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
+                            reveal(&w);
                         }
                     }
                 });
@@ -661,6 +665,11 @@ fn main() {
                 if hide && window.label() == "main" {
                     api.prevent_close();
                     let _ = window.hide();
+                    // Hiding a WebView2 frees nothing on its own; suspend it
+                    // while it is off screen (see webview_mem.rs).
+                    if let Some(w) = window.app_handle().get_webview_window("main") {
+                        webview_mem::suspend(&w);
+                    }
                 }
             }
         })
