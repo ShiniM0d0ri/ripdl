@@ -1476,7 +1476,9 @@ function renderHttpDetails(d) {
         }
         html += `</table>`;
     } else if (d.kind === "http") {
-        html += `<div class="trk-off">No byte-range plan yet - the engine writes it once the download starts.</div>`;
+        html += d.state === "completed"
+            ? `<div class="trk-off">Finished - the resume sidecar is removed once a download completes.</div>`
+            : `<div class="trk-off">No byte-range plan yet - the engine writes it once the download starts.</div>`;
     }
     $("#hdt-body").innerHTML = html;
 
