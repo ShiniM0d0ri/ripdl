@@ -898,6 +898,7 @@ fn emit(id: &str, st: &TorrentStats, on_progress: &mut impl FnMut(Progress)) {
         // its final sample; the daemon's seeding watcher takes over after.
         seeding: st.finished,
         verifying,
+        dest_file: None,
     });
 }
 

@@ -38,6 +38,11 @@ pub enum Error {
     #[error("hunt error: {0}")]
     Hunt(String),
 
+    /// A new download address cannot continue a paused download (different
+    /// file, no ranges...). Frontends show the text as-is.
+    #[error("refresh failed: {0}")]
+    Refresh(String),
+
     #[error("update check failed: {0}")]
     Update(String),
 

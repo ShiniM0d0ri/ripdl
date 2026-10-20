@@ -82,6 +82,11 @@ pub struct Progress {
     /// the daemon must not derive a rate from it; frontends show "verifying".
     #[serde(default)]
     pub verifying: bool,
+    /// Output file the tool resolved for this run (the HTTP engine knows it
+    /// as soon as the URL is probed). Lets the daemon record partial paths,
+    /// so details/open/delete work before the task completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest_file: Option<PathBuf>,
 }
 
 impl Default for Progress {
@@ -96,6 +101,7 @@ impl Default for Progress {
             upload_bps: None,
             seeding: false,
             verifying: false,
+            dest_file: None,
         }
     }
 }

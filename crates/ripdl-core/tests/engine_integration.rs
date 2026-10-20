@@ -818,6 +818,94 @@ async fn speed_limit_applies_to_single_stream() {
     );
 }
 
+/// Refresh download address (IDM's "refresh download address"): a paused
+/// task retargeted at a fresh URL - the expired-signed-link case - must
+/// continue from the durable offsets instead of restarting, and finish
+/// byte-exact.
+#[tokio::test]
+async fn refreshed_address_resumes_from_sidecar() {
+    // Same pacing/size as the resume test: 4 MiB / 8 segments of 512 KiB.
+    let state = Arc::new(ServerState {
+        total: 4 * MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: Some(Duration::from_millis(40)),
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+    });
+    let base = spawn_server(Arc::clone(&state)).await;
+    let old = format!("{base}?token=old");
+    let new = format!("{base}?token=new");
+
+    let engine = test_engine();
+    let tmp = temp_dir("refresh");
+
+    let token = CancellationToken::new();
+    let killer = token.clone();
+    let res = engine
+        .download(&old, Some(tmp.clone()), token, move |p| {
+            if p.downloaded >= 300_000 {
+                killer.cancel();
+            }
+        })
+        .await;
+    assert!(
+        matches!(res, Err(ripdl_core::Error::Cancelled)),
+        "expected cancel, got {res:?}"
+    );
+
+    // The paused sidecar still names the expired address.
+    let dest = tmp.join("file.bin");
+    let mut st = ripdl_core::refresh::load(&dest)
+        .expect("sidecar readable")
+        .expect("sidecar exists after cancel");
+    assert_eq!(st.url, old);
+
+    // Validate the new address and re-point the sidecar (what the daemon does).
+    let info = engine.plan(&new).await.expect("probe the new address");
+    ripdl_core::refresh::check_compatible(&dest, &st, &info)
+        .expect("same file behind a fresh token");
+    let kept = ripdl_core::refresh::kept_bytes(&st);
+    assert!(kept > 0, "pause must have left durable progress");
+    ripdl_core::refresh::retarget(&mut st, &new, info.etag.clone(), info.total);
+    ripdl_core::refresh::save(&dest, &st).expect("sidecar rewritten");
+
+    let seen_before = state.ranges_seen.lock().unwrap().len();
+    let resumed_dest = engine
+        .download(&new, Some(tmp.clone()), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("resume from the refreshed address");
+    assert_eq!(resumed_dest, dest, "must continue the same file");
+    verify(&dest, 4 * MIB);
+
+    let seen = state.ranges_seen.lock().unwrap().clone();
+    let resumed = &seen[seen_before..];
+    assert_eq!(resumed.len(), 8, "all 8 segments must finish, saw {seen:?}");
+    for (k, r) in resumed.iter().enumerate() {
+        let (a, _) = r.split_once('-').expect("range format");
+        let start: u64 = a.parse().expect("range start");
+        assert_ne!(
+            start % 524_288,
+            0,
+            "segment {k} must resume mid-segment after the refresh, saw {r}"
+        );
+    }
+    let names = dir_names(&dest.parent().unwrap());
+    assert!(
+        !names.iter().any(|n| n.ends_with(".ripdl.json")),
+        "sidecar must be removed on success: {names:?}"
+    );
+}
+
 /// The file changed server-side between attempts: the sidecar's etag no
 /// longer matches, so the second call must plan fresh from byte 0 (with an
 /// up-to-date If-Match) and complete.

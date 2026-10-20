@@ -323,6 +323,7 @@ impl Engine {
             let finished = finished.clone();
             let state_path = state_path.clone();
             let meta_task = meta.clone();
+            let dest_report = dest.clone();
             let mut on_progress = on_progress;
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -344,6 +345,7 @@ impl Engine {
                             total: meta_task.total,
                             percent: None,
                             speed_bps: None,
+                            dest_file: Some(dest_report.clone()),
                             ..Progress::default()
                         });
                         break;
@@ -377,6 +379,7 @@ impl Engine {
                         total: meta_task.total,
                         percent: None,
                         speed_bps: None,
+                        dest_file: Some(dest_report.clone()),
                         ..Progress::default()
                     });
                 }
@@ -787,7 +790,8 @@ fn plan_fresh(info: &PlanInfo, cfg: &EngineConfig) -> Vec<SegmentState> {
     }
 }
 
-fn sidecar_path(dest: &Path) -> PathBuf {
+/// Resume sidecar path for a partial download (`<file>.ripdl.json`).
+pub fn sidecar_path(dest: &Path) -> PathBuf {
     let mut s = dest.as_os_str().to_os_string();
     s.push(".ripdl.json");
     PathBuf::from(s)

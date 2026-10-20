@@ -229,10 +229,20 @@ pub enum Command {
     TorrentPreview {
         payload: String,
     },
-    /// Details for one task's torrent: files/peers/trackers snapshot.
-    /// Errors if the task is not a torrent or the session lost it.
+    /// Details for one task: torrents get files/peers/trackers
+    /// (`Reply::TorrentDetails`), HTTP/video tasks get addresses, the output
+    /// file and the byte-range segments (`Reply::TaskDetails`).
     Details {
         id: String,
+    },
+    /// Point a paused/failed HTTP task at a fresh URL (expired signed link)
+    /// while keeping the bytes already on disk. `resume` restarts it right
+    /// away. Rejects a new address that serves a different file.
+    RefreshUrl {
+        id: String,
+        url: String,
+        #[serde(default)]
+        resume: bool,
     },
     /// Change a torrent task's per-file selection. `None` selects every
     /// file; works live and while paused. The choice is persisted and
@@ -287,6 +297,19 @@ pub enum Reply {
     },
     TorrentDetails {
         details: crate::torrent::TorrentDetailsSnapshot,
+    },
+    /// Result of a `Details` for a non-torrent task.
+    TaskDetails {
+        details: TaskDetailsSnapshot,
+    },
+    /// Result of a `RefreshUrl`: how much on-disk progress the swap kept.
+    Refreshed {
+        id: String,
+        /// Durable bytes already on disk (kept, not re-downloaded).
+        #[serde(default)]
+        kept: u64,
+        #[serde(default)]
+        total: Option<u64>,
     },
     /// Result of a `TorrentPreview`.
     TorrentPreview {
@@ -377,6 +400,34 @@ pub struct TaskInfo {
     /// Torrent-only: current per-file selection (None = everything).
     #[serde(default)]
     pub only_files: Option<Vec<usize>>,
+}
+
+/// One task's engine view behind the details dialog: where it writes, the
+/// resume identity, and the byte-range segment map (HTTP/video tasks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDetailsSnapshot {
+    pub id: String,
+    pub kind: crate::task::TaskKind,
+    pub url: String,
+    pub state: TaskState,
+    /// Destination file (partial runs know it once the URL is probed).
+    #[serde(default)]
+    pub dest_file: Option<PathBuf>,
+    #[serde(default)]
+    pub downloaded: u64,
+    #[serde(default)]
+    pub total: Option<u64>,
+    /// Tool-level percent for tasks without byte totals (video/yt-dlp).
+    #[serde(default)]
+    pub percent: Option<f64>,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Segments from the resume sidecar (empty when the engine never
+    /// planned, when the task finished, or for the yt-dlp sidecar).
+    #[serde(default)]
+    pub segments: Vec<crate::task::SegmentState>,
 }
 
 #[cfg(test)]

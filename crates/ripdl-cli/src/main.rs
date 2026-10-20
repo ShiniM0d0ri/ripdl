@@ -125,8 +125,19 @@ enum Cmd {
         #[arg(long = "files")]
         files: bool,
     },
-    /// Torrent details for one task: files, peers, trackers.
+    /// Details for one task: torrents show files/peers/trackers, HTTP/video
+    /// tasks show the address, output file and byte-range segments.
     Details { id: String },
+    /// Point a paused/failed task at a fresh URL (expired signed link keeps
+    /// the same file). Bytes already on disk are kept; the new address must
+    /// serve the same file (name + size) and support byte ranges.
+    Refresh {
+        id: String,
+        url: String,
+        /// Resume the download right after the swap.
+        #[arg(long)]
+        resume: bool,
+    },
     /// Change a torrent task's per-file selection: file indices
     /// comma-separated (`0,2,3`) or `all`.
     Select { id: String, files: String },
@@ -278,6 +289,23 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
         Cmd::Details { id } => rpc(Command::Details { id }).await,
+        Cmd::Refresh { id, url, resume } => {
+            let reply = rpc_reply(Command::RefreshUrl { id: id.clone(), url, resume }).await?;
+            match reply {
+                Reply::Refreshed { kept, total, .. } => {
+                    println!(
+                        "address refreshed: keeping {} of {} already on disk",
+                        humans(kept),
+                        total.map(humans).unwrap_or_else(|| "?".to_string())
+                    );
+                    if !resume {
+                        println!("resume it with: ripdl resume {id}");
+                    }
+                    Ok(())
+                }
+                other => print_reply(other),
+            }
+        }
         Cmd::Select { id, files } => {
             let only_files = if files.trim().eq_ignore_ascii_case("all") {
                 None
@@ -548,6 +576,66 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             for p in details.peers.iter().take(12) {
                 println!("  {:>21} {:>12} {:<28} dl {:>12} ul {:>12}", p.addr, p.state, p.client.as_deref().unwrap_or("-"), p.downloaded, p.uploaded);
             }
+        }
+        Reply::TaskDetails { details } => {
+            let kind = match details.kind {
+                ripdl_core::task::TaskKind::Video => "video (yt-dlp sidecar)",
+                ripdl_core::task::TaskKind::Torrent => "torrent",
+                ripdl_core::task::TaskKind::Http => "http (multi-segment)",
+            };
+            println!("kind: {kind}");
+            println!("state: {}", state_label(details.state));
+            println!("url: {}", details.url);
+            if let Some(f) = &details.dest_file {
+                println!("file: {}", f.display());
+            }
+            let pct = details
+                .percent
+                .or_else(|| details.total.map(|t| details.downloaded as f64 / t as f64 * 100.0));
+            println!(
+                "progress: {}{}",
+                match details.total {
+                    Some(total) => format!("{} / {}", humans(details.downloaded), humans(total)),
+                    None => humans(details.downloaded),
+                },
+                pct.map(|p| format!(" ({p:.1}%)")).unwrap_or_default()
+            );
+            if let Some(etag) = &details.etag {
+                println!("etag: {etag}");
+            }
+            if let Some(err) = &details.error {
+                println!("error: {err}");
+            }
+            if !details.segments.is_empty() {
+                println!("segments: {}", details.segments.len());
+                for s in &details.segments {
+                    let span = s.end.saturating_sub(s.start).saturating_add(1);
+                    let pct = if s.end == u64::MAX {
+                        0.0
+                    } else {
+                        s.done as f64 / span as f64 * 100.0
+                    };
+                    println!(
+                        "  #{:<2} from {:>12}  {:>12} / {:>12} ({:>5.1}%)",
+                        s.index,
+                        humans(s.start),
+                        humans(s.done),
+                        if s.end == u64::MAX {
+                            "to EOF".to_string()
+                        } else {
+                            humans(span)
+                        },
+                        pct
+                    );
+                }
+            }
+        }
+        Reply::Refreshed { kept, total, .. } => {
+            println!(
+                "address refreshed: keeping {} of {} already on disk",
+                humans(kept),
+                total.map(humans).unwrap_or_else(|| "?".to_string())
+            );
         }
         Reply::TorrentPreview { preview } => {
             println!("name: {}", preview.name.as_deref().unwrap_or("(unknown)"));

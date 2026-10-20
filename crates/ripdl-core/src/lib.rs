@@ -10,6 +10,7 @@ pub mod engine;
 pub mod error;
 pub mod hunt;
 pub mod queue;
+pub mod refresh;
 pub mod rpc;
 pub mod task;
 pub mod torrent;

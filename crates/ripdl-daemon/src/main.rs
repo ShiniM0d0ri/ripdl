@@ -10,7 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use ripdl_core::rpc::{Command, Reply, Request, Response, TaskInfo, DEFAULT_PORT};
+use ripdl_core::rpc::{
+    Command, Reply, Request, Response, TaskDetailsSnapshot, TaskInfo, DEFAULT_PORT,
+};
 use ripdl_core::task::{Progress, TaskKind, TaskState};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
 
@@ -786,7 +788,10 @@ impl Daemon {
                 self.cmd_torrent_preview(req.id, &payload).await
             }
             Command::List => self.cmd_list(req.id),
-            Command::Details { id } => self.cmd_torrent_details(req.id, &id).await,
+            Command::Details { id } => self.cmd_details(req.id, &id).await,
+            Command::RefreshUrl { id, url, resume } => {
+                self.cmd_refresh_url(req.id, &id, &url, resume).await
+            }
             Command::UpdateTorrentSelection { id, only_files } => {
                 self.cmd_update_selection(req.id, &id, only_files).await
             }
@@ -1022,6 +1027,49 @@ impl Daemon {
         self.config.lock().unwrap().clone()
     }
 
+    /// Engine policy for one HTTP task: daemon-wide limits plus the task's
+    /// own headers (which always win over the defaults). `bond` lets a
+    /// metadata probe skip the interface scan - it cannot change what the
+    /// server answers.
+    fn engine_config(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+        bond: bool,
+    ) -> EngineConfig {
+        let conf = self.conf();
+        EngineConfig {
+            max_segments: conf.max_segments(),
+            min_segment_size: conf.min_segment_size(),
+            max_speed: conf.max_speed(),
+            headers: headers.clone(),
+            bond: if bond && conf.bond_interfaces() {
+                ripdl_core::Bond::Auto
+            } else {
+                ripdl_core::Bond::Off
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    /// Folders a task may have written its partial file to: the task's own
+    /// destination, then the daemon default, then the user's Downloads
+    /// (the runner's fallback chain).
+    fn sidecar_dirs(&self, rec: &TaskRecord) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(d) = &rec.dest_dir {
+            dirs.push(d.clone());
+        }
+        for d in [self.conf().default_download_dir, default_download_dir()]
+            .into_iter()
+            .flatten()
+        {
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        dirs
+    }
+
     /// The daemon's one torrent session, created on demand (DHT/listener
     /// bind once, rooted at the download default). Torrent runners and
     /// preview queries share this same path.
@@ -1154,6 +1202,184 @@ impl Daemon {
         }
         self.spawn_runner(rec);
         Response { id: req_id, reply: Reply::Added { id } }
+    }
+
+    /// Details dispatch: torrents answer with the swarm snapshot, everything
+    /// else with the engine's address/segment view. One command so frontends
+    /// do not have to know the kind before asking.
+    async fn cmd_details(self: &Arc<Self>, req_id: u64, id: &str) -> Response {
+        let kind = {
+            let records = self.records.lock().unwrap();
+            records.iter().find(|r| r.id == id).map(|r| r.kind)
+        };
+        match kind {
+            Some(TaskKind::Torrent) => self.cmd_torrent_details(req_id, id).await,
+            Some(_) => self.cmd_task_details(req_id, id),
+            None => Response {
+                id: req_id,
+                reply: Reply::Error {
+                    message: "task not found".into(),
+                },
+            },
+        }
+    }
+
+    /// HTTP/video details: where the task writes, the resume identity and
+    /// the byte-range map from the sidecar (the same file resume reads), so
+    /// the dialog shows what the engine really planned.
+    fn cmd_task_details(&self, req_id: u64, id: &str) -> Response {
+        let (rec, live) = {
+            // records -> progress is the order cmd_list uses; keep it.
+            let records = self.records.lock().unwrap();
+            match records.iter().find(|r| r.id == id) {
+                Some(r) => {
+                    let live = self
+                        .progress
+                        .lock()
+                        .unwrap()
+                        .get(id)
+                        .map(|t| (t.last.downloaded, t.last.total, t.last.percent));
+                    (r.clone(), live)
+                }
+                None => {
+                    return Response {
+                        id: req_id,
+                        reply: Reply::Error {
+                            message: "task not found".into(),
+                        },
+                    }
+                }
+            }
+        };
+        let (dest_file, etag, segments) = match find_sidecar(&rec, &self.sidecar_dirs(&rec)) {
+            Some((dest, state)) => (Some(dest), state.etag, state.segments),
+            None => (rec.dest_file.clone(), None, Vec::new()),
+        };
+        let (downloaded, total, percent) = match live {
+            Some((d, t, p)) => (d, t, p),
+            None => (rec.downloaded, rec.total, None),
+        };
+        Response {
+            id: req_id,
+            reply: Reply::TaskDetails {
+                details: TaskDetailsSnapshot {
+                    id: rec.id,
+                    kind: rec.kind,
+                    url: rec.url,
+                    state: rec.state,
+                    dest_file,
+                    downloaded,
+                    total,
+                    percent,
+                    etag,
+                    error: rec.error,
+                    segments,
+                },
+            },
+        }
+    }
+
+    /// IDM's "refresh download address": an expiring signed URL can be
+    /// replaced for the same file. The paused sidecar is re-pointed (byte
+    /// offsets untouched) only after the new address passes the same-file
+    /// check; a live runner is paused first so it cannot flush stale state.
+    async fn cmd_refresh_url(
+        self: &Arc<Self>,
+        req_id: u64,
+        id: &str,
+        url: &str,
+        resume: bool,
+    ) -> Response {
+        let reply: Result<Reply, String> = async {
+            let rec = {
+                let records = self.records.lock().unwrap();
+                match records.iter().find(|r| r.id == id) {
+                    Some(r) => r.clone(),
+                    None => return Err("task not found".into()),
+                }
+            };
+            if rec.kind != TaskKind::Http {
+                return Err(if rec.kind == TaskKind::Torrent {
+                    "torrents have no address to refresh; re-add the magnet or .torrent".into()
+                } else {
+                    "only HTTP downloads can refresh their address".into()
+                });
+            }
+            if rec.state == TaskState::Completed {
+                return Err("the download already finished; nothing to refresh".into());
+            }
+
+            // A runner holds the URL it was spawned with: stop it and wait
+            // for the engine's paused sidecar before swapping the address.
+            let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
+            if let Some(token) = token {
+                token.cancel();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while self.runtime.lock().unwrap().contains_key(id) {
+                    if Instant::now() > deadline {
+                        return Err("the download did not pause in time; try again".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            // Keep the durable progress when the task already started; a task
+            // that never planned has nothing to validate.
+            let mut kept = rec.downloaded;
+            let mut total = rec.total;
+            let mut dest_file = rec.dest_file.clone();
+            if let Some((dest, mut state)) = find_sidecar(&rec, &self.sidecar_dirs(&rec)) {
+                let engine = Engine::new(self.engine_config(&rec.headers, false))
+                    .map_err(|e| e.to_string())?;
+                let info = engine.plan(url).await.map_err(|e| e.to_string())?;
+                ripdl_core::refresh::check_compatible(&dest, &state, &info)
+                    .map_err(|e| e.to_string())?;
+                kept = ripdl_core::refresh::kept_bytes(&state);
+                total = info.total;
+                dest_file = Some(dest.clone());
+                ripdl_core::refresh::retarget(&mut state, url, info.etag, info.total);
+                ripdl_core::refresh::save(&dest, &state).map_err(|e| e.to_string())?;
+            }
+
+            let snapshot = {
+                let mut records = self.records.lock().unwrap();
+                let Some(r) = records.iter_mut().find(|r| r.id == id) else {
+                    return Err("task was removed meanwhile".into());
+                };
+                r.url = url.to_string();
+                r.state = TaskState::Paused;
+                r.error = None;
+                r.downloaded = kept;
+                if total.is_some() {
+                    r.total = total;
+                }
+                if dest_file.is_some() {
+                    r.dest_file = dest_file;
+                }
+                records.clone()
+            };
+            let _ = self.persist(&snapshot);
+            // The old attempt's samples describe the old URL's run.
+            self.progress.lock().unwrap().remove(id);
+
+            if resume {
+                match self.cmd_resume(req_id, id).reply {
+                    Reply::Ok => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(Reply::Refreshed {
+                id: id.to_string(),
+                kept,
+                total,
+            })
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
     }
 
     /// Torrent details: match the task's recorded info-hash against the
@@ -1639,18 +1865,7 @@ impl Daemon {
                     // defaults; task headers live on the client and always
                     // override. Both the probe and every segment carry them.
                     let engine = {
-                        let cfg = EngineConfig {
-                            max_segments: this.conf().max_segments(),
-                            min_segment_size: this.conf().min_segment_size(),
-                            max_speed: this.conf().max_speed(),
-                            headers: rec.headers.clone(),
-                            bond: if this.conf().bond_interfaces() {
-                                ripdl_core::Bond::Auto
-                            } else {
-                                ripdl_core::Bond::Off
-                            },
-                            ..EngineConfig::default()
-                        };
+                        let cfg = this.engine_config(&rec.headers, true);
                         match Engine::new(cfg) {
                             Ok(engine) => Arc::new(engine),
                             Err(e) => {
@@ -1783,6 +1998,12 @@ impl Daemon {
 
     /// Track per-task progress and derive a window-averaged speed.
     fn on_progress(&self, id: &str, p: Progress) {
+        // HTTP samples carry the resolved output file from the first tick on:
+        // record it so details/open/delete work on partial downloads (older
+        // builds only knew the path at completion).
+        if let Some(dest) = p.dest_file.clone() {
+            self.adopt_dest_file(id, dest);
+        }
         let mut map = self.progress.lock().unwrap();
         let now = Instant::now();
         // or_insert_with clones Progress only on the first tick per task;
@@ -1825,6 +2046,22 @@ impl Daemon {
         entry.speed = p.speed_bps.or(rate);
         entry.last = p;
     }
+
+    /// Persist the destination file a tool resolved (once: later samples and
+    /// the completion path carry the same value).
+    fn adopt_dest_file(&self, id: &str, dest: PathBuf) {
+        let snapshot = {
+            let mut records = self.records.lock().unwrap();
+            match records.iter_mut().find(|r| r.id == id) {
+                Some(r) if r.dest_file.is_none() => {
+                    r.dest_file = Some(dest);
+                    records.clone()
+                }
+                _ => return,
+            }
+        };
+        let _ = self.persist(&snapshot);
+    }
 }
 
 #[tokio::main]
@@ -1839,6 +2076,53 @@ async fn main() {
 /// folder, falling back to the home directory - never the daemon's cwd.
 fn default_download_dir() -> Option<PathBuf> {
     dirs::download_dir().or_else(dirs::home_dir)
+}
+
+/// Resume sidecar + partial file for an HTTP task. The recorded destination
+/// is checked first; otherwise the task's destination folders are scanned
+/// (tasks paused by an older build never recorded `dest_file`). The sidecar's
+/// URL must match the task's, so a stale sibling is ignored.
+fn find_sidecar(
+    rec: &TaskRecord,
+    dirs: &[PathBuf],
+) -> Option<(PathBuf, ripdl_core::task::TaskStateFile)> {
+    if let Some(f) = &rec.dest_file {
+        let mut side = f.as_os_str().to_os_string();
+        side.push(".ripdl.json");
+        if let Some(found) = read_sidecar_for(PathBuf::from(side), &rec.url) {
+            return Some(found);
+        }
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().ends_with(".ripdl.json") {
+                continue;
+            }
+            if let Some(found) = read_sidecar_for(entry.path(), &rec.url) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Parse one sidecar and keep it only when it describes `url`; returns the
+/// partial file it belongs to.
+fn read_sidecar_for(
+    sidecar: PathBuf,
+    url: &str,
+) -> Option<(PathBuf, ripdl_core::task::TaskStateFile)> {
+    let bytes = std::fs::read(&sidecar).ok()?;
+    let state = serde_json::from_slice::<ripdl_core::task::TaskStateFile>(&bytes).ok()?;
+    if state.url != url {
+        return None;
+    }
+    let stem = sidecar
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".ripdl.json"))?;
+    Some((sidecar.with_file_name(stem), state))
 }
 
 /// Disk artifacts owned by a removed task: the known output file and its
@@ -2114,6 +2398,54 @@ mod tests {
         };
         assert!(delete_artifacts(&rec).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Details/refresh find a partial download's sidecar even when the record
+    /// never learned `dest_file` (CLI tasks without `-d`, older builds): the
+    /// destination folders are scanned and only a sidecar for the task's own
+    /// URL counts; the partial path is derived from the sidecar name.
+    #[test]
+    fn find_sidecar_scans_folders_and_matches_url() {
+        let dir = std::env::temp_dir().join(format!(
+            "ripdl-daemon-sidecar-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("f.bin");
+        let state = ripdl_core::task::TaskStateFile {
+            id: "x".into(),
+            url: "https://x/f.bin?token=1".into(),
+            etag: Some("\"v1\"".into()),
+            total: Some(10),
+            state: TaskState::Paused,
+            segments: vec![ripdl_core::task::SegmentState {
+                index: 0,
+                start: 0,
+                end: 9,
+                done: 4,
+            }],
+        };
+        std::fs::write(
+            dir.join("f.bin.ripdl.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let mut rec = rec("t1", "https://x/f.bin?token=1", None);
+        let (target, found) = find_sidecar(&rec, &[dir.clone()]).expect("found by scan");
+        assert_eq!(target, dest);
+        assert_eq!(found.segments[0].done, 4);
+
+        // With dest_file recorded the exact sidecar wins even with no dirs.
+        rec.dest_file = Some(dest.clone());
+        assert!(find_sidecar(&rec, &[]).is_some());
+
+        // Another URL must not borrow this sidecar (refresh relies on it).
+        rec.dest_file = None;
+        rec.url = "https://x/f.bin?token=2".into();
+        assert!(find_sidecar(&rec, &[dir.clone()]).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Boot restore is what makes completed torrents survive a daemon
