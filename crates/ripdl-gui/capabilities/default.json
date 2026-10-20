@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Task window: remember its size and accept .torrent drops. Only the window/event core commands the frontend actually calls are granted; custom commands go through invoke and are not gated here.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:window:allow-set-size",
+    "core:window:allow-inner-size",
+    "core:window:allow-is-maximized",
+    "core:window:allow-scale-factor"
+  ]
+}

@@ -87,16 +87,28 @@
 
     <div id="main">
       <table id="task-table">
+        <colgroup>
+          <col data-col="name" />
+          <col data-col="kind" />
+          <col data-col="status" />
+          <col data-col="size" />
+          <col data-col="prog" />
+          <col data-col="eta" />
+          <col data-col="speed" />
+          <col class="col-fill" />
+          <col data-col="act" />
+        </colgroup>
         <thead>
           <tr>
-            <th class="col-name">File Name</th>
-            <th class="col-kind" title="Download kind"><svg class="ico"><use href="#i-layers"/></svg></th>
-            <th class="col-status">Status</th>
-            <th class="col-size">Size</th>
-            <th class="col-prog">Progress</th>
-            <th class="col-eta">Time Left</th>
-            <th class="col-speed">Speed</th>
-            <th class="col-act"></th>
+            <th class="col-name" data-col="name" title="Click to sort">File Name</th>
+            <th class="col-kind" data-col="kind" title="Download kind - click to sort"><svg class="ico"><use href="#i-layers"/></svg></th>
+            <th class="col-status" data-col="status" title="Click to sort">Status</th>
+            <th class="col-size" data-col="size" title="Click to sort">Size</th>
+            <th class="col-prog" data-col="prog" title="Click to sort">Progress</th>
+            <th class="col-eta" data-col="eta" title="Click to sort">Time Left</th>
+            <th class="col-speed" data-col="speed" title="Click to sort">Speed</th>
+            <th class="col-fill"></th>
+            <th class="col-act" data-col="act"></th>
           </tr>
         </thead>
         <tbody id="task-rows"></tbody>
@@ -216,6 +228,7 @@
       <div id="hdt-body"></div>
       <div id="hdt-actions">
         <button id="hdt-refresh"><svg class="ico"><use href="#i-globe"/></svg>Refresh address&hellip;</button>
+        <button id="hdt-copy" title="Copy the download address to the clipboard"><svg class="ico"><use href="#i-file"/></svg>Copy address</button>
         <span class="hdt-gap"></span>
         <button id="hdt-open"><svg class="ico"><use href="#i-file"/></svg>Open file</button>
         <button id="hdt-folder"><svg class="ico"><use href="#i-folder"/></svg>Open folder</button>

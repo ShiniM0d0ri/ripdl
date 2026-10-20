@@ -32,7 +32,11 @@ const CAT_LABEL = {
 const CATALOG = ["all", "unfinished", "completed", "torrents", "video", "music", "images", "documents", "archives", "programs"];
 
 let tasks = [];
-let currentCategory = "all";
+// The last category survives a restart; anything unknown falls back to "all".
+let currentCategory = (() => {
+    const saved = loadJson("ripdl.view", "all");
+    return CATALOG.includes(saved) ? saved : "all";
+})();
 let selectedId = null;
 let lastStructKey = null;
 
@@ -260,7 +264,7 @@ function inCurrentView(t) {
     if (currentCategory === "unfinished") return t.state !== "completed";
     if (currentCategory === "completed") return t.state === "completed";
     if (currentCategory === "torrents") return t.kind === "torrent";
-    return categoryOf(urlName(t.url)) === currentCategory;
+    return categoryOf(rowName(t)) === currentCategory;
 }
 
 // Everything a full row repaint owns. Downstream, poll() compares this per
@@ -305,6 +309,225 @@ function statusbarText() {
     return `${running} active · ${tasks.length} in list`;
 }
 
+/* ---------------------------------------------------------------------------
+ * Column layout: widths and sort order are the user's, so both persist in
+ * localStorage. Widths drive the <colgroup>; the trailing fill column eats the
+ * slack so the table always spans the window. Anything that cannot be loaded
+ * (first run, corrupt value) falls back to the defaults.
+ * ------------------------------------------------------------------------- */
+const COLS = [
+    { key: "name", def: 320, min: 120 },
+    { key: "kind", def: 44, min: 30 },
+    { key: "status", def: 150, min: 90 },
+    { key: "size", def: 120, min: 70 },
+    { key: "prog", def: 190, min: 90 },
+    { key: "eta", def: 90, min: 80 },
+    { key: "speed", def: 110, min: 70 },
+    // Row actions stay a fixed strip at the far right; the spacer column
+    // before them absorbs window slack so the buttons never float mid-table.
+    { key: "act", def: 130, min: 110 },
+];
+const COL_BY_KEY = Object.fromEntries(COLS.map((c) => [c.key, c]));
+
+function loadJson(key, fallback) {
+    try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
+    } catch (_) {
+        return fallback;
+    }
+}
+
+function saveJson(key, value) {
+    try {
+        if (value == null) localStorage.removeItem(key);
+        else localStorage.setItem(key, JSON.stringify(value));
+    } catch (_) { /* private mode / quota: layout is a nicety, not state */ }
+}
+
+// A window that never had its columns touched: scale the defaults to the
+// table area, leaving the fixed actions strip its room. Keeps the first launch
+// free of a horizontal scrollbar on a 900-1200 px window.
+function defaultWidths() {
+    const avail = Math.max(560, ($("#main") && $("#main").clientWidth) || 900);
+    const body = COLS.filter((c) => c.key !== "act");
+    const total = body.reduce((s, c) => s + c.def, 0);
+    const act = COL_BY_KEY.act.def;
+    const room = Math.max(320, avail - act - 8);
+    const out = {};
+    let spent = 0;
+    for (const c of body) {
+        out[c.key] = Math.max(c.min, Math.round((c.def / total) * room));
+        spent += out[c.key];
+    }
+    // Minimums can push the sum over the window (a narrow window); take it
+    // back from the widest column instead of growing a scrollbar.
+    let over = spent + act - avail + 2;
+    while (over > 0) {
+        const widest = body.reduce((a, b) => (out[a.key] >= out[b.key] ? a : b));
+        if (out[widest.key] <= widest.min) break;
+        const cut = Math.min(over, out[widest.key] - widest.min);
+        out[widest.key] -= cut;
+        over -= cut;
+    }
+    out.act = act;
+    return out;
+}
+
+let colWidths = (() => {
+    const saved = loadJson("ripdl.cols", null);
+    const widths = defaultWidths();
+    if (!saved || typeof saved !== "object") return widths;
+    for (const c of COLS) {
+        const w = Number(saved[c.key]);
+        // Older layouts may have stored act as null (auto); rewrite to its
+        // fixed default so the strip keeps its buttons.
+        if (Number.isFinite(w) && w >= c.min) widths[c.key] = Math.round(w);
+    }
+    return widths;
+})();
+
+let sortState = (() => {
+    const s = loadJson("ripdl.sort", null);
+    return s && COL_BY_KEY[s.key] && (s.dir === 1 || s.dir === -1) ? s : null;
+})();
+
+function applyColWidths() {
+    for (const [key, w] of Object.entries(colWidths)) {
+        const col = document.querySelector(`#task-table col[data-col="${key}"]`);
+        if (!col) continue;
+        col.style.width = w == null ? "auto" : `${w}px`;
+    }
+}
+
+function renderSortIndicators() {
+    for (const th of document.querySelectorAll("#task-table thead th[data-col]")) {
+        const on = !!sortState && sortState.key === th.dataset.col;
+        th.classList.toggle("sorted", on);
+        const ind = th.querySelector(".sort-ind");
+        if (ind) ind.textContent = on ? (sortState.dir === 1 ? "\u25B2" : "\u25BC") : "";
+    }
+}
+
+function setSort(key) {
+    if (key === "act") return;
+    if (!sortState || sortState.key !== key) sortState = { key, dir: 1 };
+    else if (sortState.dir === 1) sortState.dir = -1;
+    else sortState = null;
+    saveJson("ripdl.sort", sortState);
+    renderSortIndicators();
+    render();
+}
+
+const STATE_RANK = {
+    running: 0, hunt: 1, verifying: 2, metadata: 3, queued: 4, timed: 5,
+    seeding: 6, paused: 7, failed: 8, completed: 9, cancelled: 10,
+};
+const KIND_RANK = { torrent: 0, http: 1, video: 2 };
+
+// Seconds left, for sorting only (the cell keeps its own formatting).
+function etaSeconds(t) {
+    if (!t.total || !t.speed_bps || t.speed_bps <= 0) return null;
+    const left = (t.total - t.downloaded) / t.speed_bps;
+    return left > 0 ? left : null;
+}
+
+function speedOf(t) {
+    return t.state === "completed" && t.seeding ? t.upload_bps || 0 : t.speed_bps || 0;
+}
+
+function compareBy(key, a, b) {
+    switch (key) {
+        case "name":
+            return rowName(a).localeCompare(rowName(b), undefined, { numeric: true, sensitivity: "base" });
+        case "kind":
+            return (KIND_RANK[a.kind] ?? 9) - (KIND_RANK[b.kind] ?? 9);
+        case "status":
+            return (STATE_RANK[stateLabel(a)] ?? 9) - (STATE_RANK[stateLabel(b)] ?? 9);
+        case "size":
+            return (a.total ?? a.downloaded) - (b.total ?? b.downloaded);
+        case "prog":
+            return (percentOf(a) ?? -1) - (percentOf(b) ?? -1);
+        case "eta":
+            return (etaSeconds(a) ?? Infinity) - (etaSeconds(b) ?? Infinity);
+        case "speed":
+            return speedOf(a) - speedOf(b);
+        default:
+            return 0;
+    }
+}
+
+// The view as shown: category filter first, then the user's sort (if any).
+// No sort = daemon order (queue order), which is what users expect for a
+// task list that just grew a row.
+function visibleTasks() {
+    const view = tasks.filter(inCurrentView);
+    if (!sortState) return view;
+    const { key, dir } = sortState;
+    return view.sort((a, b) => {
+        const r = compareBy(key, a, b);
+        return r !== 0 ? r * dir : 0;
+    });
+}
+
+// Resize grips + sort indicators on every header (once; headers never rerender).
+function initColumnUi() {
+    applyColWidths();
+    for (const th of document.querySelectorAll("#task-table thead th[data-col]")) {
+        const key = th.dataset.col;
+        const meta = COL_BY_KEY[key];
+        if (!meta) continue;
+        th.insertAdjacentHTML("beforeend", '<span class="sort-ind"></span>');
+        const grip = document.createElement("span");
+        grip.className = "col-resizer";
+        grip.title = "Drag to resize · double-click to reset this column";
+        th.appendChild(grip);
+        grip.addEventListener("mousedown", (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const startX = ev.clientX;
+            const startW = colWidths[key] ?? th.offsetWidth;
+            document.body.classList.add("col-resizing");
+            const move = (e) => {
+                const w = Math.max(meta.min, Math.round(startW + (e.clientX - startX)));
+                colWidths[key] = w;
+                applyColWidths();
+            };
+            const up = () => {
+                document.removeEventListener("mousemove", move);
+                document.removeEventListener("mouseup", up);
+                document.body.classList.remove("col-resizing");
+                saveJson("ripdl.cols", colWidths);
+            };
+            document.addEventListener("mousemove", move);
+            document.addEventListener("mouseup", up);
+        });
+        grip.addEventListener("dblclick", (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            colWidths[key] = meta.def;
+            applyColWidths();
+            saveJson("ripdl.cols", colWidths);
+        });
+    }
+    $("#task-table thead").addEventListener("click", (ev) => {
+        if (ev.target.classList.contains("col-resizer")) return;
+        const th = ev.target.closest("th[data-col]");
+        if (th) setSort(th.dataset.col);
+    });
+    renderSortIndicators();
+}
+
+// Select a row by id and keep it visible (keyboard navigation, sort changes).
+function selectRow(id) {
+    selectedId = id;
+    for (const tr of TBODY.children) tr.classList.toggle("selected", tr.dataset.id === id);
+    const tr = rowCache.get(id);
+    if (tr) tr.scrollIntoView({ block: "nearest" });
+    const t = findTask(id);
+    $("#st-counts").textContent = t ? `${rowName(t)} · ${stateLabel(t)}` : statusbarText();
+}
+
 function render() {
     // Category counts (also shown in the sidebar). Counts only change with
     // the task set / state label / name extension - all structural - so the
@@ -314,13 +537,13 @@ function render() {
     for (const t of tasks) {
         if (t.state === "completed") counts.completed++; else counts.unfinished++;
         if (t.kind === "torrent") counts.torrents++;
-        const cat = categoryOf(urlName(t.url));
+        const cat = categoryOf(rowName(t));
         if (cat in counts) counts[cat]++;
     }
     renderSidebar(counts);
 
     const rows = $("#task-rows");
-    const view = tasks.filter(inCurrentView);
+    const view = visibleTasks();
     $("#empty-hint").classList.toggle("hidden", view.length > 0);
     rows.innerHTML = view.map((t) => {
         const name = rowName(t);
@@ -346,6 +569,7 @@ function render() {
           <td class="prog-cell">${prog}</td>
           <td class="eta-cell">${eta}</td>
           <td class="speed-cell">${speed}</td>
+          <td class="col-fill"></td>
           <td class="col-act">${actionButtons(t)}</td>
         </tr>`;
     }).join("");
@@ -393,6 +617,7 @@ $("#side-items").onclick = (ev) => {
     const el = ev.target.closest(".side-item");
     if (!el) return;
     currentCategory = el.dataset.cat;
+    saveJson("ripdl.view", currentCategory);
     lastStructKey = null;
     render();
 };
@@ -505,6 +730,26 @@ function flashErr(msg) {
     setTimeout(() => { st.style.color = ""; }, 3500);
 }
 
+// Clipboard without pulling in a plugin: the async API first, a selection
+// copy as the fallback for a page the runtime did not treat as secure.
+async function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return;
+        } catch (_) { /* fall through */ }
+    }
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (!ok) throw new Error("copy failed");
+}
+
 let pollInFlight = false;
 
 // One round trip on the wire at a time: the command side can sleep ~900ms on
@@ -523,7 +768,7 @@ async function poll() {
         // Structural changes (task set, state, name, errors) repaint the
         // tbody + sidebar; bytes-only changes update cells in place - no DOM
         // rebuild, no flicker, no lost hover.
-        const view = tasks.filter(inCurrentView);
+        const view = visibleTasks();
         const key = structKey(view);
         if (key !== lastStructKey) {
             lastStructKey = key;
@@ -629,7 +874,10 @@ function renderStatusbar() {
     drawSpeedGraph();
 
     if (Date.now() < statusFlashUntil) return; // flashing a message
-    const countsTxt = statusbarText();
+    // Selection readout doubles as a "what am I looking at" hint; the plain
+    // counts return as soon as nothing is selected.
+    const sel = selectedId ? findTask(selectedId) : null;
+    const countsTxt = sel ? `${rowName(sel)} · ${stateLabel(sel)}` : statusbarText();
     if (ST_COUNTS.textContent !== countsTxt) ST_COUNTS.textContent = countsTxt;
 }
 
@@ -1106,6 +1354,27 @@ document.addEventListener("keydown", (ev) => {
         ev.preventDefault();
         pickTorrent();
     }
+    // Task-list keyboard: move the selection, inspect, remove. Only when no
+    // text field has focus, so typing in the toolbar/filter still works.
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement && document.activeElement.tagName);
+    if (typing) return;
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        const view = visibleTasks();
+        if (!view.length) return;
+        ev.preventDefault();
+        const i = view.findIndex((t) => t.id === selectedId);
+        const next = ev.key === "ArrowDown"
+            ? Math.min(view.length - 1, i + 1)
+            : Math.max(0, i < 0 ? 0 : i - 1);
+        selectRow(view[next].id);
+        renderStatusbar();
+    } else if (ev.key === "Enter" && selectedId) {
+        ev.preventDefault();
+        openDetails(selectedId);
+    } else if (ev.key === "Delete" && selectedId) {
+        ev.preventDefault();
+        doTaskAction("remove", selectedId);
+    }
 });
 
 // Pick a .torrent from disk and route it through the add dialog: that keeps
@@ -1498,6 +1767,16 @@ function renderHttpDetails(d) {
 $("#hdt-close").onclick = closeHttpDetails;
 $("#hdt-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeHttpDetails(); };
 $("#hdt-refresh").onclick = () => { if (httpDetailsId) openRefreshDialog(httpDetailsId); };
+$("#hdt-copy").onclick = async () => {
+    try {
+        const d = await invokeSafe("task_details", { id: httpDetailsId });
+        if (!d.url) throw new Error("no address");
+        await copyText(d.url);
+        flashStatus("address copied");
+    } catch (e) {
+        flashErr("clipboard unavailable");
+    }
+};
 $("#hdt-open").onclick = async () => {
     try {
         const d = await invokeSafe("task_details", { id: httpDetailsId });
@@ -1585,4 +1864,70 @@ $("#rdlg-url").onkeydown = (ev) => {
 };
 
 setConn(false);
+initColumnUi();
+initWindowMemory();
+initDragDrop();
 poll().then(schedulePoll);
+
+/* Window size: remembered across launches (a 1100 px task list is not a
+ * preference you should have to redo every morning). Maximized windows are
+ * not recorded, so restoring never turns into "opens maximized by accident".
+ */
+function initWindowMemory() {
+    const api = window.__TAURI__ && window.__TAURI__.window;
+    if (!api || !api.getCurrentWindow) return;
+    let win;
+    try {
+        win = api.getCurrentWindow();
+    } catch (_) {
+        return;
+    }
+    const saved = loadJson("ripdl.window", null);
+    if (saved && Number.isFinite(saved.w) && Number.isFinite(saved.h) && saved.w > 400 && saved.h > 300) {
+        try {
+            const size = new window.__TAURI__.dpi.LogicalSize(saved.w, saved.h);
+            win.setSize(size).catch(() => {});
+        } catch (_) { /* older runtime: skip */ }
+    }
+    let timer = null;
+    const onResize = () => {
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+            try {
+                if (await win.isMaximized()) return;
+                const [size, scale] = await Promise.all([win.innerSize(), win.scaleFactor()]);
+                saveJson("ripdl.window", {
+                    w: Math.round(size.width / scale),
+                    h: Math.round(size.height / scale),
+                });
+            } catch (_) { /* not every resize has a settled size */ }
+        }, 500);
+    };
+    win.onResized(onResize).catch(() => {});
+}
+
+/* Drop a .torrent anywhere on the window: the fastest path from "downloaded a
+ * torrent file" to "queued", and it reuses the add dialog (file checkboxes,
+ * sequential toggle) instead of inventing a second add flow. */
+function initDragDrop() {
+    const api = window.__TAURI__ && window.__TAURI__.webviewWindow;
+    const win = (api && api.getCurrentWebviewWindow && api.getCurrentWebviewWindow())
+        || (window.__TAURI__ && window.__TAURI__.window && window.__TAURI__.window.getCurrentWindow && window.__TAURI__.window.getCurrentWindow());
+    if (!win || !win.onDragDropEvent) return;
+    win.onDragDropEvent((event) => {
+        const p = event && event.payload;
+        if (!p) return;
+        if (p.type === "over" || p.type === "enter") {
+            document.body.classList.add("drop-target");
+            return;
+        }
+        document.body.classList.remove("drop-target");
+        if (p.type !== "drop" || !Array.isArray(p.paths)) return;
+        const torrent = p.paths.find((x) => /\.torrent$/i.test(x));
+        if (torrent) {
+            openAddDialog(torrent);
+        } else if (p.paths.length) {
+            flashStatus("drop a .torrent file (or Ctrl+T) to add BitTorrent downloads");
+        }
+    }).catch(() => {});
+}
