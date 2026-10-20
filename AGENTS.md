@@ -365,6 +365,38 @@ installer runs elevated, and a normal-integrity second launch cannot write to
 its pipe (UIPI), which used to start a second window on the same daemon (seen
 as three windows after a `-Verb RunAs` install). It now treats the "show" hint
 as best effort and exits; the tray icon still restores the first window.
+v0.3.15: torrent state truth + list ergonomics. (1) The real defect behind
+"seeds even when paused": rqbit latches the *add-time* start flag while its
+initial hash check runs, so a paused add came up live when the check ended,
+and the stale intention flag made a later unpause bail with "torrent is
+already live" - seen live as a task stuck at `failed` while the swarm kept
+downloading a 6.6 GB ISO. Boot restore now adds torrents with
+`AddTorrentOptions.paused` (never Live), the engine decides pause/unpause on
+`TorrentStatsState` instead of the flag, a runner/watcher that finds the
+torrent parked wakes it (bounded, cancellation still wins), and every error
+exit pauses the torrent so a failed row can never keep uploading. `cmd_pause`
+also pauses by info-hash immediately (no wait for a runner) and `set_state`
+folds the last progress sample into the record, so a paused torrent shows its
+real bytes/size after a restart. Playback of the fix: restore a paused record
+-> details `finished [paused]`, no peers; `resume` -> seeding, no error.
+(2) Session start is warm like qBittorrent instead of cold: a stable listen
+port 4240-4243 (falls back to random), UPnP port forwarding, DHT routing-table
+persistence at `<data_dir>/torrent-state/dht-nodes.json` (reuses its saved
+port; task state still lives only in queue.json), and a 6 s peer-connect
+timeout (rqbit defaults to 10 s, which a second/tethered uplink burns). This
+targets the slow ramp: qBittorrent restarts with a warm DHT table, known
+peers, a stable mapped port and uTP, while ripdl used to re-bootstrap DHT on
+a random port with no incoming peers and no UPnP.
+(3) Task list: resizable columns (drag header edge, double-click resets,
+widths in localStorage, proportional first-run widths that never overflow),
+click-to-sort every data column (second click flips, third clears; persisted),
+row selection via Up/Down with the file + state in the status bar,
+Enter opens details, Delete removes, remembered category filter, remembered
+window size, `.torrent` drag-and-drop onto the window (opens the add dialog
+with the file checklist), and Copy address in the HTTP details dialog. This
+needed the first Tauri capabilities file (`crates/ripdl-gui/capabilities/
+default.json`: `core:default` + event listen + window size getters/setter);
+without it `setSize`/`onResized`/`onDragDropEvent`/`listen` are denied.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap,

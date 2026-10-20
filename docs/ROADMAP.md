@@ -363,11 +363,17 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       from the row + context menu, ratio/time limits in Settings
 - [ ] Categories: per-category destination, queue slot, speed policy;
       auto-categorize on add (extension heuristic already exists)
-- [ ] Search, filter (status/kind/host), sort columns; multi-select batch
+- [x] Column layout + list navigation: drag-to-resize headers (double-click
+      resets one column), persisted widths, click-to-sort every data column
+      with an arrow (persisted), trailing spacer + sticky actions strip, row
+      selection readout in the status bar, Up/Down/Enter/Delete keys, category
+      filter remembered across launches, window size remembered, `.torrent`
+      drag-and-drop onto the window, copy-address in the HTTP details dialog
+- [ ] Search, filter (status/kind/host), multi-select batch
       pause/resume/remove
 - [ ] History: completed/removed tasks with redownload
-- [ ] Completion notifications (tray balloon) + drag-and-drop URLs /
-      `.torrent` files onto the window
+- [ ] Completion notifications (tray balloon) + drag-and-drop URLs onto the
+      window (`.torrent` drop landed)
 - [ ] Windows Explorer context menu ("Download with ripdl") + `ripdl://`
       protocol handler
 - [ ] Diagnostics: every failed task exposes a reason + "copy diagnostics"
