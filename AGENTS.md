@@ -76,7 +76,8 @@ the single-stream path.
   Cargo.toml (tag must match). Artifacts: `ripdl-vX.Y.Z-x86_64-windows-`
   `{portable.zip,setup.exe}` (Inno script `packaging/windows/ripdl.iss`,
   Sources relative to repo root), `ripdl-vX.Y.Z-x86_64-linux.tar.gz`,
-  deb+rpm via nfpm (`packaging/linux/nfpm.yaml`, installed with go),
+  deb+rpm via nfpm (`packaging/linux/nfpm.yaml`, pinned prebuilt tarball -
+  no Go toolchain; `go install` flaked on sum.golang.org),
   `ripdl-browser-extension-vX.Y.Z.zip` + `SHA256SUMS.txt` in the release
   job. Cut releases by bumping the workspace version *and* `ext/manifest.json`
   (the extension zip ships that manifest; Chrome only reads it for Web Store

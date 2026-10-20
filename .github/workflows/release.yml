@@ -121,15 +121,21 @@ jobs:
       - name: Build deb + rpm (nfpm)
         run: |
           V="${{ steps.ver.outputs.version }}"
-          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.36.1
+          # Pinned prebuilt nfpm instead of `go install`: the Go install pulled
+          # the whole module graph through proxy.golang.org + sum.golang.org on
+          # every release and once killed a run on a flaky sumdb stream
+          # (INTERNAL_ERROR). One tarball, no Go toolchain, same version.
+          curl -fsSL -o nfpm.tgz \
+            "https://github.com/goreleaser/nfpm/releases/download/v2.36.1/nfpm_2.36.1_Linux_x86_64.tar.gz"
+          tar -xzf nfpm.tgz nfpm
           # nfpm's own env expansion is inconsistent across versions; resolve
           # the placeholders here so the config is plain absolute paths.
           sed -e "s|\${RIPDL_VERSION}|$V|g" \
               -e "s|\${RIPDL_BIN}|$PWD/target/release|g" \
               -e "s|\${RIPDL_SRC}|$PWD|g" \
               packaging/linux/nfpm.yaml > nfpm.resolved.yaml
-          "$(go env GOPATH)/bin/nfpm" package --config nfpm.resolved.yaml --packager deb --target dist
-          "$(go env GOPATH)/bin/nfpm" package --config nfpm.resolved.yaml --packager rpm --target dist
+          ./nfpm package --config nfpm.resolved.yaml --packager deb --target dist
+          ./nfpm package --config nfpm.resolved.yaml --packager rpm --target dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
