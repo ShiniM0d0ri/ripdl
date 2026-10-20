@@ -109,9 +109,16 @@ function errorHint(e) {
     return "";
 }
 
-// The row title: torrent display name when known, else URL basename.
+// The row title: torrent display name when known, else the file the task
+// actually writes, else the URL basename. The URL often ends in an opaque
+// token (GitHub release assets: .../12e29558-517b-...?rscd=...filename=X), so
+// the on-disk name recorded by the engine wins as soon as there is one.
 function rowName(t) {
     if (t.kind === "torrent" && t.name) return t.name;
+    if (t.dest_file) {
+        const base = baseName(t.dest_file);
+        if (base) return base;
+    }
     return urlName(t.url);
 }
 
