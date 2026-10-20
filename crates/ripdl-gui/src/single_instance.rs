@@ -127,7 +127,13 @@ fn claim_named(name: &str) -> io::Result<Option<Guard>> {
         })),
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
             drop(rt);
-            notify_named(name)?;
+            // Somebody owns the pipe, so this launch must not open a second
+            // window. The "show" hint is best effort: a normal-integrity
+            // launch cannot poke an elevated instance (UIPI blocks the pipe
+            // write), and starting anyway would put two windows on one
+            // daemon - the tray icon is still there to bring the first one
+            // back.
+            let _ = notify_named(name);
             Ok(None)
         }
         Err(e) => Err(e),
