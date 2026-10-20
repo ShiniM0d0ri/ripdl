@@ -322,6 +322,23 @@ context entry, now labelled per kind) opens the new dialog, refreshed every
 second while open, with Open file/folder. Partial HTTP tasks now record
 `dest_file` from `Progress.dest_file` on the first engine tick, so partial
 paths show in the row and `rm --files` no longer needs the URL scan there.
+v0.3.13: browser wiring self-heals. The native-messaging host was a manual
+step (`ripdl register-host`) and nothing ever repaired it, so a registration
+pointing at a dev build (this machine: `target\debug\ripdl.exe`, still
+0.3.11 while the app was 0.3.12) survived every upgrade and the browser kept
+launching that binary for "send to ripdl". Setup now runs
+`{app}\ripdl.exe register-host` (`[Run]`, `runhidden nowait
+runasoriginaluser`) on every install/upgrade, so the HKCU keys and
+`%LOCALAPPDATA%\ripdl\org.ripdl.host.json` always name the installed exe:
+installed users no longer need the CLI step, and a hijacked registration is
+corrected by the next update. `register-host` also refuses to point the
+browser at a `target\debug|release` build while an installed ripdl is
+registered (`--force` overrides; dev builds warn that the next install
+replaces them). Verified live: `--force` from the debug 0.3.13 binary
+re-created the hijack, the app updated through its own banner, and Setup's
+[Run] put the manifest back on `C:\Program Files\ripdl\ripdl.exe` - a framed
+`list` on stdin/stdout then answered from the installed host against the
+installed daemon.
 Backlog: selected-links capture polish, DNR fallback referer (may be
 unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap,
