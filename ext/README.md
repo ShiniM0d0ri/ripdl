@@ -11,6 +11,15 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
    ripdl register-host
    ```
 
+   `register-host` refuses to point the browser at a `target\debug` /
+   `target\release` build when an *installed* ripdl is already registered
+   (that is how a stale dev binary ends up serving real downloads); pass
+   `--force` when you really want the dev build.
+
+   **Installed ripdl needs no manual step**: Setup runs `ripdl register-host`
+   for the installed binary on every install/upgrade, which also repairs a
+   registration left pointing at a dev build.
+
    The extension pins its own ID (see below), so `register-host` needs no
    ID by default: it allows the pinned one everywhere. Extra dev/build IDs
    (e.g. an older loaded copy) can be added with `--ext-id <ID>`, repeatable

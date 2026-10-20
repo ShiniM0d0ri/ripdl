@@ -63,6 +63,13 @@ Name: "{autodesktop}\ripdl"; Filename: "{app}\ripdl-gui.exe"; Tasks: desktopicon
 Type: filesandordirs; Name: "{app}\ext"
 
 [Run]
+; Browser bridge: point the native-messaging host at the installed binary on
+; every install/upgrade. Besides removing a manual step, this repairs a
+; registration that points somewhere else (a dev build, an old portable
+; copy) - otherwise that stale path survives every upgrade and sends browser
+; downloads to it. runasoriginaluser keeps the HKCU keys + manifest in the
+; real user's hive (Setup is elevated); runhidden suppresses the console.
+Filename: "{app}\ripdl.exe"; Parameters: "register-host"; StatusMsg: "Registering the browser extension host..."; Flags: runhidden nowait runasoriginaluser
 ; runasoriginaluser: Setup runs elevated (Program Files), but the app itself
 ; has no need for admin rights - after an in-app update the relaunched GUI
 ; must not inherit the elevation. No skipifsilent: the in-app path installs
