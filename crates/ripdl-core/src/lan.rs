@@ -222,6 +222,10 @@ struct Request {
     path: String,
     query: Vec<(String, String)>,
     content_length: u64,
+    /// False when the client sent no `Content-Length` at all (chunked or
+    /// close-delimited bodies are not supported: an upload must declare its
+    /// size so the receiver can verify every byte arrived).
+    has_content_length: bool,
     leftover: Vec<u8>,
 }
 
@@ -257,11 +261,13 @@ async fn read_head<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Request> {
         None => (target, Vec::new()),
     };
     let mut content_length = 0u64;
+    let mut has_content_length = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         if name.eq_ignore_ascii_case("content-length") {
+            has_content_length = true;
             content_length = value.trim().parse().unwrap_or(0);
         }
     }
@@ -270,6 +276,7 @@ async fn read_head<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Request> {
         path,
         query,
         content_length,
+        has_content_length,
         leftover,
     })
 }
@@ -361,6 +368,7 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
         path,
         query,
         content_length,
+        has_content_length,
         mut leftover,
     } = read_head(&mut rd).await?;
     match (method.as_str(), path.as_str()) {
@@ -396,6 +404,15 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
         ("POST", "/api/send") => {
             if !state.code_ok(&query) {
                 return respond_json(&mut wr, 403, "Forbidden", b"{\"error\":\"code\"}").await;
+            }
+            if !has_content_length {
+                return respond_json(
+                    &mut wr,
+                    411,
+                    "Length Required",
+                    b"{\"error\":\"content-length required\"}",
+                )
+                .await;
             }
             let raw_name = query
                 .iter()
@@ -1156,6 +1173,52 @@ mod tests {
         assert_eq!(sanitize_name("CON.txt"), "_CON.txt");
         assert_eq!(sanitize_name("nul"), "_nul");
         assert_eq!(sanitize_name("console.txt"), "console.txt");
+    }
+
+    #[tokio::test]
+    async fn parallel_same_name_uploads_stay_intact() {
+        let dir = temp_dir("parallel");
+        let src_dir = temp_dir("parallel-src");
+        let server = start(&dir, true, "x").await;
+        let src = src_dir.join("same.bin");
+        let data: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 253) as u8).collect();
+        tokio::fs::write(&src, &data).await.unwrap();
+        let cfg = SendConfig {
+            url: server.url().to_string(),
+            code: String::new(),
+            path: src,
+        };
+        let (a, b) = tokio::join!(send_file(&cfg, |_, _| {}), send_file(&cfg, |_, _| {}));
+        a.unwrap();
+        b.unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["same (1).bin".to_string(), "same.bin".to_string()]);
+        for name in names {
+            let bytes = tokio::fs::read(dir.join(&name)).await.unwrap();
+            assert_eq!(bytes, data, "{name} is corrupt");
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_without_content_length_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = temp_dir("nolen");
+        let server = start(&dir, false, "CODE99").await;
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
+            .await
+            .unwrap();
+        sock.write_all(b"POST /api/send?name=x.bin&code=CODE99 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf).to_string();
+        assert!(text.starts_with("HTTP/1.1 411"), "{text}");
+        assert!(!tokio::fs::try_exists(dir.join("x.bin")).await.unwrap());
     }
 
     #[tokio::test]
