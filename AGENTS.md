@@ -431,3 +431,9 @@ with partial badges, discovered devices to fill the address, file picker,
 per-copy progress. Verified live: 5 MiB and 40 MiB copies hash-match,
 wrong code answers 403 before the body, the page never leaks the code,
 toggle off/on rebinds cleanly, discovery finds the local receiver.
+On main after v0.3.16: an upload with no `Content-Length` (chunked bodies
+from a non-browser client) answers 411 instead of storing an empty file,
+Windows device names (`CON.txt`, `NUL`) are prefixed so the upload cannot
+fail on create, and `parallel_same_name_uploads_stay_intact` proves the
+token-named `.part` + rename-after-write path keeps two concurrent copies
+of the same file byte-identical (`name.bin` + `name (1).bin`).
