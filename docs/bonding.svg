@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300" role="img" aria-label="Three internet connections merging into one faster download">
+  <defs>
+    <linearGradient id="filebg" x1="0" y1="0" x2="0.2" y2="1">
+      <stop offset="0" stop-color="#f3f8fd"/>
+      <stop offset="1" stop-color="#e6f0f9"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0l10 5-10 5z" fill="#2f74ab"/>
+    </marker>
+  </defs>
+
+  <g font-family="Segoe UI, system-ui, sans-serif">
+    <!-- Wi-Fi -->
+    <g>
+      <rect x="8" y="20" width="250" height="66" rx="14" fill="#f6f8fa" stroke="#d7dde4"/>
+      <g stroke="#5b6770" stroke-width="3.2" fill="none" stroke-linecap="round">
+        <path d="M36 58c6-9 16-14 26-14"/>
+        <path d="M31 49c9-13 22-20 36-20" opacity="0.8"/>
+        <circle cx="40" cy="64" r="3.4" fill="#5b6770" stroke="none"/>
+      </g>
+      <text x="86" y="50" font-size="16" font-weight="600" fill="#22303c">Wi-Fi</text>
+      <text x="86" y="71" font-size="12" fill="#66717b">200 Mbps</text>
+    </g>
+
+    <!-- Ethernet -->
+    <g>
+      <rect x="8" y="117" width="250" height="66" rx="14" fill="#f6f8fa" stroke="#d7dde4"/>
+      <g stroke="#5b6770" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="30" y="143" width="30" height="18" rx="3"/>
+        <path d="M36 149v6M43 149v6M50 149v6" stroke-width="2.4"/>
+        <path d="M45 138v5"/>
+      </g>
+      <text x="86" y="147" font-size="16" font-weight="600" fill="#22303c">Ethernet</text>
+      <text x="86" y="168" font-size="12" fill="#66717b">500 Mbps</text>
+    </g>
+
+    <!-- Phone tether -->
+    <g>
+      <rect x="8" y="214" width="250" height="66" rx="14" fill="#f6f8fa" stroke="#d7dde4"/>
+      <g stroke="#5b6770" stroke-width="3.2" fill="none" stroke-linecap="round">
+        <rect x="36" y="232" width="20" height="34" rx="4"/>
+        <path d="M43 259h6"/>
+      </g>
+      <text x="86" y="244" font-size="16" font-weight="600" fill="#22303c">Phone tether</text>
+      <text x="86" y="265" font-size="12" fill="#66717b">100 Mbps</text>
+    </g>
+
+    <!-- merge -->
+    <g fill="none" stroke="#2f74ab" stroke-width="3" opacity="0.9">
+      <path d="M258 53c42 0 62 22 72 72"/>
+      <path d="M258 150h72"/>
+      <path d="M258 247c42 0 62-22 72-72"/>
+    </g>
+    <path d="M334 150h52" stroke="#2f74ab" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <!-- result -->
+    <rect x="396" y="62" width="356" height="176" rx="18" fill="url(#filebg)" stroke="#b9d4ea"/>
+    <g transform="translate(424 92)" fill="none" stroke="#2f74ab" stroke-width="3" stroke-linejoin="round">
+      <path d="M0 0h26l14 14v46H0z"/>
+      <path d="M26 0v14h14"/>
+    </g>
+    <text x="484" y="112" font-size="17" font-weight="600" fill="#22303c">big-file.iso</text>
+    <text x="484" y="136" font-size="12.5" fill="#66717b">one download, spread over every connection</text>
+    <text x="424" y="196" font-size="30" font-weight="700" fill="#1f5384">≈ 800 Mbps</text>
+    <text x="424" y="220" font-size="12.5" fill="#66717b">instead of being stuck at the slowest one</text>
+  </g>
+</svg>

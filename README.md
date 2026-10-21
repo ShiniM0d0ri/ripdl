@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/screenshots/main-window.png" alt="ripdl downloading a file">
+  <img src="docs/logo.svg" alt="ripdl" width="104">
 </p>
 
 <h1 align="center">ripdl</h1>
@@ -19,9 +19,15 @@
 <p align="center">
   <a href="https://github.com/ShiniM0d0ri/ripdl/releases/latest"><b>⬇ Download for Windows</b></a>
   &nbsp;·&nbsp;
+  <a href="#one-download-over-every-connection">Combine connections</a>
+  &nbsp;·&nbsp;
   <a href="#command-line">Command line</a>
   &nbsp;·&nbsp;
   <a href="#troubleshooting">Troubleshooting</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/main-window.png" alt="ripdl downloading a file">
 </p>
 
 ## What is ripdl?
@@ -44,14 +50,41 @@ home.
 | Ads, bundled offers, "get premium" | None |
 | Telemetry, accounts, crash reporting | None |
 | Torrents, video pages, LAN transfer | Included |
+| One download over several uplinks at once | Yes — see [below](#one-download-over-every-connection) |
 | GUI + command line | Both, one engine |
 | Platforms | Windows 10/11, Linux |
+
+## One download, over every connection
+
+The trick almost nobody else bothers with: download managers can split a file
+into several connections, but they all leave through the **same** network
+interface. ripdl can put them on **different** uplinks at the same time — Wi-Fi
+and a network cable, or a tethered phone — so a single file downloads over all
+of them.
+
+<p align="center">
+  <img src="docs/bonding.svg" alt="Wi-Fi, Ethernet and a tethered phone merging into one 800 Mbps download" width="720">
+</p>
+
+Turn it on in **Settings → Combine network connections**, or add `--bond` on the
+command line (`ripdl download --bond <url>`). Every parallel connection gets its
+own source address, so a server that throttles "one client" sees several and the
+bytes add up.
+
+**Honest limits:** the uplinks must be genuinely independent. A cable and Wi-Fi
+that both belong to the same router still share one ISP line, so you gain
+nothing; a laptop on Wi-Fi plus a phone on mobile data (USB-tethered) really do
+add up. It is off by default for that reason, and torrent bonding is fixed when
+the daemon starts — restart it after toggling.
 
 ## Features
 
 - **Fast, resumable downloads** — up to 8 parallel connections per file when
   the server allows it, one steady stream when it doesn't. Pause, close the app
   or crash: it resumes from the last byte.
+- **One file, several uplinks** — see
+  [above](#one-download-over-every-connection): Wi-Fi + cable + tethering, used
+  together.
 - **A queue you can actually control** — pause/resume/remove, sort by speed or
   size, limit how many run at once, cap total speed, or schedule a task for
   later ("in 1 hour", "at 22:30").
@@ -64,8 +97,6 @@ home.
 - **Send files to your phone, or between two PCs** — a code-protected page on
   your own Wi-Fi: open it in any browser, drop files in, or download what is
   there. No cloud, no account, no size limit.
-- **Combine your connections (optional)** — if this PC has Wi-Fi *and*
-  Ethernet *and* tethering, one download can use all of them.
 - **Tray + background** — close the window and downloads keep going.
 
 ## Install
@@ -155,6 +186,8 @@ a network you trust.
 
 - **Concurrent downloads / max segments** — how many tasks run at once, and how
   many connections each one gets (8 is a good default).
+- **Combine network connections** — spread one download over every uplink
+  (see [above](#one-download-over-every-connection)).
 - **Speed cap** — one shared limit for everything (`2MiB`, `500k`, empty =
   unlimited).
 - **Default download folder** — where new tasks go.

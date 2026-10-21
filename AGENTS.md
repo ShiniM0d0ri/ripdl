@@ -22,6 +22,12 @@ telemetry, zero ads, forever — non-negotiable, code it into no feature.
 - `docs/ROADMAP.md` — phase plan; keep checkboxes current for every
   completed/added item.
 - `docs/rea-findings.md` — REA research notebook (P4 browser-capture work).
+- Brand assets: `docs/logo.svg` is the source of truth for the mark (rounded
+  blue tile, three uplinks feeding one download arrow);
+  `packaging/icon/generate.ps1` redraws it with GDI+ into
+  `crates/ripdl-gui/icons/icon.png` (512) + `icon.ico` (16-256: DIB frames,
+  plus one PNG frame at 256) and `docs/logo-512.png`. Edit the SVG and the
+  script together, then re-run it.
 
 ## Commands
 
@@ -436,4 +442,9 @@ from a non-browser client) answers 411 instead of storing an empty file,
 Windows device names (`CON.txt`, `NUL`) are prefixed so the upload cannot
 fail on create, and `parallel_same_name_uploads_stay_intact` proves the
 token-named `.part` + rename-after-write path keeps two concurrent copies
-of the same file byte-identical (`name.bin` + `name (1).bin`).
+of the same file byte-identical (`name.bin` + `name (1).bin`). Same window:
+the README is a first-timer walkthrough with real screenshots
+(`docs/screenshots/`, captured over CDP), a bonding section with an SVG
+diagram, and the app mark was redesigned (`docs/logo.svg`,
+`packaging/icon/generate.ps1` regenerates `icon.png`/`icon.ico`; keep both
+in sync).
