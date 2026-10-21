@@ -22,8 +22,8 @@ telemetry, zero ads, forever — non-negotiable, code it into no feature.
 - `docs/ROADMAP.md` — phase plan; keep checkboxes current for every
   completed/added item.
 - `docs/rea-findings.md` — REA research notebook (P4 browser-capture work).
-- Brand assets: `docs/logo.svg` is the source of truth for the mark (rounded
-  blue tile, three uplinks feeding one download arrow);
+- Brand assets: `docs/logo.svg` is the source of truth for the mark (deep-teal
+  tile, white download arrow, three mint speed dashes);
   `packaging/icon/generate.ps1` redraws it with GDI+ into
   `crates/ripdl-gui/icons/icon.png` (512) + `icon.ico` (16-256: DIB frames,
   plus one PNG frame at 256) and `docs/logo-512.png`. Edit the SVG and the

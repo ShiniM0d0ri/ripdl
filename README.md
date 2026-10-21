@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/ShiniM0d0ri/ripdl/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/ShiniM0d0ri/ripdl?display_name=tag"></a>
-  <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-4c8bf5">
+  <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0f7a6a">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green">
 </p>
 

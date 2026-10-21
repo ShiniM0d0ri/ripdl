@@ -1,29 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="ripdl logo">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0.55" y2="1">
-      <stop offset="0" stop-color="#4d9edc"/>
-      <stop offset="0.55" stop-color="#2f74ab"/>
-      <stop offset="1" stop-color="#1f5384"/>
-    </linearGradient>
-    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.26"/>
-      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
-    </linearGradient>
-  </defs>
+  <!-- Deep teal tile, white download arrow, mint speed dashes: one fast,
+       clean mark that stays readable at 16 px. -->
+  <rect width="512" height="512" rx="112" fill="#0b3230"/>
 
-  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
-  <rect width="512" height="512" rx="116" fill="url(#shine)"/>
-
-  <!-- three uplinks feeding one stream -->
-  <g stroke="#ffffff" stroke-width="21" stroke-linecap="round" fill="none">
-    <path d="M142 146l94 62" opacity="0.66"/>
-    <path d="M256 82v126" opacity="0.9"/>
-    <path d="M370 146l-94 62" opacity="0.66"/>
+  <g fill="#4ee0b5">
+    <rect x="104" y="176" width="86" height="20" rx="10" opacity="0.55"/>
+    <rect x="104" y="242" width="64" height="20" rx="10" opacity="0.75"/>
+    <rect x="104" y="308" width="42" height="20" rx="10"/>
   </g>
 
-  <!-- download arrow -->
-  <path d="M220 166h72v102h64L256 356 156 268h64z" fill="#ffffff"/>
-
-  <!-- tray -->
-  <path d="M172 400h168" stroke="#ffffff" stroke-width="24" stroke-linecap="round" opacity="0.9" fill="none"/>
+  <path d="M222 132h68v122h62L256 384 160 254h62z" fill="#ffffff"/>
 </svg>

@@ -485,7 +485,7 @@ body.drop-target::after {
 }
 #abt-body { display: flex; flex-direction: column; gap: 4px; }
 .abt-head { display: flex; align-items: baseline; gap: 7px; }
-.abt-logo { color: #1a8f3c; font-size: 17px; font-weight: 700; }
+.abt-logo { color: #0b6e5f; font-size: 17px; font-weight: 700; }
 .abt-name { font-size: 16px; font-weight: 600; color: #22303c; }
 .abt-ver { color: #66717b; font-size: 12px; }
 .abt-tag { color: #39424c; }

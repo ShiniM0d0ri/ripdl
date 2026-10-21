@@ -7,8 +7,8 @@
 #   crates/ripdl-gui/icons/icon.ico   multi-size (Windows exe/taskbar/installer)
 #   docs/logo-512.png                 flat copy for READMEs that want a PNG
 #
-# Geometry mirrors docs/logo.svg: a rounded blue tile, three uplinks feeding
-# one download arrow, and a tray line. Every size is drawn from scratch so
+# Geometry mirrors docs/logo.svg: a deep-teal rounded tile, a white download
+# arrow and three mint speed dashes. Every size is drawn from scratch so
 # small icons stay crisp instead of being downscaled.
 
 Add-Type -AssemblyName System.Drawing
@@ -18,12 +18,12 @@ if (-not $root) { $root = (Get-Location).Path }
 $iconDir = Join-Path $root 'crates/ripdl-gui/icons'
 $docsDir = Join-Path $root 'docs'
 
-$TopColor = [System.Drawing.Color]::FromArgb(255, 0x4D, 0x9E, 0xDC)
-$BottomColor = [System.Drawing.Color]::FromArgb(255, 0x1F, 0x53, 0x84)
+$TileColor = [System.Drawing.Color]::FromArgb(255, 0x0B, 0x32, 0x30)
 $White = [System.Drawing.Color]::White
-$LaneSoft = [System.Drawing.Color]::FromArgb(168, 255, 255, 255)
-$LaneStrong = [System.Drawing.Color]::FromArgb(232, 255, 255, 255)
-$Tray = [System.Drawing.Color]::FromArgb(230, 255, 255, 255)
+# Mint speed dashes: farthest is faintest, so the arrow reads as moving.
+$DashSoft = [System.Drawing.Color]::FromArgb(140, 0x4E, 0xE0, 0xB5)
+$DashMid = [System.Drawing.Color]::FromArgb(191, 0x4E, 0xE0, 0xB5)
+$DashSolid = [System.Drawing.Color]::FromArgb(255, 0x4E, 0xE0, 0xB5)
 
 function New-RoundedPath([float]$x, [float]$y, [float]$w, [float]$h, [float]$r) {
     $p = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -36,13 +36,6 @@ function New-RoundedPath([float]$x, [float]$y, [float]$w, [float]$h, [float]$r) 
     return $p
 }
 
-function New-LinePen([System.Drawing.Color]$color, [float]$width) {
-    $pen = New-Object System.Drawing.Pen($color, $width)
-    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-    $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-    return $pen
-}
-
 # Draws the mark into a fresh ARGB bitmap at $size x $size.
 function New-MarkBitmap([int]$size) {
     $bmp = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -52,33 +45,42 @@ function New-MarkBitmap([int]$size) {
     $g.Clear([System.Drawing.Color]::Transparent)
 
     $s = $size / 512.0
-    $rect = New-Object System.Drawing.RectangleF(0, 0, $size, $size)
-    $tile = New-RoundedPath 0 0 $size $size (116 * $s)
-    $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $TopColor, $BottomColor, 65.0)
-    $g.FillPath($bg, $tile)
+    $tilePath = New-RoundedPath 0 0 $size $size (112 * $s)
+    $tileBrush = New-Object System.Drawing.SolidBrush($TileColor)
+    $g.FillPath($tileBrush, $tilePath)
 
-    # Three uplinks feeding the stream (behind the arrow).
-    $laneWidth = [Math]::Max(2.0, 21 * $s)
-    $g.DrawLine((New-LinePen $LaneSoft $laneWidth), 142 * $s, 146 * $s, 236 * $s, 208 * $s)
-    $g.DrawLine((New-LinePen $LaneStrong $laneWidth), 256 * $s, 82 * $s, 256 * $s, 208 * $s)
-    $g.DrawLine((New-LinePen $LaneSoft $laneWidth), 370 * $s, 146 * $s, 276 * $s, 208 * $s)
+    # Mint speed dashes, farthest first.
+    $dashes = @(
+        @(104, 176, 86, $DashSoft),
+        @(104, 242, 64, $DashMid),
+        @(104, 308, 42, $DashSolid)
+    )
+    foreach ($d in $dashes) {
+        $x = [float]($d[0] * $s)
+        $y = [float]($d[1] * $s)
+        $w = [float]($d[2] * $s)
+        $h = [float](20 * $s)
+        $radius = [Math]::Min($h / 2.0, $w / 2.0)
+        $dash = New-RoundedPath $x $y $w $h $radius
+        $brush = New-Object System.Drawing.SolidBrush($d[3])
+        $g.FillPath($brush, $dash)
+        $brush.Dispose()
+        $dash.Dispose()
+    }
 
     # Download arrow.
     $arrow = [System.Drawing.PointF[]]@(
-        [System.Drawing.PointF]::new(220 * $s, 166 * $s),
-        [System.Drawing.PointF]::new(292 * $s, 166 * $s),
-        [System.Drawing.PointF]::new(292 * $s, 268 * $s),
-        [System.Drawing.PointF]::new(356 * $s, 268 * $s),
-        [System.Drawing.PointF]::new(256 * $s, 356 * $s),
-        [System.Drawing.PointF]::new(156 * $s, 268 * $s),
-        [System.Drawing.PointF]::new(220 * $s, 268 * $s)
+        [System.Drawing.PointF]::new(222 * $s, 132 * $s),
+        [System.Drawing.PointF]::new(290 * $s, 132 * $s),
+        [System.Drawing.PointF]::new(290 * $s, 254 * $s),
+        [System.Drawing.PointF]::new(352 * $s, 254 * $s),
+        [System.Drawing.PointF]::new(256 * $s, 384 * $s),
+        [System.Drawing.PointF]::new(160 * $s, 254 * $s),
+        [System.Drawing.PointF]::new(222 * $s, 254 * $s)
     )
     $whiteBrush = New-Object System.Drawing.SolidBrush($White)
     $g.FillPolygon($whiteBrush, $arrow)
-
-    # Tray.
-    $trayWidth = [Math]::Max(2.0, 24 * $s)
-    $g.DrawLine((New-LinePen $Tray $trayWidth), 172 * $s, 400 * $s, 340 * $s, 400 * $s)
+    $whiteBrush.Dispose()
 
     $g.Dispose()
     return $bmp
