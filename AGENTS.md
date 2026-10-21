@@ -27,7 +27,9 @@ telemetry, zero ads, forever — non-negotiable, code it into no feature.
   `packaging/icon/generate.ps1` redraws it with GDI+ into
   `crates/ripdl-gui/icons/icon.png` (512) + `icon.ico` (16-256: DIB frames,
   plus one PNG frame at 256) and `docs/logo-512.png`. Edit the SVG and the
-  script together, then re-run it.
+  script together, then re-run it. Gotcha: tauri-build caches the Windows
+  resource, so a plain `cargo build` keeps the *old* exe icon after
+  regenerating `icon.ico` — run `cargo clean -p ripdl-gui` first.
 
 ## Commands
 
