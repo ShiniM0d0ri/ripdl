@@ -1,140 +1,260 @@
-# ripdl
+<p align="center">
+  <img src="docs/screenshots/main-window.png" alt="ripdl downloading a file">
+</p>
 
-A free, ad-free, multi-segment download manager for Windows and Linux, written
-in Rust — with an IDM-style desktop app and a CLI.
+<h1 align="center">ripdl</h1>
 
-ripdl exists because the alternatives are **paywalled** (IDM), **ad-supported**
-(Free Download Manager ships ads + tracking), **abandoned** (Motrix), or
-**CLI-only** (aria2). ripdl makes no network requests except the downloads you
-ask for: no analytics, no crash reporting, no upgrade nags, no bundled offers.
-Your history stays on your machine. Source code right here.
+<p align="center">
+  <b>A free, ad-free download manager for Windows and Linux.</b><br>
+  Fast HTTP downloads, torrents, video pages and same-network file transfer —
+  with no account, no ads and no telemetry.
+</p>
 
-## What it does
+<p align="center">
+  <a href="https://github.com/ShiniM0d0ri/ripdl/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/ShiniM0d0ri/ripdl?display_name=tag"></a>
+  <img alt="Windows and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-4c8bf5">
+  <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green">
+</p>
 
-- **Downloads any URL** using multiple parallel segments (or one plain stream
-  when the server doesn't support ranges), with **automatic resume** of
-  interrupted tasks
-- **Torrents** — magnets, `.torrent` files and URLs, with per-file selection,
-  sequential ("stream as you download") mode, files/peers/trackers view
-- **Video/stream pages** — route a YouTube-like page through the well-known
-  `yt-dlp` tool instead of reimplementing site extraction
-- **Queue + scheduler** — background daemon with concurrency limits, speed
-  cap, and "start after 1h" / "start at 22:30" scheduling
-- **GUI app** — live task list with speeds and progress, settings, system tray
-- **CLI** — scriptable, no daemon needed for plain downloads
-- **NIC bonding** — combine Wi-Fi + Ethernet + tethering into one faster pipe
-  for a single download
-- **Same-network transfer** — send a file to another ripdl (or to a browser on
-  any phone/tablet) over your own network: a code-protected drop box, no cloud,
-  no account, no upload limit
+<p align="center">
+  <a href="https://github.com/ShiniM0d0ri/ripdl/releases/latest"><b>⬇ Download for Windows</b></a>
+  &nbsp;·&nbsp;
+  <a href="#command-line">Command line</a>
+  &nbsp;·&nbsp;
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full status and roadmap.
+## What is ripdl?
+
+A download manager is a program that grabs files **faster and more reliably
+than a browser**: it opens several connections to the same file, keeps a queue,
+and picks up exactly where it left off after a crash, a reboot or a lost Wi-Fi
+connection.
+
+ripdl also handles **torrents**, **video pages** (via yt-dlp) and **sending
+files to your own devices** over Wi-Fi. It is open source, so it is free
+forever — there is nothing to buy, nothing to activate, and nothing that phones
+home.
+
+## Why switch from IDM / FDM / aria2?
+
+|  | ripdl |
+|---|---|
+| Price | Free, forever (MIT OR Apache-2.0) |
+| Ads, bundled offers, "get premium" | None |
+| Telemetry, accounts, crash reporting | None |
+| Torrents, video pages, LAN transfer | Included |
+| GUI + command line | Both, one engine |
+| Platforms | Windows 10/11, Linux |
+
+## Features
+
+- **Fast, resumable downloads** — up to 8 parallel connections per file when
+  the server allows it, one steady stream when it doesn't. Pause, close the app
+  or crash: it resumes from the last byte.
+- **A queue you can actually control** — pause/resume/remove, sort by speed or
+  size, limit how many run at once, cap total speed, or schedule a task for
+  later ("in 1 hour", "at 22:30").
+- **Torrents** — `.torrent` files and magnets, per-file selection, sequential
+  (stream-while-downloading) mode, seeding with ratio/time limits, live
+  files/peers/trackers view.
+- **Video and stream pages** — send a page to
+  [yt-dlp](https://github.com/yt-dlp/yt-dlp) from the Add dialog or with
+  `--video`; progress is shown as a percentage.
+- **Send files to your phone, or between two PCs** — a code-protected page on
+  your own Wi-Fi: open it in any browser, drop files in, or download what is
+  there. No cloud, no account, no size limit.
+- **Combine your connections (optional)** — if this PC has Wi-Fi *and*
+  Ethernet *and* tethering, one download can use all of them.
+- **Tray + background** — close the window and downloads keep going.
 
 ## Install
 
-Grab an installer from the [latest release](https://github.com/ShiniM0d0ri/ripdl/releases):
+**Windows (recommended)**
+Download `ripdl-v<version>-x86_64-windows-setup.exe` from the
+[latest release](https://github.com/ShiniM0d0ri/ripdl/releases/latest) and run
+it. It installs to `C:\Program Files\ripdl`, adds a Start-menu entry and opens
+the app. New versions install with one click from inside the app. Prefer no
+installer? Use the portable `.zip` and unzip anywhere.
 
-- **Windows (recommended)**: download `ripdl-v*-x86_64-windows-setup.exe` and
-  run it. It installs to `C:\Program Files\ripdl` and launches the GUI.
-- **Windows (portable)**: unzip `ripdl-v*-x86_64-windows-portable.zip`
-  anywhere (the pinned browser extension is under `ext/` inside).
-- **Linux**: install the shipped `.deb` / `.rpm` package — or extract
-  `ripdl-v*-x86_64-linux.tar.gz` and copy `ripdl`, `ripdl-daemon` and
-  `ripdl-gui` to a `PATH` folder:
-  `tar -xzf ripdl-v*-x86_64-linux.tar.gz && sudo cp ripdl-v*/ripdl ripdl-v*/ripdl-daemon ripdl-v*/ripdl-gui /usr/local/bin/`.
+*Requirements:* Windows 10/11 (the WebView2 runtime that ships with Edge), or a
+modern Linux desktop. No .NET, no Java, no extra runtimes.
 
-The Windows installer includes the browser extension under
-`C:\Program Files\ripdl\ext`; the desktop app and daemon are installed with it.
+**Linux**
 
-### First steps in the GUI
+- Debian/Ubuntu: `sudo apt install ./ripdl_<version>_amd64.deb`
+- Fedora: `sudo dnf install ./ripdl-<version>-1.x86_64.rpm`
+- Any distro:
+  `tar -xzf ripdl-v<version>-x86_64-linux.tar.gz && sudo cp ripdl-v*/ripdl ripdl-v*/ripdl-daemon ripdl-v*/ripdl-gui /usr/local/bin/`
 
-1. Click **Add URL**, paste a link, pick a folder, **OK**.
-2. Watch it go — right-click a row to pause, resume or open the file.
-3. Settings (gear icon) controls the speed cap, folder defaults,
-   download/segment counts and updates.
+## Your first download (30 seconds)
 
-### Command line
+1. Open ripdl and click the **+** button (or press `Ctrl+N`).
+2. Paste a link, press **Download**. Change the folder if you don't want the
+   default Downloads one.
+3. Watch it go. Right-click a row to pause, resume, open the file or remove it.
+
+<p align="center">
+  <img src="docs/screenshots/add-url.png" alt="Add URL dialog" width="720">
+</p>
+
+The list is remembered: downloads keep running while the window sits in the
+tray, and unfinished ones resume when you start ripdl again.
+
+### What do the buttons do?
+
+The toolbar is icon-only (hover anything for a tooltip):
+
+| Button | What it does |
+|---|---|
+| **+** | Add a download URL (`Ctrl+N`) |
+| **magnet** | Add a torrent file (`Ctrl+T`) — or drop one on the window |
+| **▶** | Resume every paused or failed task |
+| **⏸** | Pause every running task |
+| **trash** | Clear completed tasks from the list (files stay on disk) |
+| **paper plane** | Send / receive files on your network |
+| **sliders** | Settings |
+
+On a task row: **double-click** opens details (segments, torrent files/peers),
+**right-click** gives pause, resume, refresh address, open file/folder and
+remove.
+
+## Torrents
+
+Click the magnet button (or `Ctrl+T`) to open a `.torrent` file, or paste a
+magnet link into Add. Single-file torrents land directly in Downloads;
+multi-file torrents get their own folder. Double-click a torrent row to see its
+files, peers and trackers — and untick anything you don't want.
+
+<p align="center">
+  <img src="docs/screenshots/torrent-details.png" alt="Torrent details: files, peers, trackers" width="720">
+</p>
+
+## Send a file to your phone, or between two PCs
+
+1. Click the paper-plane button (**Send & Receive**).
+2. Turn on **Receive files on this network**. ripdl shows an address such as
+   `http://192.168.1.8:8463` and a short code.
+3. On your phone (same Wi-Fi) open that address in any browser, type the code,
+   pick a file and press **Send**. It appears in `Downloads\ripdl-inbox`.
+4. To send *from* this PC, pick the other device under **Send** (or type its
+   address and code) and click **Send file…**.
+
+<p align="center">
+  <img src="docs/screenshots/send-receive.png" alt="Send and receive dialog" width="720">
+</p>
+
+Nothing leaves your network. The code is the key — turn on **No code** only on
+a network you trust.
+
+## Settings worth knowing
+
+<p align="center">
+  <img src="docs/screenshots/settings.png" alt="Settings" width="720">
+</p>
+
+- **Concurrent downloads / max segments** — how many tasks run at once, and how
+  many connections each one gets (8 is a good default).
+- **Speed cap** — one shared limit for everything (`2MiB`, `500k`, empty =
+  unlimited).
+- **Default download folder** — where new tasks go.
+- **Minimize to tray on close** — keep downloading in the background.
+- **Seed finished torrents** — ratio and time limits for after a torrent ends.
+- **Check for updates at startup** — one GitHub request per launch, can be
+  turned off.
+
+## Command line
+
+Optional — the app does everything — but handy for scripts and servers:
 
 ```sh
-ripdl download https://example.com/big-file.zip         # direct download, resumable
-ripdl info https://example.com/big-file.zip             # inspect size/ranges first
-ripdl download -o D:/Downloads -s 16 <url>              # folder + segment count
-ripdl add https://example.com/big-file.zip              # queue via the daemon
-ripdl add --after 1h <url>                              # schedule
-ripdl add <magnet-link-or-.torrent> --sequential        # torrents
-ripdl add --video "https://youtube.com/watch?v=..."     # video/streams (needs yt-dlp)
-ripdl ls                                                # live queue + progress
+ripdl add https://example.com/big.iso          # queue it in the background
+ripdl ls                                        # what is running, with speeds
 ripdl pause <id> | ripdl resume <id> | ripdl rm <id> [--files]
-ripdl lan info                                          # receive URL + code
-ripdl lan peers                                         # find ripdl on this network
-ripdl lan send big.iso --to http://192.168.1.8:8463 --code ABC123
-ripdl config                                            # see/set daemon settings
-ripdl update                                            # check for a new release
+
+ripdl download <url> -o ~/Downloads -s 16       # one-off download, no daemon
+ripdl add --after 1h <url>                      # start it later
+ripdl add <magnet-or-.torrent> --sequential     # torrents
+ripdl add --video "https://youtube.com/watch?v=..."   # needs yt-dlp
+
+ripdl lan info                                  # this PC's address + code
+ripdl lan send photo.jpg --to http://192.168.1.8:8463 --code ABC123
+
+ripdl config                                    # see or change settings
+ripdl update                                    # check for a newer release
 ```
 
-Notes:
-- `download` runs standalone; `add` uses the background daemon (auto-spawned
-  if you just installed).
-- Video pages need [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed
-  (`winget install yt-dlp.yt-dlp`, or set `ytdlp_path` in the settings).
-- Interrupted downloads keep a `<file>.ripdl.json` sidecar — rerun the same
-  command and it continues where it stopped.
-- NIC bonding (combine all your uplinks into one download): the GUI settings
-  checkbox, `ripdl config bond_interfaces=true`, or `ripdl download --bond`.
+Run `ripdl --help` for the full list, and `ripdl <command> --help` for flags.
 
-## Update & uninstall
+## Browser extension (optional)
 
-- **GUI**: `Help → Check for Updates` (or just launch normally — it checks
-  once per session by default). When a new release exists you get a banner
-  with **Download & Install**: ripdl downloads the installer, verifies its
-  SHA-256 against GitHub's checksum file, and runs it over the old install.
-  Turn on *Download & install updates automatically* in Settings for a fully
-  hands-off experience (UAC prompt is the only thing you'll see).
-- **CLI**: `ripdl update` prints the installed/latest versions and the release
-  URL; `ripdl update --install` performs the same verified upgrade.
-- **Windows uninstall**: Settings → Apps → *ripdl* → *Uninstall*. It removes
-  `C:\Program Files\ripdl` and the browser-host registrations. Your
-  **downloads are kept**, the daemon's data dir `%LOCALAPPDATA%\ripdl` is
-  **kept** (queue, settings — delete it by hand for a spotless machine), and
-  the browser extension is removed from the browser itself
-  (`chrome://extensions` → Remove).
-- **Portable**: delete the unzipped folder. **Linux** (`deb`/`rpm`): remove
-  the package (`apt remove ripdl` / `dnf remove ripdl`). **Linux** (tarball):
-  `sudo rm /usr/local/bin/ripdl*` and delete the queue folder
-  (`~/.local/share/ripdl`) if you want the data gone too.
+The extension hands downloads to ripdl instead of the browser's own downloader
+— right-click a link → **Download link with ripdl**. Load it once:
 
-Updating a portable copy: drop the new zip's files over the old one while no
-download is running.
+1. Run `ripdl register-host` (the Windows installer already does this).
+2. Open `chrome://extensions`, enable **Developer mode**, click
+   **Load unpacked** and pick the `ext` folder inside the install directory.
+3. Right-click any link → **Download link with ripdl**.
 
-## Browser extension (experimental)
+It only acts when you click, and it never reads pages in the background.
 
-The MV3 extension hands browser downloads to ripdl, and from its popup can
-also offer the current page's video/stream URL via yt-dlp.
+## Staying up to date
 
-1. `ripdl register-host` (registers the native messaging host, per-user)
-2. Chrome/Brave/Edge → `chrome://extensions` → enable Developer mode →
-   **Load unpacked** → pick `ext/` from the install folder
-3. Right-click a download link → **Download link with ripdl** (there's also
-   *this page URL*, *selected links* and *all page links*), or open the
-   toolbar popup on a media page.
+The app checks GitHub once per launch and shows a banner with **Download &
+Install**: the installer is verified against its SHA-256 before it runs. Turn on
+*Download & install updates automatically* in Settings to make that hands-off.
+`ripdl update --install` does the same from the CLI.
 
-Privacy posture: it only acts when you click, only reads the page URL while
-the popup is open, never touches history or runs page scripts, and shares
-cookies only if you opt in.
+## Uninstall
 
-## For developers
+- **Windows:** Settings → Apps → ripdl → Uninstall. Your downloaded files stay
+  exactly where they are.
+- **Linux:** remove the package (`apt remove ripdl` / `dnf remove ripdl`) or the
+  three binaries you copied.
+
+Queue and settings live in `%LOCALAPPDATA%\ripdl` (Windows) or
+`~/.local/share/ripdl` (Linux) — delete that folder too if you want a completely
+clean machine.
+
+## Privacy
+
+No analytics, no crash reporting, no ads, no accounts. ripdl connects only to:
+
+- the download addresses you give it (and torrent trackers/files you open),
+- `api.github.com` for the update check (can be disabled in Settings),
+- your local network, and only if you turn on Send & Receive.
+
+## Troubleshooting
+
+**The other device can't connect (Send & Receive).**
+Allow ripdl through Windows Firewall for *private* networks, and make sure both
+devices are on the same Wi-Fi/LAN. Guest networks, "client isolation" and some
+VPNs block device-to-device traffic.
+
+**A video page fails.**
+Video mode needs [yt-dlp](https://github.com/yt-dlp/yt-dlp):
+`winget install yt-dlp.yt-dlp`. If it isn't on `PATH`, set its full path in
+Settings → *yt-dlp path*.
+
+**The download is slower than expected.**
+Many servers throttle each connection; raising *Max segments* can help. If a
+server doesn't support ranges, ripdl deliberately uses a single stream.
+
+**"File already exists".**
+ripdl never overwrites silently — remove the old task or choose another folder.
+
+## Build from source
 
 ```sh
-cargo build --release
-cargo test        # fully offline; no real networks
+cargo build --release   # Rust stable; the GUI needs WebKit2GTK dev packages on Linux
+cargo test              # fully offline, no real networks
 ```
 
-Rule of the codebase: features land in `ripdl-core` (pure lib) / the daemon
-once; CLI, GUI and the browser host are thin shells on top. Torrent support
-runs on a vendored, minimally-patched
-[librqbit](https://github.com/ikatson/rqbit) (Apache-2.0) under `vendor/`.
+Workspace layout: `ripdl-core` (engine), `ripdl-daemon` (background queue),
+`ripdl-gui` (Tauri window), `ripdl-cli`. What is done and what is next lives in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License
 
-MIT OR Apache-2.0 — see
-[LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE).
+MIT OR Apache-2.0, at your option — see [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

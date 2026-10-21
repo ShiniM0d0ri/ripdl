@@ -275,7 +275,11 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       installs with `/SILENT` (UAC only, no wizard, app relaunches itself)
       and hides a stale update banner when a check reports "current".
 - [ ] Packaging: winget / scoop / Homebrew, AUR
-- [ ] Website + README showdown (screenshots, honest feature table)
+- [x] README showcase: first-timer walkthrough with real screenshots
+      (`docs/screenshots/`: main window, Add URL, torrent details,
+      Send & Receive, settings), a plain-language feature list and an honest
+      vs-IDM/FDM/aria2 table. Website still pending.
+- [ ] Website
 - [ ] i18n
 
 ## P6 - speed & reach
@@ -411,5 +415,6 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
 ## Packaging / reach (backlog)
 
 - [ ] winget / scoop / Homebrew, AUR
-- [ ] Website + README showcase (screenshots, honest feature table)
+- [x] README showcase with screenshots (see P5)
+- [ ] Website
 - [ ] i18n
