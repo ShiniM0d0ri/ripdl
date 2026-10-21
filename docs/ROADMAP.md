@@ -412,6 +412,9 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       for phones, resumable/chunked uploads, mDNS/DNS-SD instead of the
       custom beacon, per-device pairing instead of one shared code.
 
+Shipped in **v0.4.0** (with the post-0.3.16 hardening listed in AGENTS.md and
+the new brand/README work).
+
 ## Packaging / reach (backlog)
 
 - [ ] winget / scoop / Homebrew, AUR
