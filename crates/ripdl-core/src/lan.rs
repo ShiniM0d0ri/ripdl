@@ -456,8 +456,7 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
                 let _ = tokio::fs::remove_file(&part).await;
                 return respond_json(&mut wr, 400, "Bad Request", b"{\"error\":\"truncated\"}").await;
             }
-            let final_path = unique_path(&state.dir, &name).await;
-            tokio::fs::rename(&part, &final_path).await?;
+            let final_path = place_finished(&state.dir, &part, &name).await?;
             let body = serde_json::json!({
                 "name": final_path
                     .file_name()
@@ -511,10 +510,10 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
 
 /// One file name, no directories, no Windows-reserved characters.
 fn sanitize_name(raw: &str) -> String {
-    let base = Path::new(raw)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // Split on both separators: a Windows path must not smuggle directories
+    // into a Unix receiver (or the other way round). Only the last component
+    // survives.
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("").to_string();
     let mut out = String::with_capacity(base.len());
     for ch in base.chars() {
         let bad = matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0')
@@ -538,28 +537,59 @@ fn sanitize_name(raw: &str) -> String {
     trimmed
 }
 
-/// `name.ext` -> `name (1).ext` when the name is taken.
-async fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let candidate = dir.join(name);
-    if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
-        let path = Path::new(name);
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "received".into());
-        let ext = path.extension().map(|e| e.to_string_lossy().into_owned());
-        for n in 1..10_000u32 {
-            let file = match &ext {
-                Some(ext) => format!("{stem} ({n}).{ext}"),
-                None => format!("{stem} ({n})"),
-            };
-            let candidate = dir.join(file);
-            if !tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
-                return candidate;
+/// `name.ext` with an optional ` (n)` suffix.
+fn suffixed(name: &str, n: u32) -> String {
+    if n == 0 {
+        return name.to_string();
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "received".into());
+    match path.extension().map(|e| e.to_string_lossy().into_owned()) {
+        Some(ext) => format!("{stem} ({n}).{ext}"),
+        None => format!("{stem} ({n})"),
+    }
+}
+
+/// Move a finished body to a free name inside `dir`. Claiming the name has
+/// to be atomic: two uploads that finish at the same instant can both see
+/// `x.bin` free, and a plain rename would silently drop one of them.
+async fn place_finished(dir: &Path, part: &Path, name: &str) -> Result<PathBuf> {
+    for n in 0..1000u32 {
+        let candidate = dir.join(suffixed(name, n));
+        // A hard link either creates the name with the finished content or
+        // fails because it is taken - no window where an empty file shows up.
+        match tokio::fs::hard_link(part, &candidate).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(part).await;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                // Filesystems without hard links (exFAT/FAT32 inbox on a USB
+                // stick): claim the name exclusively, then move the body over
+                // the claim we own.
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                    .await
+                {
+                    Ok(_) => {
+                        tokio::fs::rename(part, &candidate).await?;
+                        return Ok(candidate);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
     }
-    candidate
+    Err(Error::State(
+        "no free file name in the receive folder after 1000 tries".into(),
+    ))
 }
 
 fn constant_eq(a: &str, b: &str) -> bool {
