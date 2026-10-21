@@ -33,6 +33,8 @@
       <symbol id="i-box" viewBox="0 0 24 24"><path d="M12 3l9 5v8l-9 5-9-5V8z"/><path d="M3 8l9 5 9-5M12 13v8"/></symbol>
       <symbol id="i-app" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></symbol>
       <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M4 13h4l2 3h4l2-3h4"/><path d="M5 4h14l2 9v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><path d="M3.5 11.5L20 4l-7.5 16.5-2.2-6.3z"/><path d="M10.3 14.2L20 4"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="1.5"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8"/></symbol>
       <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></symbol>
       <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
       <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5M3 17l9 5 9-5"/></symbol>
@@ -58,6 +60,9 @@
     </button>
     <button id="btn-clear-done" class="tb-btn" title="Remove completed tasks from the list (files stay on disk)" aria-label="Clear completed">
       <svg class="ico gray"><use href="#i-trash"/></svg>
+    </button>
+    <button id="btn-lan" class="tb-btn" title="Send / receive files on this network" aria-label="Send and receive">
+      <svg class="ico green"><use href="#i-send"/></svg>
     </button>
     <button id="btn-settings" class="tb-btn right" title="Settings (daemon config)" aria-label="Settings">
       <svg class="ico blue"><use href="#i-sliders"/></svg>
@@ -188,6 +193,62 @@
         <button id="abt-check">Check for updates</button>
         <button id="abt-ok" class="primary">Close</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Send / receive on the local network -->
+  <div id="lan-backdrop" class="hidden">
+    <div id="lan">
+      <div class="set-title">Send &amp; receive<em> files between devices on this network</em><button id="lan-close">&times;</button></div>
+      <div id="lan-body">
+        <div class="lan-card">
+          <div class="lan-head">
+            <strong>Receive</strong>
+            <label class="chk"><input type="checkbox" id="lan-on" /> Receive files on this network</label>
+          </div>
+          <div id="lan-status" class="set-hint">&mdash;</div>
+          <div id="lan-tip" class="lan-hint"></div>
+          <div class="lan-row">
+            <span class="lan-label">Address</span>
+            <code id="lan-url" class="lan-code"></code>
+            <button id="lan-copy" title="Copy the address"><svg class="ico"><use href="#i-copy"/></svg></button>
+          </div>
+          <div class="lan-row">
+            <span class="lan-label">Code</span>
+            <code id="lan-code" class="lan-code lan-code-big"></code>
+            <button id="lan-newcode" title="Generate a new code; paired devices must re-enter it">New code</button>
+            <label class="chk lan-open" title="Any device on this network can upload without the code."><input type="checkbox" id="lan-open" /> No code</label>
+          </div>
+          <div class="lan-row">
+            <span class="lan-label">Folder</span>
+            <span id="lan-dir" class="lan-path"></span>
+            <button id="lan-open-dir"><svg class="ico"><use href="#i-folder"/></svg>Open</button>
+          </div>
+          <div class="lan-sub">Received files</div>
+          <div id="lan-files" class="lan-files"></div>
+        </div>
+
+        <div class="lan-card">
+          <div class="lan-head">
+            <strong>Send</strong>
+            <button id="lan-find" title="Broadcast a discovery request on the local network">Find devices</button>
+          </div>
+          <div id="lan-peers" class="lan-peers"></div>
+          <div class="lan-row">
+            <span class="lan-label">To</span>
+            <input id="lan-to" type="text" spellcheck="false" placeholder="http://192.168.1.8:8463" />
+          </div>
+          <div class="lan-row">
+            <span class="lan-label">Code</span>
+            <input id="lan-send-code" type="text" spellcheck="false" placeholder="code shown on that device" />
+            <button id="lan-pick" class="primary"><svg class="ico"><use href="#i-send"/></svg>Send file&hellip;</button>
+          </div>
+          <div class="lan-sub">Sending</div>
+          <div id="lan-sends" class="lan-sends"></div>
+        </div>
+      </div>
+      <div class="dlg-actions"><button id="lan-done" class="primary">Close</button></div>
+      <div id="lan-err" class="hidden"></div>
     </div>
   </div>
 

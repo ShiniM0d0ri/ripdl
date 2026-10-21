@@ -24,6 +24,9 @@ Your history stays on your machine. Source code right here.
 - **CLI** — scriptable, no daemon needed for plain downloads
 - **NIC bonding** — combine Wi-Fi + Ethernet + tethering into one faster pipe
   for a single download
+- **Same-network transfer** — send a file to another ripdl (or to a browser on
+  any phone/tablet) over your own network: a code-protected drop box, no cloud,
+  no account, no upload limit
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the full status and roadmap.
 
@@ -62,6 +65,9 @@ ripdl add <magnet-link-or-.torrent> --sequential        # torrents
 ripdl add --video "https://youtube.com/watch?v=..."     # video/streams (needs yt-dlp)
 ripdl ls                                                # live queue + progress
 ripdl pause <id> | ripdl resume <id> | ripdl rm <id> [--files]
+ripdl lan info                                          # receive URL + code
+ripdl lan peers                                         # find ripdl on this network
+ripdl lan send big.iso --to http://192.168.1.8:8463 --code ABC123
 ripdl config                                            # see/set daemon settings
 ripdl update                                            # check for a new release
 ```

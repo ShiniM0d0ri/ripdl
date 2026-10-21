@@ -148,7 +148,8 @@ enum Cmd {
         /// max_segments, min_segment_size, max_speed_bytes (0 = uncapped),
         /// default_download_dir, ytdlp_path, hide_to_tray, bond_interfaces,
         /// update_check, update_auto_install, seed_enabled (true|false),
-        /// seed_ratio (0 = unlimited), seed_time_min (0 = never).
+        /// seed_ratio (0 = unlimited), seed_time_min (0 = never),
+        /// lan_enabled, lan_port, lan_dir, lan_open.
         #[arg(value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
@@ -161,6 +162,12 @@ enum Cmd {
         /// upgrade in place (Windows; goes through the daemon).
         #[arg(long)]
         install: bool,
+    },
+    /// Send/receive files on the local network: receive status, discovery,
+    /// sending a file, and rotating the pairing code.
+    Lan {
+        #[command(subcommand)]
+        cmd: LanCmd,
     },
     /// Register this binary as the browser's native messaging host
     /// (`ripdl host` mode triggers when Chrome passes an extension origin).
@@ -179,6 +186,32 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum LanCmd {
+    /// Show this device's receive URL, pairing code, folder, and the files
+    /// that arrived.
+    Info,
+    /// Find ripdl receivers on this network (UDP broadcast, ~1 s).
+    Peers,
+    /// Copy a file to a receiver on this network.
+    Send {
+        path: PathBuf,
+        /// Receiver base URL, e.g. `http://192.168.1.8:8463`.
+        #[arg(long)]
+        to: String,
+        /// Pairing code shown by the receiver (not needed when it accepts
+        /// files without a code).
+        #[arg(long, default_value = "")]
+        code: String,
+    },
+    /// Show outgoing LAN copies.
+    Sends,
+    /// Rotate this device's pairing code (paired devices must re-enter it).
+    NewCode,
+    /// Open the receive folder in the file manager.
+    Open,
 }
 
 #[tokio::main]
@@ -288,6 +321,20 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+        Cmd::Lan { cmd } => match cmd {
+            LanCmd::Info => rpc(Command::LanInfo).await,
+            LanCmd::Peers => rpc(Command::LanPeers).await,
+            LanCmd::Sends => rpc(Command::LanSends).await,
+            LanCmd::NewCode => rpc(Command::LanNewCode).await,
+            LanCmd::Open => {
+                let reply = rpc_reply(Command::LanInfo).await?;
+                match reply {
+                    Reply::Lan { info } => open_path(&info.dir),
+                    other => print_reply(other),
+                }
+            }
+            LanCmd::Send { path, to, code } => send_watch(path, to, code).await,
+        },
         Cmd::RegisterHost { ext_id, host, force } => register_host(&ext_id, &host, force),
         Cmd::Ls => rpc(Command::List).await,
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
@@ -391,6 +438,22 @@ async fn main() -> anyhow::Result<()> {
                                 .context("seed_time_min needs minutes (0 = never)")?,
                         )
                     }
+                    "lan_enabled" => {
+                        settings.lan_enabled =
+                            Some(val.parse().context("lan_enabled needs true|false")?)
+                    }
+                    "lan_port" => {
+                        let port: u16 = val.parse().context("lan_port needs 1-65535")?;
+                        if port == 0 {
+                            bail!("lan_port must be 1-65535");
+                        }
+                        settings.lan_port = Some(port);
+                    }
+                    "lan_dir" => settings.lan_dir = Some(PathBuf::from(val)),
+                    "lan_open" => {
+                        settings.lan_open =
+                            Some(val.parse().context("lan_open needs true|false")?)
+                    }
                     other => bail!("unknown setting {other:?} (see: ripdl config --help)"),
                 }
             }
@@ -430,6 +493,61 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Send one file and follow its progress until the daemon reports it done.
+async fn send_watch(path: PathBuf, to: String, code: String) -> anyhow::Result<()> {
+    let reply = rpc_reply(Command::LanSend { url: to, code, path }).await?;
+    let Reply::LanSend { id } = reply else {
+        return print_reply(reply);
+    };
+    use std::io::Write as _;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let reply = rpc_reply(Command::LanSends).await?;
+        let Reply::LanSends { sends } = reply else {
+            return print_reply(reply);
+        };
+        let Some(s) = sends.into_iter().find(|s| s.id == id) else {
+            println!("send {id} disappeared (daemon restarted?)");
+            return Ok(());
+        };
+        let pct = if s.total > 0 {
+            s.sent as f64 / s.total as f64 * 100.0
+        } else {
+            0.0
+        };
+        print!(
+            "\r  {}  {:>5.1}%  {} / {}",
+            s.name,
+            pct,
+            humans(s.sent),
+            humans(s.total)
+        );
+        let _ = std::io::stdout().flush();
+        if s.done {
+            println!();
+            return match s.error {
+                Some(e) => Err(anyhow::anyhow!("send failed: {e}")),
+                None => {
+                    println!("sent to {} as {}", s.peer, s.name);
+                    Ok(())
+                }
+            };
+        }
+    }
+}
+
+/// Reveal a folder in the OS file manager (best effort).
+fn open_path(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(path).spawn()?;
+    Ok(())
 }
 
 /// One-shot RPC client: connect, send, print the reply.
@@ -536,6 +654,93 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             println!("seed_enabled:         {}", settings.seed_enabled());
             println!("seed_ratio:           {}", settings.seed_ratio());
             println!("seed_time_min:        {}", settings.seed_time_min());
+            println!("lan_enabled:          {}", settings.lan_enabled());
+            println!("lan_port:             {}", settings.lan_port());
+            println!(
+                "lan_dir:              {}",
+                settings
+                    .lan_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(Downloads/ripdl-inbox)".to_string())
+            );
+            println!("lan_open:             {}", settings.lan_open());
+        }
+        Reply::Lan { info } => {
+            let status = if !info.enabled {
+                "off (ripdl config lan_enabled=true)"
+            } else if info.running {
+                "on"
+            } else {
+                "on, but not listening (port in use?)"
+            };
+            println!("receive:  {status}");
+            if !info.url.is_empty() {
+                println!("address:  {}", info.url);
+            }
+            if info.code.is_empty() {
+                println!("code:     (none yet - start receiving once)");
+            } else {
+                println!("code:     {}", info.code);
+            }
+            println!("open:     {}", if info.open { "yes (no code)" } else { "no (code required)" });
+            println!("folder:   {}", info.dir.display());
+            if info.files.is_empty() {
+                println!("files:    (none yet)");
+            } else {
+                println!("files:");
+                for f in &info.files {
+                    println!(
+                        "  {:>10}  {}{}",
+                        humans(f.size),
+                        f.name,
+                        if f.partial { "  (receiving...)" } else { "" }
+                    );
+                }
+            }
+        }
+        Reply::LanPeers { peers } => {
+            if peers.is_empty() {
+                println!("no receivers answered (same network? receiving enabled there?)");
+            }
+            for p in peers {
+                println!(
+                    "{:<24} {:<28} {}",
+                    p.name,
+                    p.url,
+                    if p.open { "no code needed" } else { "code required" }
+                );
+            }
+        }
+        Reply::LanSend { id } => println!("sending (id {id}); watch it with: ripdl lan sends"),
+        Reply::LanSends { sends } => {
+            if sends.is_empty() {
+                println!("no outgoing LAN copies");
+            }
+            for s in sends {
+                let pct = if s.total > 0 {
+                    s.sent as f64 / s.total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let state = match (&s.error, s.done) {
+                    (Some(e), _) => format!("failed: {e}"),
+                    (None, true) => "done".to_string(),
+                    (None, false) => "sending".to_string(),
+                };
+                println!(
+                    "{}  {}  {:>5.1}%  {} / {}  -> {}",
+                    s.id,
+                    s.name,
+                    pct,
+                    humans(s.sent),
+                    humans(s.total),
+                    s.peer
+                );
+                if !s.done || s.error.is_some() {
+                    println!("    {state}");
+                }
+            }
         }
         Reply::TorrentDetails { details } => {
             println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));

@@ -9,6 +9,7 @@ pub mod categories;
 pub mod engine;
 pub mod error;
 pub mod hunt;
+pub mod lan;
 pub mod queue;
 pub mod refresh;
 pub mod rpc;

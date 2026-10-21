@@ -909,6 +909,8 @@ const MENUS = {
         { label: "Add URL", hint: "Ctrl+N", act: () => openAddDialog() },
         { label: "Add Torrent", hint: "Ctrl+T", act: () => pickTorrent() },
         null,
+        { label: "Send / Receive on Network", act: () => openLan() },
+        null,
         { label: "Exit", act: () => { invokeSafe("exit_app"); } },
     ],
     tasks: () => [
@@ -1330,9 +1332,247 @@ $("#set-dir").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 // True while any dialog is open: global accelerators shouldn't fire into
 // them (Ctrl+N while typing in the Add dialog would wipe the typed URL).
 function dialogOpen() {
-    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop", "#hdt-backdrop", "#rdlg-backdrop", "#abt-backdrop"]
+    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop", "#hdt-backdrop", "#rdlg-backdrop", "#abt-backdrop", "#lan-backdrop"]
         .some((s) => !$(s).classList.contains("hidden"));
 }
+
+/* ------------------------------------------------------------------ */
+/* Send / receive on the local network                                 */
+/* ------------------------------------------------------------------ */
+let lanInfo = null;
+let lanTimer = null;
+
+function lanErr(msg) {
+    const el = $("#lan-err");
+    if (!msg) {
+        el.classList.add("hidden");
+        el.textContent = "";
+        return;
+    }
+    el.textContent = String(msg).replace(/^.*error: /, "");
+    el.classList.remove("hidden");
+}
+
+function lanJoin(dir, name) {
+    const sep = dir.includes("\\") ? "\\" : "/";
+    return dir.endsWith(sep) ? dir + name : dir + sep + name;
+}
+
+function applyLanInfo(info) {
+    lanInfo = info;
+    $("#lan-on").checked = !!info.enabled;
+    $("#lan-open").checked = !!info.open;
+    $("#lan-url").textContent = info.running ? info.url : "(not listening)";
+    $("#lan-code").textContent = info.code || "------";
+    $("#lan-dir").textContent = info.dir || "";
+    const st = $("#lan-status");
+    if (!info.enabled) {
+        st.className = "set-hint warn";
+        st.textContent = "Receiving is off. Turn it on to accept files from other devices.";
+    } else if (!info.running) {
+        st.className = "set-hint warn";
+        st.textContent = `Receiving is on but nothing is listening on port ${info.port} (is another app using it?)`;
+    } else if (info.open) {
+        st.className = "set-hint ok";
+        st.textContent = `Listening on port ${info.port}. Anyone on this network can send files.`;
+    } else {
+        st.className = "set-hint ok";
+        st.textContent = `Listening on port ${info.port}. The code is required to send or list files.`;
+    }
+    $("#lan-tip").textContent = info.running
+        ? "If another device cannot connect, allow ripdl through the firewall for private networks."
+        : "";
+    const box = $("#lan-files");
+    if (!info.files || !info.files.length) {
+        box.innerHTML = '<div class="lan-hint">nothing received yet</div>';
+    } else {
+        box.innerHTML = info.files
+            .map(
+                (f) => `<div class="lan-file">
+                  <span class="lan-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>
+                  ${f.partial ? '<span class="lan-hint">receiving&hellip;</span>' : ""}
+                  <span class="lan-size">${humans(f.size)}</span>
+                  ${
+                      f.partial
+                          ? ""
+                          : `<button data-open="${escapeHtml(f.name)}"><svg class="ico"><use href="#i-file"/></svg>Open</button>`
+                  }
+                </div>`
+            )
+            .join("");
+        box.querySelectorAll("button[data-open]").forEach((b) => {
+            b.onclick = () => {
+                invokeSafe("open_path", { path: lanJoin(info.dir, b.dataset.open) }).catch((e) => lanErr(e));
+            };
+        });
+    }
+}
+
+async function refreshLan() {
+    try {
+        applyLanInfo(await invokeSafe("lan_info"));
+        lanErr(null);
+    } catch (e) {
+        lanErr(e);
+    }
+}
+
+async function findLanPeers() {
+    const box = $("#lan-peers");
+    box.innerHTML = '<div class="lan-hint">Looking for ripdl on this network&hellip;</div>';
+    try {
+        const peers = await invokeSafe("lan_peers");
+        if (!peers.length) {
+            box.innerHTML =
+                '<div class="lan-hint">Nobody answered. Start ripdl on the other device, turn receiving on there, and check that both are on the same network.</div>';
+            return;
+        }
+        box.innerHTML = peers
+            .map(
+                (p, i) => `<div class="lan-peer" data-i="${i}" title="${escapeHtml(p.url)}">
+                  <span class="lan-name">${escapeHtml(p.name)}</span>
+                  <span class="lan-url">${escapeHtml(p.url)}</span>
+                  <span class="lan-hint">${p.open ? "no code" : "code needed"}</span>
+                </div>`
+            )
+            .join("");
+        box.querySelectorAll(".lan-peer").forEach((el) => {
+            el.onclick = () => {
+                const p = peers[Number(el.dataset.i)];
+                $("#lan-to").value = p.url;
+                if (p.open) $("#lan-send-code").value = "";
+                $("#lan-send-code").focus();
+            };
+        });
+    } catch (e) {
+        box.innerHTML = `<div class="lan-hint">discovery failed: ${escapeHtml(String(e))}</div>`;
+    }
+}
+
+async function refreshLanSends() {
+    const box = $("#lan-sends");
+    let sends = [];
+    try {
+        sends = await invokeSafe("lan_sends");
+    } catch (_) {
+        return;
+    }
+    if (!sends.length) {
+        box.innerHTML = '<div class="lan-hint">no outgoing copies</div>';
+        return;
+    }
+    box.innerHTML = sends
+        .map((s) => {
+            const pct = s.total > 0 ? Math.min(100, Math.round((s.sent / s.total) * 1000) / 10) : 0;
+            const failed = !!s.error;
+            const detail = failed
+                ? escapeHtml(String(s.error))
+                : s.done
+                  ? `sent to ${escapeHtml(s.peer)}`
+                  : `${humans(s.sent)} / ${humans(s.total)} \u00b7 ${escapeHtml(s.peer)}`;
+            return `<div class="lan-send${failed ? " err" : ""}" title="${escapeHtml(s.path)}">
+              <span class="lan-name">${escapeHtml(s.name)}</span>
+              <span class="lan-bar"><i style="width:${s.done && !failed ? 100 : pct}%"></i></span>
+              <span class="lan-size">${failed ? "failed" : s.done ? "sent" : pct + "%"}</span>
+            </div>
+            <div class="lan-hint">${detail}</div>`;
+        })
+        .join("");
+}
+
+function lanLoop() {
+    clearTimeout(lanTimer);
+    lanTimer = setTimeout(async () => {
+        if ($("#lan-backdrop").classList.contains("hidden")) return;
+        await refreshLanSends();
+        lanLoop();
+    }, 800);
+}
+
+async function openLan() {
+    lanErr(null);
+    $("#lan-backdrop").classList.remove("hidden");
+    await refreshLan();
+    refreshLanSends();
+    findLanPeers();
+    lanLoop();
+}
+
+function closeLan() {
+    clearTimeout(lanTimer);
+    $("#lan-backdrop").classList.add("hidden");
+}
+
+$("#btn-lan").onclick = openLan;
+$("#lan-close").onclick = closeLan;
+$("#lan-done").onclick = closeLan;
+$("#lan-backdrop").onclick = (ev) => {
+    if (ev.target === ev.currentTarget) closeLan();
+};
+$("#lan-find").onclick = findLanPeers;
+$("#lan-on").onchange = async () => {
+    const on = $("#lan-on").checked;
+    try {
+        applyLanInfo(await invokeSafe("lan_configure", { enabled: on }));
+        flashStatus(on ? "receiving files on this network" : "LAN receiving off");
+    } catch (e) {
+        $("#lan-on").checked = !on;
+        lanErr(e);
+    }
+};
+$("#lan-open").onchange = async () => {
+    const open = $("#lan-open").checked;
+    if (open && !confirm("Accept files from any device on this network without the code?")) {
+        $("#lan-open").checked = false;
+        return;
+    }
+    try {
+        applyLanInfo(await invokeSafe("lan_configure", { open }));
+    } catch (e) {
+        $("#lan-open").checked = !open;
+        lanErr(e);
+    }
+};
+$("#lan-newcode").onclick = async () => {
+    try {
+        applyLanInfo(await invokeSafe("lan_new_code"));
+        flashStatus("new pairing code generated");
+    } catch (e) {
+        lanErr(e);
+    }
+};
+$("#lan-copy").onclick = () => {
+    const text = lanInfo && lanInfo.url ? lanInfo.url : "";
+    if (!text) return;
+    copyText(text)
+        .then(() => flashStatus("address copied"))
+        .catch(() => {});
+};
+$("#lan-open-dir").onclick = () => {
+    if (lanInfo && lanInfo.dir) {
+        invokeSafe("open_path", { path: lanInfo.dir }).catch((e) => lanErr(e));
+    }
+};
+$("#lan-pick").onclick = async () => {
+    lanErr(null);
+    let to = $("#lan-to").value.trim();
+    if (!to) return lanErr("pick a device above, or type its address");
+    if (!/^https?:\/\//i.test(to)) to = "http://" + to;
+    let path = null;
+    try {
+        path = await invokeSafe("pick_any_file");
+    } catch (e) {
+        return lanErr(e);
+    }
+    if (!path) return;
+    try {
+        await invokeSafe("lan_send", { url: to, code: $("#lan-send-code").value.trim(), path });
+        $("#lan-send-code").value = "";
+        await refreshLanSends();
+    } catch (e) {
+        lanErr(e);
+    }
+};
 
 document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
@@ -1343,6 +1583,7 @@ document.addEventListener("keydown", (ev) => {
         closeRefreshDialog();
         closeSettings();
         closeAbout();
+        closeLan();
         closeMenus();
     }
     if (dialogOpen()) return;

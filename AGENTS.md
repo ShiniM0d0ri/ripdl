@@ -12,9 +12,11 @@ telemetry, zero ads, forever — non-negotiable, code it into no feature.
 ## Layout
 
 - `crates/ripdl-core` — pure library: HTTP engine (probe/plan, multi-segment
-  ranges, sidecar resume, retry/backoff, cancellation), RPC protocol types.
+  ranges, sidecar resume, retry/backoff, cancellation), RPC protocol types,
+  torrent session (`torrent`), LAN drop box (`lan`: receiver, sender,
+  UDP discovery).
 - `crates/ripdl-cli` — thin CLI over core + daemon RPC (`download`, `info`,
-  `add`, `ls`, `pause`, `resume`, `rm`, `stop`).
+  `add`, `ls`, `pause`, `resume`, `rm`, `lan`, `stop`).
 - `crates/ripdl-daemon` — queue owner: persistent queue at
   `%LOCALAPPDATA%\ripdl\queue.json`, one runner per task, EMA speed tracking.
 - `docs/ROADMAP.md` — phase plan; keep checkboxes current for every
@@ -114,6 +116,7 @@ scheduler (`--after`/`--at` with delayed runner start), named pipe transport
 (pipe-first client + dual listeners; TCP kept as fallback; unix socket on
 non-Windows), daemon config file (`config.json`: max_concurrent,
 max_segments, min_segment_size, max_speed_bytes, default_download_dir,
+lan_enabled/lan_port/lan_dir/lan_open/lan_code (same-network drop box),
 bond_interfaces — NIC bonding, segments bind per uplink interface via
 `ripdl_core::engine::nic` + `Bond::Auto`/`Addresses`; per-task `--bond`),
 hunt mode (video/stream tasks via the `yt-dlp` sidecar: `add --video`,
@@ -402,3 +405,29 @@ unneeded: offer-first), named-pipe handoff for the bridge (bridge itself
 still speaks TCP), per-task quota polish, global daemon speed cap,
 magnet paused-until-pick flow (currently the add dialog resolves metadata
 before queueing; a fully paused meta-first flow would allow add-then-pick).
+v0.3.16: same-network file transfer, no new dependencies. `ripdl-core::lan`
+is a hand-rolled HTTP/1.1 drop box (the daemon binds 0.0.0.0:8463 only when
+`lan_enabled`) with a self-contained upload page for phones
+(`GET /`, `POST /api/send`, `GET /api/files`, `GET /files/<name>`,
+`GET /api/check`), a sender that streams a local file with an exact
+Content-Length, and a UDP discovery beacon on 8464. Security is a
+per-device 6-char code (ambiguous characters skipped, persisted as
+`lan_code`, rotatable) required for upload and listing unless the user
+turns on "no code" (`lan_open`) for a trusted network; names are
+sanitized to one path component inside the inbox; uploads land in a
+token-named `.part-<8hex>-<name>` (visible as `partial` rows while they
+arrive) and are renamed to a unique `name (1)` after the last byte, so two
+concurrent same-name sends cannot corrupt each other. The sender pre-checks
+the code (`/api/check`) so a wrong code fails before a multi-GB body starts.
+RPC: `LanInfo`/`LanPeers`/`LanSend`/`LanSends`/`LanSendForget`/`LanNewCode`;
+outgoing copies are progress-polled volatile entries, not queue tasks.
+`apply_lan()` rebuilds the listener live on any settings change (port,
+folder, on/off, code) with a short retry because a just-dropped listener
+releases its port a tick later. Frontends: `ripdl lan
+info|peers|send|sends|new-code|open` (send prints live progress) and the
+GUI Send & Receive dialog (toolbar paper plane / File menu): address +
+copy, code, new code, no-code toggle, inbox folder + open, received files
+with partial badges, discovered devices to fill the address, file picker,
+per-copy progress. Verified live: 5 MiB and 40 MiB copies hash-match,
+wrong code answers 403 before the body, the page never leaks the code,
+toggle off/on rebinds cleanly, discovery finds the local receiver.

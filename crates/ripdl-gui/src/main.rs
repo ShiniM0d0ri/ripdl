@@ -306,6 +306,104 @@ async fn pick_file() -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Native file picker for a LAN send (any file).
+#[tauri::command]
+async fn pick_any_file() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Choose a file to send")
+            .pick_file()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// LAN send/receive (thin wrappers over the daemon's drop box)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn lan_info() -> Result<ripdl_core::rpc::LanInfo, String> {
+    match rpc(Command::LanInfo).await? {
+        Reply::Lan { info } => Ok(info),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn lan_peers() -> Result<Vec<ripdl_core::lan::LanPeer>, String> {
+    match rpc(Command::LanPeers).await? {
+        Reply::LanPeers { peers } => Ok(peers),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn lan_send(url: String, code: String, path: String) -> Result<String, String> {
+    let cmd = Command::LanSend {
+        url,
+        code,
+        path: std::path::PathBuf::from(path),
+    };
+    match rpc(cmd).await? {
+        Reply::LanSend { id } => Ok(id),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn lan_sends() -> Result<Vec<ripdl_core::rpc::LanSendInfo>, String> {
+    match rpc(Command::LanSends).await? {
+        Reply::LanSends { sends } => Ok(sends),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn lan_forget(id: String) -> Result<(), String> {
+    expect_ok(rpc(Command::LanSendForget { id }).await?)
+}
+
+#[tauri::command]
+async fn lan_new_code() -> Result<ripdl_core::rpc::LanInfo, String> {
+    match rpc(Command::LanNewCode).await? {
+        Reply::Lan { info } => Ok(info),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+/// Toggle receiving / trusted mode by patching the live settings, then
+/// return the state the daemon actually reached (a port clash shows up as
+/// `running: false` instead of a silent lie).
+#[tauri::command]
+async fn lan_configure(
+    enabled: Option<bool>,
+    open: Option<bool>,
+) -> Result<ripdl_core::rpc::LanInfo, String> {
+    let mut settings = match rpc(Command::GetConfig).await? {
+        Reply::Config { settings, .. } => settings,
+        other => return Err(format!("unexpected daemon reply: {other:?}")),
+    };
+    if let Some(v) = enabled {
+        settings.lan_enabled = Some(v);
+    }
+    if let Some(v) = open {
+        settings.lan_open = Some(v);
+    }
+    match rpc(Command::SetConfig { settings }).await? {
+        Reply::Config { .. } => {}
+        Reply::Error { message } => return Err(message),
+        other => return Err(format!("unexpected daemon reply: {other:?}")),
+    }
+    lan_info().await
+}
+
 /// Files/peers/trackers snapshot for one torrent task.
 #[tauri::command]
 async fn torrent_details(id: String) -> Result<ripdl_core::torrent::TorrentDetailsSnapshot, String> {
@@ -571,6 +669,14 @@ fn main() {
             remove_task,
             pick_dir,
             pick_file,
+            pick_any_file,
+            lan_info,
+            lan_peers,
+            lan_send,
+            lan_sends,
+            lan_forget,
+            lan_new_code,
+            lan_configure,
             torrent_details,
             task_details,
             refresh_url,

@@ -379,6 +379,35 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
 - [ ] Diagnostics: every failed task exposes a reason + "copy diagnostics"
       (URL, headers without secrets, last error)
 
+## P9 - same-network transfer (LAN drop box)
+
+- [x] `ripdl-core::lan`: a self-contained HTTP/1.1 drop box (no new crates)
+      with a phone-friendly page at `http://<lan-ip>:<port>/`,
+      `POST /api/send` (exact Content-Length, streamed into a token-named
+      `.part` and renamed on the last byte), `GET /api/files`,
+      `GET /files/<name>`, `GET /api/check`. Uploads need the device code
+      unless "no code" (trusted network) is on; names are sanitized to a
+      single path component inside the inbox; concurrent same-name uploads
+      become `name (1)`; in-flight uploads are listed as partial rows.
+- [x] Sender + discovery: `send_file` pre-checks the code (a wrong code
+      fails before a multi-GB body starts) and reports `(sent, total)`;
+      a UDP beacon on 8464 answers with name/URL/open-mode;
+      `lan_ipv4()` prefers the default-route interface.
+- [x] Daemon: `lan_enabled`/`lan_port`/`lan_dir`/`lan_open`/`lan_code` in
+      config.json, receiver started at boot and rebuilt live on a settings
+      change (port, folder, on/off, code), RPC `LanInfo`, `LanPeers`,
+      `LanSend`, `LanSends`, `LanSendForget`, `LanNewCode`. Outgoing copies
+      are progress-polled, volatile (not queue tasks).
+- [x] CLI: `ripdl lan info|peers|send|sends|new-code|open` with live send
+      progress, plus `config lan_enabled=true ...` for one-line setup.
+- [x] GUI: toolbar paper-plane / File menu opens Send & Receive (address,
+      code + copy, new code, no-code toggle, folder + open, received files
+      with partial badges, discovered devices, file picker, per-copy
+      progress).
+- [ ] Backlog: accept prompt for incoming files (LocalSend-style), QR code
+      for phones, resumable/chunked uploads, mDNS/DNS-SD instead of the
+      custom beacon, per-device pairing instead of one shared code.
+
 ## Packaging / reach (backlog)
 
 - [ ] winget / scoop / Homebrew, AUR

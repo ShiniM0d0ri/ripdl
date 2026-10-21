@@ -11,7 +11,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ripdl_core::rpc::{
-    Command, Reply, Request, Response, TaskDetailsSnapshot, TaskInfo, DEFAULT_PORT,
+    Command, LanInfo, LanSendInfo, Reply, Request, Response, TaskDetailsSnapshot, TaskInfo,
+    DEFAULT_PORT,
 };
 use ripdl_core::task::{Progress, TaskKind, TaskState};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
@@ -153,6 +154,24 @@ struct Daemon {
     sem: Arc<tokio::sync::Semaphore>,
     /// Set during an install fetch (concurrent ones would share a .part).
     update_busy: std::sync::atomic::AtomicBool,
+    /// LAN drop box listener. Dropped (tasks aborted) whenever receiving is
+    /// turned off, re-ported or re-pointed at another folder.
+    lan: tokio::sync::Mutex<Option<ripdl_core::lan::LanServer>>,
+    /// Outgoing LAN copies, newest last. Volatile: a LAN copy is not a queue
+    /// task, so a daemon restart simply forgets finished ones.
+    lan_sends: Mutex<Vec<Arc<Mutex<LanSendState>>>>,
+}
+
+/// Live state of one outgoing LAN copy.
+struct LanSendState {
+    id: String,
+    name: String,
+    peer: String,
+    path: PathBuf,
+    total: u64,
+    sent: u64,
+    done: bool,
+    error: Option<String>,
 }
 
 /// Daemon policy from `<data_dir>/config.json`. Shared type with all
@@ -190,6 +209,8 @@ impl Daemon {
             shutdown: tokio::sync::Notify::new(),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
+            lan: tokio::sync::Mutex::new(None),
+            lan_sends: Mutex::new(Vec::new()),
         })
     }
 
@@ -823,7 +844,266 @@ impl Daemon {
             Command::SetConfig { settings } => self.cmd_set_config(req.id, settings).await,
             Command::CheckUpdate => self.cmd_check_update(req.id).await,
             Command::UpdateInstall => self.cmd_update_install(req.id, false).await,
+            Command::LanInfo => self.cmd_lan_info(req.id).await,
+            Command::LanPeers => self.cmd_lan_peers(req.id).await,
+            Command::LanSend { url, code, path } => {
+                self.cmd_lan_send(req.id, url, code, path).await
+            }
+            Command::LanSends => self.cmd_lan_sends(req.id),
+            Command::LanSendForget { id } => self.cmd_lan_forget(req.id, &id),
+            Command::LanNewCode => self.cmd_lan_new_code(req.id).await,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // LAN transfer (send/receive files on the same network)
+    // -----------------------------------------------------------------
+
+    /// Receive folder: explicit setting, else `<Downloads>/ripdl-inbox`,
+    /// else under the data directory when the shell has no Downloads.
+    fn lan_dir(&self) -> PathBuf {
+        if let Some(dir) = self.conf().lan_dir {
+            return dir;
+        }
+        dirs::download_dir()
+            .map(|d| d.join("ripdl-inbox"))
+            .unwrap_or_else(|| {
+                self.queue_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("lan-inbox")
+            })
+    }
+
+    /// Name the other device sees ("DESKTOP-XXXX" by default).
+    fn device_name() -> String {
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "ripdl".to_string())
+    }
+
+    /// (Re)start or stop the drop box so it matches the live settings.
+    /// Called at boot, from SetConfig and from LanNewCode.
+    async fn apply_lan(self: &Arc<Self>) {
+        // Stop first: the port may be changing and a listener cannot share
+        // it. Dropping the server aborts its accept/discovery tasks.
+        self.lan.lock().await.take();
+        let conf = self.conf();
+        if !conf.lan_enabled() {
+            return;
+        }
+        let dir = self.lan_dir();
+        let code = match conf.lan_code.clone().filter(|c| !c.is_empty()) {
+            Some(code) => code,
+            None => {
+                let code = ripdl_core::lan::generate_code();
+                {
+                    let mut cfg = self.config.lock().unwrap();
+                    cfg.lan_code = Some(code.clone());
+                    let snapshot = cfg.clone();
+                    drop(cfg);
+                    if let Err(e) = snapshot.save(&self.config_path) {
+                        tracing::warn!(error = %e, "cannot persist the LAN code");
+                    }
+                }
+                code
+            }
+        };
+        let cfg = ripdl_core::lan::LanConfig {
+            host: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: conf.lan_port(),
+            dir,
+            code,
+            open: conf.lan_open(),
+            name: Self::device_name(),
+        };
+        // A just-dropped listener releases its port on the next scheduler
+        // tick; retry briefly instead of losing the feature to that race.
+        let mut last_err = None;
+        for attempt in 0..10 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            match ripdl_core::lan::LanServer::start(cfg.clone()).await {
+                Ok(server) => {
+                    tracing::info!(
+                        url = server.url(),
+                        dir = %cfg.dir.display(),
+                        open = cfg.open,
+                        "lan receiver listening"
+                    );
+                    *self.lan.lock().await = Some(server);
+                    return;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        tracing::warn!(
+            error = %last_err.map(|e| e.to_string()).unwrap_or_default(),
+            port = cfg.port,
+            "lan receiver could not start (port in use?)"
+        );
+    }
+
+    async fn cmd_lan_info(self: &Arc<Self>, req_id: u64) -> Response {
+        let conf = self.conf();
+        let dir = self.lan_dir();
+        let (running, url, port) = {
+            let server = self.lan.lock().await;
+            match server.as_ref() {
+                Some(s) => (true, s.url().to_string(), s.port()),
+                None => (false, String::new(), conf.lan_port()),
+            }
+        };
+        let files = ripdl_core::lan::files(&dir).await;
+        Response {
+            id: req_id,
+            reply: Reply::Lan {
+                info: LanInfo {
+                    enabled: conf.lan_enabled(),
+                    running,
+                    url,
+                    port,
+                    code: conf.lan_code.clone().unwrap_or_default(),
+                    open: conf.lan_open(),
+                    dir,
+                    files,
+                },
+            },
+        }
+    }
+
+    async fn cmd_lan_peers(self: &Arc<Self>, req_id: u64) -> Response {
+        let peers = ripdl_core::lan::discover(Duration::from_millis(1200)).await;
+        Response {
+            id: req_id,
+            reply: Reply::LanPeers { peers },
+        }
+    }
+
+    async fn cmd_lan_send(
+        self: &Arc<Self>,
+        req_id: u64,
+        url: String,
+        code: String,
+        path: PathBuf,
+    ) -> Response {
+        let err = |m: String| Response {
+            id: req_id,
+            reply: Reply::Error { message: m },
+        };
+        let url = url.trim().trim_end_matches('/').to_string();
+        if url.is_empty() {
+            return err("empty receiver address".into());
+        }
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(m) if m.is_file() => m,
+            Ok(_) => return err(format!("not a file: {}", path.display())),
+            Err(e) => return err(format!("cannot read {}: {e}", path.display())),
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        let id = uuid::Uuid::new_v4().to_string();
+        let state = Arc::new(Mutex::new(LanSendState {
+            id: id.clone(),
+            name,
+            peer: url.clone(),
+            path: path.clone(),
+            total: meta.len(),
+            sent: 0,
+            done: false,
+            error: None,
+        }));
+        {
+            let mut sends = self.lan_sends.lock().unwrap();
+            sends.push(state.clone());
+            // The list is a progress view, not a log: keep the last 20.
+            let excess = sends.len().saturating_sub(20);
+            sends.drain(..excess);
+        }
+        let st = state.clone();
+        tokio::spawn(async move {
+            let cfg = ripdl_core::lan::SendConfig { url, code, path };
+            let progress = {
+                let st = st.clone();
+                move |sent, total| {
+                    if let Ok(mut s) = st.lock() {
+                        s.sent = sent;
+                        s.total = total;
+                    }
+                }
+            };
+            let result = ripdl_core::lan::send_file(&cfg, progress).await;
+            if let Ok(mut s) = st.lock() {
+                s.done = true;
+                match result {
+                    Ok(stored) => s.name = stored,
+                    Err(e) => s.error = Some(e.to_string()),
+                }
+            }
+        });
+        Response {
+            id: req_id,
+            reply: Reply::LanSend { id },
+        }
+    }
+
+    fn cmd_lan_sends(&self, req_id: u64) -> Response {
+        let sends = self
+            .lan_sends
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s.lock().ok().map(|s| LanSendInfo {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                peer: s.peer.clone(),
+                path: s.path.clone(),
+                total: s.total,
+                sent: s.sent,
+                done: s.done,
+                error: s.error.clone(),
+            }))
+            .collect();
+        Response {
+            id: req_id,
+            reply: Reply::LanSends { sends },
+        }
+    }
+
+    fn cmd_lan_forget(&self, req_id: u64, id: &str) -> Response {
+        self.lan_sends.lock().unwrap().retain(|s| {
+            s.lock().map(|s| s.id != id).unwrap_or(false)
+        });
+        Response {
+            id: req_id,
+            reply: Reply::Ok,
+        }
+    }
+
+    async fn cmd_lan_new_code(self: &Arc<Self>, req_id: u64) -> Response {
+        let code = ripdl_core::lan::generate_code();
+        {
+            let mut cfg = self.config.lock().unwrap();
+            cfg.lan_code = Some(code);
+            let snapshot = cfg.clone();
+            drop(cfg);
+            if let Err(e) = snapshot.save(&self.config_path) {
+                return Response {
+                    id: req_id,
+                    reply: Reply::Error {
+                        message: format!("saving config failed: {e}"),
+                    },
+                };
+            }
+        }
+        self.apply_lan().await;
+        self.cmd_lan_info(req_id).await
     }
 
     fn cmd_get_config(self: &Arc<Self>, req_id: u64) -> Response {
@@ -970,6 +1250,13 @@ impl Daemon {
         }
         let old_max = self.conf().max_concurrent();
         let seed_before = self.conf().seed_enabled();
+        let lan_before = (
+            self.conf().lan_enabled(),
+            self.conf().lan_port(),
+            self.lan_dir(),
+            self.conf().lan_open(),
+            self.conf().lan_code.clone(),
+        );
         *self.config.lock().unwrap() = settings;
         let new_max = self.conf().max_concurrent();
         match new_max.checked_sub(old_max) {
@@ -1030,6 +1317,16 @@ impl Daemon {
                     }
                 }
             }
+        }
+        let lan_after = (
+            self.conf().lan_enabled(),
+            self.conf().lan_port(),
+            self.lan_dir(),
+            self.conf().lan_open(),
+            self.conf().lan_code.clone(),
+        );
+        if lan_before != lan_after {
+            self.apply_lan().await;
         }
         Response {
             id: req_id,
@@ -2658,6 +2955,9 @@ async fn real_main() -> Result<()> {
     let config = DaemonConfig::load(&config_path);
     let daemon = Arc::new(Daemon::new(queue_path, config_path, config).context("init daemon")?);
     daemon.boot_resume().context("resume queue")?;
+    // LAN drop box: bind only when the user turned receiving on. A port
+    // clash logs a warning and leaves the rest of the daemon working.
+    daemon.apply_lan().await;
     // Fastresume cache hygiene: drop bitfields for tasks that are gone.
     daemon.prune_fastresume();
     // Re-attach completed/paused torrents in the background: this is what

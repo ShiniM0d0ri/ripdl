@@ -542,3 +542,84 @@ body.drop-target::after {
     font-weight: 600;
 }
 #set-err { color: #c23b3b; font-size: 12px; }
+
+/* Send / receive on the local network */
+#lan-backdrop {
+    position: fixed; inset: 0; z-index: 80;
+    background: #0006;
+    display: flex; align-items: center; justify-content: center;
+}
+#lan {
+    background: #fff; border: 1px solid #c3c9cf; border-radius: 6px;
+    box-shadow: 0 12px 40px #0005;
+    width: min(640px, 94vw); max-height: 88vh; overflow: auto;
+    display: flex; flex-direction: column;
+    padding: 14px 16px; gap: 10px;
+}
+#lan-close {
+    border: none; background: none; font-size: 18px; cursor: pointer; color: #667;
+    padding: 0 6px; border-radius: 4px; margin-left: auto;
+}
+#lan-close:hover { background: #eef1f4; }
+#lan-body { display: flex; flex-direction: column; gap: 10px; }
+.lan-card {
+    border: 1px solid #e3e6ea; border-radius: 6px; padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 7px;
+}
+.lan-head { display: flex; align-items: center; gap: 10px; }
+.lan-head strong { font-size: 13px; color: #2c3540; flex: 1; }
+.lan-head .chk { font-size: 12px; color: #39424c; display: flex; align-items: center; gap: 5px; }
+.lan-row { display: flex; align-items: center; gap: 8px; }
+.lan-label { width: 62px; font-size: 12px; color: #55606b; flex: none; }
+.lan-row input[type=text] {
+    flex: 1; padding: 5px 8px; border: 1px solid #c3c9cf; border-radius: 4px;
+    font: 12px "Segoe UI", sans-serif; color: inherit; user-select: text;
+}
+.lan-row button, .lan-head button {
+    padding: 4px 10px; border-radius: 4px; border: 1px solid #c3c9cf;
+    background: linear-gradient(#fdfdfd, #eef0f2); cursor: pointer; font: inherit;
+    white-space: nowrap; display: inline-flex; align-items: center; gap: 5px;
+}
+.lan-row button.primary {
+    background: linear-gradient(#3f8dca, #2f6fa5); color: #fff; border-color: #2f6fa5;
+    font-weight: 600;
+}
+.lan-row button .ico, .lan-head button .ico { width: 13px; height: 13px; }
+.lan-code {
+    font: 12px "Consolas", monospace; background: #f2f5f8; border-radius: 4px;
+    padding: 3px 7px; user-select: text; color: #22303c; flex: 1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lan-code-big { font-size: 15px; letter-spacing: .14em; font-weight: 600; flex: none; }
+.lan-path {
+    font-size: 11.5px; color: #55606b; flex: 1; user-select: text;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lan-sub {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    color: #78838f; margin-top: 2px;
+}
+.lan-files, .lan-sends, .lan-peers { display: flex; flex-direction: column; gap: 3px; max-height: 150px; overflow: auto; }
+.lan-file, .lan-send, .lan-peer {
+    display: flex; align-items: center; gap: 8px; padding: 3px 0;
+    border-top: 1px solid #f2f4f6; font-size: 12px; color: #33404b;
+}
+.lan-file:first-child, .lan-send:first-child, .lan-peer:first-child { border-top: none; }
+.lan-file .lan-name, .lan-send .lan-name, .lan-peer .lan-name {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lan-file .lan-size, .lan-send .lan-size { color: #78838f; font-size: 11px; }
+.lan-file button, .lan-peer button, .lan-send button {
+    padding: 2px 8px; border-radius: 4px; border: 1px solid #c3c9cf;
+    background: #f7f9fa; cursor: pointer; font: 11px "Segoe UI", sans-serif;
+}
+.lan-peer { cursor: pointer; }
+.lan-peer:hover { background: #f4f8fb; }
+.lan-peer .lan-url { color: #78838f; font: 11px Consolas, monospace; }
+.lan-hint { font-size: 11.5px; color: #78838f; }
+.lan-hint.ok { color: #1a7f37; }
+.lan-hint.warn { color: #b26b00; }
+.lan-bar { height: 4px; border-radius: 2px; background: #e7ebef; overflow: hidden; width: 90px; flex: none; }
+.lan-bar > i { display: block; height: 100%; background: #2f6fa5; }
+.lan-send.err .lan-name { color: #b02a2a; }
+#lan-err { color: #c23b3b; font-size: 12px; }

@@ -56,6 +56,24 @@ pub struct DaemonSettings {
     /// Stop seeding after this many minutes (`0` = unlimited). Default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_time_min: Option<u32>,
+    /// Accept files from other devices on the local network (the LAN drop
+    /// box). Default off: a network-facing listener is an explicit opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_enabled: Option<bool>,
+    /// TCP port for the drop box (default 8463).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_port: Option<u16>,
+    /// Receive folder (default `<Downloads>/ripdl-inbox`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_dir: Option<PathBuf>,
+    /// Trusted-network mode: accept uploads without the pairing code.
+    /// Default off (the code is what keeps a cafe Wi-Fi out of the inbox).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_open: Option<bool>,
+    /// Pairing code for this device. Generated on first enable and kept so
+    /// paired devices keep working across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_code: Option<String>,
 }
 
 impl DaemonSettings {
@@ -143,6 +161,21 @@ impl DaemonSettings {
         self.seed_time_min.unwrap_or(0)
     }
 
+    /// LAN receive on/off (default off).
+    pub fn lan_enabled(&self) -> bool {
+        self.lan_enabled.unwrap_or(false)
+    }
+
+    /// Drop-box port (default 8463).
+    pub fn lan_port(&self) -> u16 {
+        self.lan_port.unwrap_or(crate::lan::DEFAULT_PORT)
+    }
+
+    /// Trusted-network mode (no code; default off).
+    pub fn lan_open(&self) -> bool {
+        self.lan_open.unwrap_or(false)
+    }
+
     /// Apply a partial update: every `Some(x)` in `patch` wins; `None`
     /// leaves the current value untouched. Useful for CLI-style
     /// single-key edits on top of the live values.
@@ -185,6 +218,21 @@ impl DaemonSettings {
         }
         if patch.seed_time_min.is_some() {
             self.seed_time_min = patch.seed_time_min;
+        }
+        if patch.lan_enabled.is_some() {
+            self.lan_enabled = patch.lan_enabled;
+        }
+        if patch.lan_port.is_some() {
+            self.lan_port = patch.lan_port;
+        }
+        if patch.lan_dir.is_some() {
+            self.lan_dir = patch.lan_dir;
+        }
+        if patch.lan_open.is_some() {
+            self.lan_open = patch.lan_open;
+        }
+        if patch.lan_code.is_some() {
+            self.lan_code = patch.lan_code;
         }
     }
 }
@@ -276,6 +324,26 @@ pub enum Command {
     SetConfig {
         settings: DaemonSettings,
     },
+    /// Receiving state: URL, pairing code, inbox path and its contents.
+    LanInfo,
+    /// Ask the LAN who is receiving (UDP broadcast, ~1 s).
+    LanPeers,
+    /// Copy one local file to another ripdl (or browser) on this network.
+    /// Returns a send id; progress is polled with `LanSends`.
+    LanSend {
+        url: String,
+        #[serde(default)]
+        code: String,
+        path: PathBuf,
+    },
+    /// In-flight and recent outgoing LAN copies.
+    LanSends,
+    /// Forget one finished send entry.
+    LanSendForget {
+        id: String,
+    },
+    /// Rotate this device's pairing code (paired devices must re-enter it).
+    LanNewCode,
     Shutdown,
 }
 
@@ -334,10 +402,66 @@ pub enum Reply {
     Update {
         info: crate::update::UpdateInfo,
     },
+    /// Receiver status + inbox listing.
+    Lan {
+        info: LanInfo,
+    },
+    /// Receivers discovered on the local network.
+    LanPeers {
+        peers: Vec<crate::lan::LanPeer>,
+    },
+    /// Accepted a LAN copy; poll progress with `LanSends`.
+    LanSend {
+        id: String,
+    },
+    /// Outgoing LAN copies (newest last).
+    LanSends {
+        sends: Vec<LanSendInfo>,
+    },
     Ok,
     Error {
         message: String,
     },
+}
+
+/// Receiver status shown by every frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanInfo {
+    /// The setting (may be on while `running` is false after a port clash).
+    pub enabled: bool,
+    pub running: bool,
+    /// Base URL other devices should use (empty while not running).
+    #[serde(default)]
+    pub url: String,
+    pub port: u16,
+    /// Pairing code for this device (empty when none was generated yet).
+    #[serde(default)]
+    pub code: String,
+    /// Trusted-network mode: no code required.
+    #[serde(default)]
+    pub open: bool,
+    /// Receive folder (created on first enable).
+    #[serde(default)]
+    pub dir: PathBuf,
+    /// Files currently in the receive folder, newest first.
+    #[serde(default)]
+    pub files: Vec<crate::lan::LanFile>,
+}
+
+/// One outgoing LAN copy (volatile: LAN sends are not queue tasks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanSendInfo {
+    pub id: String,
+    /// File name (updated to the name the receiver stored it under).
+    pub name: String,
+    /// Receiver base URL.
+    pub peer: String,
+    pub path: PathBuf,
+    pub total: u64,
+    pub sent: u64,
+    pub done: bool,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Serializable view of one task for frontends.
