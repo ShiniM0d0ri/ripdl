@@ -117,12 +117,46 @@ struct ProgressTrack {
     /// `(when, cumulative bytes)` samples inside the rate window. A sliding
     /// window over real elapsed time beats a per-tick delta: tick jitter and
     /// short bursts (a stalled link catching up) otherwise read as GB/s
-    /// spikes followed by hard zeros.
+    /// spikes followed by hard zeros. Torrents use a longer span
+    /// (`TORRENT_RATE_WINDOW`) because pieces land in bursts.
     window: VecDeque<(Instant, u64)>,
 }
 
 /// Speed is averaged over this much wall time (>= 2 samples).
 const RATE_WINDOW: Duration = Duration::from_secs(2);
+/// Torrents arrive in piece-sized bursts and rqbit's own estimator is a
+/// short-interval number, so a 2 s readout flaps between 0 and peak. Average
+/// over a longer span instead: still bytes-moved-over-elapsed, just settled
+/// (what mature clients show).
+const TORRENT_RATE_WINDOW: Duration = Duration::from_secs(6);
+
+/// Push one `(now, cumulative bytes)` sample, dropping what fell out of the
+/// window. A gap longer than the window (pause, suspend, a recheck) starts a
+/// fresh baseline instead of reporting a rate across dead time.
+fn push_rate_sample(
+    window: &mut VecDeque<(Instant, u64)>,
+    now: Instant,
+    bytes: u64,
+    span: Duration,
+) {
+    if let Some(&(t, _)) = window.back() {
+        if now.duration_since(t) > span {
+            window.clear();
+        }
+    }
+    window.push_back((now, bytes));
+    while window.len() > 2 && now.duration_since(window[0].0) > span {
+        window.pop_front();
+    }
+}
+
+/// Bytes moved across the window. Under half a second the delta is too
+/// bursty to display.
+fn window_rate(window: &VecDeque<(Instant, u64)>) -> Option<f64> {
+    let (&(t0, b0), &(t1, b1)) = (window.front()?, window.back()?);
+    let dt = t1.duration_since(t0).as_secs_f64();
+    (dt >= 0.5).then(|| ((b1.saturating_sub(b0)) as f64 / dt).clamp(0.0, 1.0e12))
+}
 
 struct Daemon {
     port: u16,
@@ -2362,6 +2396,15 @@ impl Daemon {
         if let Some(dest) = p.dest_file.clone() {
             self.adopt_dest_file(id, dest);
         }
+        // Kind lookup happens before the progress lock (adopt_dest_file above
+        // already took the records lock): nesting the two in the opposite
+        // order would invite a deadlock.
+        let is_torrent = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.id == id && r.kind == TaskKind::Torrent);
         let mut map = self.progress.lock().unwrap();
         let now = Instant::now();
         // or_insert_with clones Progress only on the first tick per task;
@@ -2382,26 +2425,32 @@ impl Daemon {
             entry.last = p;
             return;
         }
-        entry.window.push_back((now, p.downloaded));
-        // Keep ~2 s of samples (never fewer than two, so a fresh task still
-        // gets a span once its second tick lands).
-        while entry.window.len() > 2
-            && now.duration_since(entry.window[0].0) > RATE_WINDOW
-        {
-            entry.window.pop_front();
-        }
-        let rate = match (entry.window.front(), entry.window.back()) {
-            (Some(&(t0, b0)), Some(&(t1, b1))) => {
-                let dt = t1.duration_since(t0).as_secs_f64();
-                // Under half a second the delta is too bursty to display.
-                (dt >= 0.5).then(|| ((b1.saturating_sub(b0)) as f64 / dt).clamp(0.0, 1.0e12))
-            }
-            _ => None,
+        let span = if is_torrent {
+            TORRENT_RATE_WINDOW
+        } else {
+            RATE_WINDOW
         };
-        // Torrents carry librqbit's own smoothed rate; prefer it (adopted
-        // bytes on resume would otherwise look like a burst). HTTP samples
-        // leave `speed_bps` None and use the window.
-        entry.speed = p.speed_bps.or(rate);
+        push_rate_sample(&mut entry.window, now, p.downloaded, span);
+        let rate = window_rate(&entry.window);
+        // Torrents: the derived window beats rqbit's short-interval number
+        // (the row used to flap between 0 B/s and peak), so use it and fall
+        // back to the tool rate until two samples span enough time. HTTP
+        // keeps the old preference (the engine reports its own window).
+        entry.speed = if is_torrent {
+            rate.or(p.speed_bps)
+        } else {
+            p.speed_bps.or(rate)
+        };
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                id,
+                torrent = is_torrent,
+                downloaded = p.downloaded,
+                shown_bps = entry.speed,
+                tool_bps = p.speed_bps,
+                "progress sample"
+            );
+        }
         entry.last = p;
     }
 
@@ -2937,6 +2986,67 @@ mod tests {
         }
         session.raw().stop().await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Torrent rows used to flap between 0 B/s and peak because librqbit's
+    // estimator is a short-interval number; the derived window over a longer
+    // span is what the row shows now.
+    #[test]
+    fn torrent_rate_window_needs_two_samples() {
+        let t0 = Instant::now();
+        let mut w = VecDeque::new();
+        push_rate_sample(&mut w, t0, 1_000, TORRENT_RATE_WINDOW);
+        assert_eq!(window_rate(&w), None, "one sample has no span");
+
+        push_rate_sample(&mut w, t0 + Duration::from_secs(2), 3_000, TORRENT_RATE_WINDOW);
+        let r = window_rate(&w).expect("two samples over 2 s");
+        assert!((r - 1_000.0).abs() < 1.0, "rate {r}");
+    }
+
+    #[test]
+    fn torrent_rate_window_smooths_across_samples() {
+        let t0 = Instant::now();
+        let mut w = VecDeque::new();
+        // A bursty swarm: 300 KiB, 2.1 MiB, 0, 900 KiB on 2 s ticks.
+        for (i, bytes) in [0u64, 300, 2_400, 2_400, 3_300].iter().enumerate() {
+            push_rate_sample(
+                &mut w,
+                t0 + Duration::from_secs(i as u64 * 2),
+                bytes * 1024,
+                TORRENT_RATE_WINDOW,
+            );
+        }
+        // 3.0 MiB moved over the last 6 s (500 KiB/s), not "0 B/s" - which is
+        // what the raw last tick reported.
+        let r = window_rate(&w).expect("windowed rate");
+        assert!((r - 500.0 * 1024.0).abs() < 2_000.0, "rate {r}");
+    }
+
+    #[test]
+    fn rate_window_restarts_after_a_gap() {
+        let t0 = Instant::now();
+        let mut w = VecDeque::new();
+        push_rate_sample(&mut w, t0, 0, TORRENT_RATE_WINDOW);
+        push_rate_sample(&mut w, t0 + Duration::from_secs(2), 2_000, TORRENT_RATE_WINDOW);
+        // 60 s pause: the stale sample must not stretch the jump over a
+        // minute (the row would read a fraction of the truth for a tick).
+        push_rate_sample(&mut w, t0 + Duration::from_secs(62), 5_000, TORRENT_RATE_WINDOW);
+        assert_eq!(w.len(), 1, "gap starts a fresh baseline");
+        assert_eq!(window_rate(&w), None);
+
+        push_rate_sample(&mut w, t0 + Duration::from_secs(64), 7_000, TORRENT_RATE_WINDOW);
+        let r = window_rate(&w).expect("rate after the gap");
+        assert!((r - 1_000.0).abs() < 1.0, "rate {r}");
+    }
+
+    #[test]
+    fn rate_window_stays_bounded() {
+        let t0 = Instant::now();
+        let mut w = VecDeque::new();
+        for i in 0..12u64 {
+            push_rate_sample(&mut w, t0 + Duration::from_secs(i * 2), i * 1_000, RATE_WINDOW);
+        }
+        assert!(w.len() <= 2, "2 s window keeps at most two samples, got {}", w.len());
     }
 }
 

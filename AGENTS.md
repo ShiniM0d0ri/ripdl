@@ -453,4 +453,12 @@ first-timer README with real screenshots and a bonding diagram, and a
 Windows-CI gate for the LSD-only torrent loopback test (the runner blocks
 that multicast; the ubuntu job still runs it). No RPC changes beyond
 v0.3.16, so 0.3.16 frontends work against a 0.4.0 daemon.
+On main after v0.4.0: torrent rows show a 6 s sliding rate
+(`TORRENT_RATE_WINDOW`) instead of librqbit's short-interval number, which
+flapped between 0 B/s and peak on every tick. The sample pipeline is now
+`push_rate_sample`/`window_rate` (pure, unit-tested, restarts the window after
+a pause-sized gap); HTTP tasks keep the 2 s window, and
+`RUST_LOG=ripdl_daemon=debug` logs one line per sample (shown rate, tool rate)
+for jitter reports. The Settings toolbar button is a real cog (`#i-gear`); the
+unused `#i-sliders` sprite entry is gone.
 
