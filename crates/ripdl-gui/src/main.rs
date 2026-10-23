@@ -546,18 +546,63 @@ async fn bond_state() -> Result<BondState, String> {
             settings,
             torrent_session,
             torrent_bind,
+            torrent_rates,
+            torrent_unreachable,
+            ..
         } => {
             let bind: Vec<std::net::IpAddr> = torrent_bind
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect();
+            let mut text = ripdl_core::engine::describe_torrent_bond(
+                settings.bond_interfaces(),
+                torrent_session,
+                &bind,
+            );
+            // Measured per-uplink throughput: the reason a slow tether gets
+            // skipped ("Wi-Fi 7.0 MB/s, Ethernet 2 idle").
+            if torrent_session && !torrent_rates.is_empty() {
+                let nics = ripdl_core::engine::bonded_nics();
+                // Fold v4+v6 of the same interface into one number.
+                let mut merged: Vec<(String, f64)> = Vec::new();
+                for (ip, rate) in &torrent_rates {
+                    let addr: Option<std::net::IpAddr> = ip.parse().ok();
+                    let name = addr
+                        .and_then(|a| {
+                            nics.iter()
+                                .find(|n| {
+                                    std::net::IpAddr::V4(n.addr) == a
+                                        || n.v6.map(std::net::IpAddr::V6) == Some(a)
+                                })
+                                .map(|n| n.name.clone())
+                        })
+                        .unwrap_or_else(|| ip.clone());
+                    match merged.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, r)) => *r += *rate,
+                        None => merged.push((name, *rate)),
+                    }
+                }
+                let parts: Vec<String> = merged
+                    .iter()
+                    .map(|(name, rate)| {
+                        if *rate < 1024.0 {
+                            format!("{name} idle")
+                        } else {
+                            format!("{name} {:.1} MB/s", rate / 1_048_576.0)
+                        }
+                    })
+                    .collect();
+                text = format!("{text} \u{2014} {}", parts.join(" \u{00b7} "));
+            }
+            if !torrent_unreachable.is_empty() {
+                text = format!(
+                    "{text} \u{2014} skipped {} (no working path)",
+                    torrent_unreachable.join(", ")
+                );
+            }
             Ok(BondState {
                 active: torrent_session && !bind.is_empty(),
-                text: ripdl_core::engine::describe_torrent_bond(
-                    settings.bond_interfaces(),
-                    torrent_session,
-                    &bind,
-                ),
+                text,
             })
         }
         other => Err(format!("unexpected daemon reply: {other:?}")),

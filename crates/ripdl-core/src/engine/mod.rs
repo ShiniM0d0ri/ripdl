@@ -13,7 +13,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-pub use nic::{bonded_nics, UplinkNic};
+pub use nic::{bonded_nics, live_bonded_nics, scan_uplinks, UplinkNic, UplinkScan};
 pub use planner::{percent_decode_lossy, PlanInfo};
 
 use crate::error::{Error, Result};
@@ -67,19 +67,26 @@ pub fn describe_torrent_bond(configured: bool, session: bool, bind: &[IpAddr]) -
         return "enabled - applies when the torrent session starts".to_string();
     }
     if bind.is_empty() {
-        return "enabled, but the running session is not bonded - restart the daemon".to_string();
+        return "enabled - no uplink bound yet, it follows the network".to_string();
     }
     let nics = bonded_nics();
     let names: Vec<String> = bind
         .iter()
         .map(|ip| {
             nics.iter()
-                .find(|n| IpAddr::V4(n.addr) == *ip)
+                .find(|n| IpAddr::V4(n.addr) == *ip || n.v6.map(IpAddr::V6) == Some(*ip))
                 .map(|n| n.name.clone())
                 .unwrap_or_else(|| ip.to_string())
         })
         .collect();
-    format!("active on {}", names.join(", "))
+    // One interface contributes up to two bound addresses; name it once.
+    let mut unique: Vec<String> = Vec::new();
+    for n in names {
+        if !unique.contains(&n) {
+            unique.push(n);
+        }
+    }
+    format!("active on {}", unique.join(", "))
 }
 
 /// Tunables for the download engine.
@@ -873,7 +880,9 @@ mod tests {
         assert_eq!(describe_torrent_bond(false, true, &[]), "off");
         assert!(describe_torrent_bond(false, true, &one).contains("still bonded"));
         assert!(describe_torrent_bond(true, false, &[]).contains("when the torrent session starts"));
-        assert!(describe_torrent_bond(true, true, &[]).contains("restart the daemon"));
+        // Bonding is hot-swappable now, so "enabled but nothing bound" is the
+        // transient "no uplink yet" state, not a restart prompt.
+        assert!(describe_torrent_bond(true, true, &[]).contains("follows the network"));
         assert!(describe_torrent_bond(true, true, &one).starts_with("active on"));
     }
 }

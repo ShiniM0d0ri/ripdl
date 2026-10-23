@@ -10,7 +10,7 @@
   <svg class="sprite" aria-hidden="true" focusable="false">
     <defs>
       <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
-      <symbol id="i-magnet" viewBox="0 0 24 24"><path d="M6 4v11a6 6 0 0 0 12 0V4h-4v11a2 2 0 0 1-4 0V4z"/></symbol>
+      <symbol id="i-tfile" viewBox="0 0 24 24"><path d="M6.5 3.5h7.5L18 7.5v13H6.5z"/><path d="M14 3.5v4h4"/><path d="M12.2 11.4v5.4"/><path d="M9.6 14.2l2.6 2.6 2.6-2.6"/></symbol>
       <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></symbol>
       <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
       <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
@@ -40,7 +40,7 @@
     </defs>
   </svg>
   <div id="menubar">
-    <span data-menu="file">File</span><span data-menu="tasks">Tasks</span><span data-menu="help">Help</span>
+    <span data-menu="file">File</span><span data-menu="tasks">Tasks</span><span data-menu="view">View</span><span data-menu="help">Help</span>
   </div>
   <div id="menudrop" class="hidden"></div>
 
@@ -48,8 +48,8 @@
     <button id="btn-add" class="tb-btn" title="Add URL (Ctrl+N)" aria-label="Add URL">
       <svg class="ico green"><use href="#i-plus"/></svg>
     </button>
-    <button id="btn-add-torrent" class="tb-btn" title="Add a .torrent file (Ctrl+T)" aria-label="Add torrent">
-      <svg class="ico green"><use href="#i-magnet"/></svg>
+    <button id="btn-add-torrent" class="tb-btn" title="Add a .torrent file (Ctrl+T)" aria-label="Add torrent file">
+      <svg class="ico green"><use href="#i-tfile"/></svg>
     </button>
     <button id="btn-resume-all" class="tb-btn" title="Resume all paused / failed" aria-label="Resume all">
       <svg class="ico blue"><use href="#i-play"/></svg>
@@ -91,30 +91,10 @@
 
     <div id="main">
       <table id="task-table">
-        <colgroup>
-          <col data-col="name" />
-          <col data-col="kind" />
-          <col data-col="status" />
-          <col data-col="size" />
-          <col data-col="prog" />
-          <col data-col="eta" />
-          <col data-col="speed" />
-          <col class="col-fill" />
-          <col data-col="act" />
-        </colgroup>
-        <thead>
-          <tr>
-            <th class="col-name" data-col="name" title="Click to sort">File Name</th>
-            <th class="col-kind" data-col="kind" title="Download kind - click to sort"><svg class="ico"><use href="#i-layers"/></svg></th>
-            <th class="col-status" data-col="status" title="Click to sort">Status</th>
-            <th class="col-size" data-col="size" title="Click to sort">Size</th>
-            <th class="col-prog" data-col="prog" title="Click to sort">Progress</th>
-            <th class="col-eta" data-col="eta" title="Click to sort">Time Left</th>
-            <th class="col-speed" data-col="speed" title="Click to sort">Speed</th>
-            <th class="col-fill"></th>
-            <th class="col-act" data-col="act"></th>
-          </tr>
-        </thead>
+        <!-- Built from COLS at startup: optional columns (Peers) come and go
+             without leaving the table and the header out of sync. -->
+        <colgroup id="task-cols"></colgroup>
+        <thead id="task-head"></thead>
         <tbody id="task-rows"></tbody>
       </table>
       <div id="empty-hint">
@@ -251,16 +231,18 @@
     </div>
   </div>
 
-  <!-- Row context menu (icons; the toggle entry is retitled per task) -->
+  <!-- Row context menu (icons; the toggle entry is retitled per task, and
+       turns into a bulk pause/resume when several rows are selected) -->
   <div id="ctx" class="hidden">
     <div data-act="toggle"><svg class="ico" id="ctx-toggle-ico"><use href="#i-pause"/></svg><span id="ctx-toggle-lbl">Pause</span></div>
     <div data-act="details"><svg class="ico"><use href="#i-info"/></svg><span id="ctx-details-lbl">Details&hellip;</span></div>
     <div data-act="refresh"><svg class="ico"><use href="#i-globe"/></svg>Refresh address&hellip;</div>
+    <div data-act="copyAddress"><svg class="ico"><use href="#i-copy"/></svg>Copy address</div>
     <div data-act="openFile"><svg class="ico"><use href="#i-file"/></svg>Open file</div>
     <div data-act="openFolder"><svg class="ico"><use href="#i-folder"/></svg>Open download folder</div>
     <hr />
-    <div data-act="remove"><svg class="ico"><use href="#i-x"/></svg>Remove from list</div>
-    <div data-act="deleteFiles"><svg class="ico"><use href="#i-trash"/></svg>Remove &amp; delete files</div>
+    <div data-act="remove"><svg class="ico"><use href="#i-x"/></svg><span id="ctx-remove-lbl">Remove from list</span></div>
+    <div data-act="deleteFiles"><svg class="ico"><use href="#i-trash"/></svg><span id="ctx-delete-lbl">Remove &amp; delete files</span></div>
   </div>
 
   <!-- Torrent details dialog -->

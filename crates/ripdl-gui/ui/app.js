@@ -38,6 +38,11 @@ let currentCategory = (() => {
     return CATALOG.includes(saved) ? saved : "all";
 })();
 let selectedId = null;
+// Every highlighted row (Ctrl/Shift-click). `selectedId` stays the "primary"
+// row: details, the status bar and Enter/Double-click refer to it.
+let selectedIds = new Set();
+// Shift-click range origin.
+let anchorId = null;
 let lastStructKey = null;
 
 // Plain passthrough: a failed command (bad URL, daemon said no) is not a
@@ -167,6 +172,8 @@ function stateLabel(t) {
     if (t.state === "running" && t.verifying) return "verifying";
     // Torrent still fetching metadata: no bytes and no total yet.
     if (t.state === "running" && t.kind === "torrent" && !t.total) return "metadata";
+    // Probing the URL / planning segments: no bytes have arrived yet.
+    if (t.state === "running" && t.probing) return "connecting";
     return t.state;
 }
 
@@ -175,7 +182,25 @@ function speedText(t) {
     if (t.state === "completed" && t.seeding) {
         return t.upload_bps ? `\u2191 ${humans(t.upload_bps)}/s` : "\u2191 -";
     }
+    // A parked row keeps its last sample; showing it reads as live bandwidth.
+    if (!["running", "queued"].includes(t.state)) return "-";
     return t.speed_bps ? `${humans(t.speed_bps)}/s` : "-";
+}
+
+// Live transfer rate only: a paused/failed row's stored rate must not inflate
+// the strip or the graph.
+function liveSpeed(t) {
+    return ["running", "queued"].includes(t.state) ? t.speed_bps || 0 : 0;
+}
+
+// Optional Peers column: torrent rows only, "-" for everything else.
+function peersText(t) {
+    if (!optCols.has("peers")) return null;
+    return t.kind === "torrent" && t.peers ? String(t.peers) : "-";
+}
+
+function peersOf(t) {
+    return t.kind === "torrent" ? t.peers || 0 : -1;
 }
 
 function percentOf(t) {
@@ -212,7 +237,7 @@ function ico(name, cls = "") {
 
 // One icon per sidebar category, reused for the row's file-type glyph.
 const CAT_ICON = {
-    all: "inbox", unfinished: "clock", completed: "check", torrents: "magnet",
+    all: "inbox", unfinished: "clock", completed: "check", torrents: "tfile",
     video: "film", music: "music", images: "image", documents: "doc",
     archives: "box", programs: "app", other: "file",
 };
@@ -220,7 +245,7 @@ const CAT_ICON = {
 // Transport, not content: this is what tells a torrent row apart from a plain
 // HTTP download at a glance (and hints that torrent rows have a details view).
 const KIND = {
-    torrent: { icon: "magnet", cls: "green", label: "BitTorrent", hint: "double-click for files, peers and trackers" },
+    torrent: { icon: "tfile", cls: "green", label: "BitTorrent", hint: "double-click for files, peers and trackers" },
     http: { icon: "download", cls: "blue", label: "HTTP", hint: "multi-segment download - double-click for segments" },
     video: { icon: "film", cls: "violet", label: "Video", hint: "stream page handled by yt-dlp - double-click for details" },
 };
@@ -248,6 +273,7 @@ const STATUS_ICON = {
     timed: ico("clock"), paused: ico("pause"), failed: ico("alert"),
     cancelled: ico("x"), hunt: ico("film"), downloading: ico("download"),
     verifying: ico("search"), seeding: ico("up"), metadata: ico("globe"),
+    connecting: ico("globe"),
 };
 
 function renderSidebar(counts) {
@@ -295,6 +321,8 @@ function refreshVolatile(t) {
     set(".size-cell", sizeText(t));
     set(".eta-cell", etaOf(t) || "-");
     set(".speed-cell", speedText(t));
+    const peers = peersText(t);
+    if (peers != null) set(".peers-cell", peers);
     const pct = percentOf(t);
     if (pct == null) return; // pc-less layout is structural (no-total cases)
     const fill = tr.querySelector(".prog-fill");
@@ -316,18 +344,30 @@ function statusbarText() {
  * (first run, corrupt value) falls back to the defaults.
  * ------------------------------------------------------------------------- */
 const COLS = [
-    { key: "name", def: 320, min: 120 },
-    { key: "kind", def: 44, min: 30 },
-    { key: "status", def: 150, min: 90 },
-    { key: "size", def: 120, min: 70 },
-    { key: "prog", def: 190, min: 90 },
-    { key: "eta", def: 90, min: 80 },
-    { key: "speed", def: 110, min: 70 },
+    { key: "name", def: 320, min: 120, label: "File Name" },
+    { key: "kind", def: 44, min: 44, label: "Kind", icon: "layers" },
+    { key: "status", def: 150, min: 90, label: "Status" },
+    { key: "size", def: 120, min: 70, label: "Size" },
+    { key: "prog", def: 190, min: 90, label: "Progress" },
+    { key: "eta", def: 90, min: 80, label: "Time Left" },
+    // Optional: torrent rows only, off by default (View > Peers column).
+    { key: "peers", def: 70, min: 56, label: "Peers", optional: true },
+    { key: "speed", def: 110, min: 70, label: "Speed" },
     // Row actions stay a fixed strip at the far right; the spacer column
     // before them absorbs window slack so the buttons never float mid-table.
-    { key: "act", def: 130, min: 110 },
+    { key: "act", def: 130, min: 110, label: "" },
 ];
 const COL_BY_KEY = Object.fromEntries(COLS.map((c) => [c.key, c]));
+
+// Optional columns the user turned on (persisted).
+let optCols = new Set(
+    (loadJson("ripdl.optcols", []) || []).filter((k) => COL_BY_KEY[k] && COL_BY_KEY[k].optional)
+);
+
+// Columns to render, in order: optional ones only when enabled.
+function visibleCols() {
+    return COLS.filter((c) => !c.optional || optCols.has(c.key));
+}
 
 function loadJson(key, fallback) {
     try {
@@ -420,7 +460,7 @@ function setSort(key) {
 }
 
 const STATE_RANK = {
-    running: 0, hunt: 1, verifying: 2, metadata: 3, queued: 4, timed: 5,
+    running: 0, hunt: 1, verifying: 2, connecting: 2, metadata: 3, queued: 4, timed: 5,
     seeding: 6, paused: 7, failed: 8, completed: 9, cancelled: 10,
 };
 const KIND_RANK = { torrent: 0, http: 1, video: 2 };
@@ -433,7 +473,8 @@ function etaSeconds(t) {
 }
 
 function speedOf(t) {
-    return t.state === "completed" && t.seeding ? t.upload_bps || 0 : t.speed_bps || 0;
+    if (t.state === "completed" && t.seeding) return t.upload_bps || 0;
+    return liveSpeed(t);
 }
 
 function compareBy(key, a, b) {
@@ -450,6 +491,8 @@ function compareBy(key, a, b) {
             return (percentOf(a) ?? -1) - (percentOf(b) ?? -1);
         case "eta":
             return (etaSeconds(a) ?? Infinity) - (etaSeconds(b) ?? Infinity);
+        case "peers":
+            return peersOf(a) - peersOf(b);
         case "speed":
             return speedOf(a) - speedOf(b);
         default:
@@ -470,17 +513,33 @@ function visibleTasks() {
     });
 }
 
-// Resize grips + sort indicators on every header (once; headers never rerender).
-function initColumnUi() {
-    applyColWidths();
-    for (const th of document.querySelectorAll("#task-table thead th[data-col]")) {
+// Header cells come from COLS, so an optional column can be turned on or off
+// without the header drifting out of sync with the rows.
+function buildHeader() {
+    const cols = visibleCols();
+    // The spacer column sits just before the actions strip so the buttons stay
+    // pinned to the right edge no matter how much slack the window has.
+    const body = cols.filter((c) => c.key !== "act");
+    const act = cols.filter((c) => c.key === "act");
+    const ordered = [...body, { key: "fill" }, ...act];
+    $("#task-cols").innerHTML = ordered.map((c) => `<col data-col="${c.key}" class="${c.key === "fill" ? "col-fill" : ""}" />`).join("");
+    $("#task-head").innerHTML = "<tr>" + ordered.map((c) => {
+        if (c.key === "fill") return '<th class="col-fill"></th>';
+        const label = c.icon ? `<svg class="ico"><use href="#i-${c.icon}"/></svg>` : c.label;
+        const title = c.label
+            ? ` title="${c.label} - click to sort, drag the edge to resize"`
+            : "";
+        return `<th class="col-${c.key}" data-col="${c.key}"${title}>${label}</th>`;
+    }).join("") + "</tr>";
+
+    for (const th of $("#task-head").querySelectorAll("th[data-col]")) {
         const key = th.dataset.col;
         const meta = COL_BY_KEY[key];
         if (!meta) continue;
         th.insertAdjacentHTML("beforeend", '<span class="sort-ind"></span>');
         const grip = document.createElement("span");
         grip.className = "col-resizer";
-        grip.title = "Drag to resize · double-click to reset this column";
+        grip.title = "Drag to resize \u00b7 double-click to reset this column";
         th.appendChild(grip);
         grip.addEventListener("mousedown", (ev) => {
             ev.preventDefault();
@@ -510,22 +569,144 @@ function initColumnUi() {
             saveJson("ripdl.cols", colWidths);
         });
     }
-    $("#task-table thead").addEventListener("click", (ev) => {
+    applyColWidths();
+    renderSortIndicators();
+}
+
+// Keep the saved layout inside the window: shrink (never grow) when the
+// window is narrower than the stored widths, so a window resize or a column
+// toggle cannot leave a horizontal scrollbar behind.
+function fitWidths() {
+    const main = $("#main");
+    if (!main) return;
+    const room = main.clientWidth - 2 - (colWidths.act ?? COL_BY_KEY.act.def);
+    const cols = COLS.filter((c) => c.key !== "act" && (!c.optional || optCols.has(c.key)));
+    const widthOf = (c) => colWidths[c.key] ?? c.def;
+    let total = cols.reduce((s, c) => s + widthOf(c), 0);
+    if (total <= room) return;
+
+    // Take the overflow from every column that has slack above its minimum,
+    // proportionally, then shave the remainder off the widest one (rounding).
+    const slack = cols.reduce((s, c) => s + Math.max(0, widthOf(c) - c.min), 0);
+    if (slack > 0) {
+        const over = total - room;
+        for (const c of cols) {
+            const s = Math.max(0, widthOf(c) - c.min);
+            if (!s) continue;
+            const cut = Math.min(s, Math.round(over * (s / slack)));
+            if (cut > 0) colWidths[c.key] = widthOf(c) - cut;
+        }
+    }
+    for (let guard = 0; guard < 64 && total > room; guard++) {
+        const widest = cols.reduce((a, b) => (widthOf(a) >= widthOf(b) ? a : b));
+        if (widthOf(widest) <= widest.min) break;
+        colWidths[widest.key] = widthOf(widest) - 1;
+        total = cols.reduce((s, c) => s + widthOf(c), 0);
+    }
+    saveJson("ripdl.cols", colWidths);
+    applyColWidths();
+}
+
+// Show/hide an optional column (View menu) and repaint.
+function toggleColumn(key) {
+    const on = !optCols.has(key);
+    if (on) optCols.add(key);
+    else optCols.delete(key);
+    saveJson("ripdl.optcols", [...optCols]);
+    // Sorting by a column nobody can see is confusing: drop it.
+    if (!on && sortState && sortState.key === key) {
+        sortState = null;
+        saveJson("ripdl.sort", null);
+    }
+    // Make room by narrowing the name column instead of pushing the table
+    // wider than the window (a new column should not sprout a scrollbar).
+    const meta = COL_BY_KEY[key];
+    const nameMeta = COL_BY_KEY.name;
+    const nameW = colWidths.name ?? nameMeta.def;
+    const addW = colWidths[key] || meta.def;
+    if (on) {
+        const take = Math.min(addW, Math.max(0, nameW - nameMeta.min));
+        colWidths[key] = take || addW;
+        if (take > 0) colWidths.name = nameW - take;
+    } else if (colWidths.name != null) {
+        colWidths.name = Math.min(nameMeta.def, nameW + addW);
+    }
+    saveJson("ripdl.cols", colWidths);
+    buildHeader();
+    lastStructKey = null;
+    render();
+}
+
+// Resize grips + sort indicators on every header (the delegation is bound
+// once; the cells themselves are rebuilt by buildHeader).
+function initColumnUi() {
+    buildHeader();
+    fitWidths();
+    $("#task-head").addEventListener("click", (ev) => {
         if (ev.target.classList.contains("col-resizer")) return;
         const th = ev.target.closest("th[data-col]");
         if (th) setSort(th.dataset.col);
     });
-    renderSortIndicators();
+    // A narrower window shrinks the stored widths instead of scrolling.
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(fitWidths, 250);
+    });
+}
+
+// --- selection -------------------------------------------------------------
+// One row is the "primary" (details / status / Enter); the rest are extras a
+// Ctrl/Shift-click added, so bulk actions stay one click away without a
+// separate mode.
+
+function selectedTasks() {
+    const ids = selectedIds;
+    return visibleTasks().filter((t) => ids.has(t.id));
+}
+
+function paintSelection() {
+    for (const tr of TBODY.children) tr.classList.toggle("selected", selectedIds.has(tr.dataset.id));
+}
+
+function setSelection(ids, primary = null) {
+    selectedIds = new Set(ids);
+    selectedId = primary || (ids.length ? ids[ids.length - 1] : null);
+    if (!selectedId) anchorId = null;
+    paintSelection();
+    renderStatusbar();
+}
+
+function toggleSelection(id) {
+    if (selectedIds.has(id)) {
+        selectedIds.delete(id);
+        if (selectedId === id) selectedId = [...selectedIds].pop() || null;
+    } else {
+        selectedIds.add(id);
+        selectedId = id;
+    }
+    anchorId = id;
+    paintSelection();
+    renderStatusbar();
+}
+
+function extendSelection(id) {
+    const view = visibleTasks().map((t) => t.id);
+    const from = view.indexOf(anchorId || selectedId);
+    const to = view.indexOf(id);
+    if (from < 0 || to < 0) {
+        setSelection([id], id);
+        return;
+    }
+    const [a, b] = from <= to ? [from, to] : [to, from];
+    setSelection(view.slice(a, b + 1), id);
 }
 
 // Select a row by id and keep it visible (keyboard navigation, sort changes).
 function selectRow(id) {
-    selectedId = id;
-    for (const tr of TBODY.children) tr.classList.toggle("selected", tr.dataset.id === id);
+    setSelection([id], id);
     const tr = rowCache.get(id);
     if (tr) tr.scrollIntoView({ block: "nearest" });
-    const t = findTask(id);
-    $("#st-counts").textContent = t ? `${rowName(t)} · ${stateLabel(t)}` : statusbarText();
 }
 
 function render() {
@@ -556,8 +737,9 @@ function render() {
         const size = sizeText(t);
         const eta = etaOf(t) || "-";
         const speed = speedText(t);
+        const peers = peersText(t);
         const dir = t.dest_dir ? t.dest_dir.replace(/[\\/]+$/, "") : "";
-        const cls = t.id === selectedId ? ' class="selected"' : "";
+        const cls = selectedIds.has(t.id) ? ' class="selected"' : "";
         return `<tr${cls} data-id="${t.id}">
           <td class="name-cell" title="${escapeHtml(detailsTitle(t))}">
             <div class="fname-cell"><span class="ficon">${fileIcon(t)}</span><span title="${escapeHtml(name)}">${escapeHtml(name)}</span></div>
@@ -568,6 +750,7 @@ function render() {
           <td class="size-cell">${size}</td>
           <td class="prog-cell">${prog}</td>
           <td class="eta-cell">${eta}</td>
+          ${peers == null ? "" : `<td class="peers-cell">${peers}</td>`}
           <td class="speed-cell">${speed}</td>
           <td class="col-fill"></td>
           <td class="col-act">${actionButtons(t)}</td>
@@ -590,27 +773,38 @@ TBODY.onclick = (ev) => {
     const btn = ev.target.closest(".row-btn");
     if (btn) {
         ev.stopPropagation();
+        // A row button acts on that row only: clicking it is not a way to
+        // bulk-pause, so the selection is left alone.
         doTaskAction(btn.dataset.act, btn.dataset.id);
         return;
     }
     const tr = ev.target.closest("tr");
-    if (!tr) return;
-    selectedId = tr.dataset.id;
-    TBODY.querySelectorAll("tr").forEach((x) => x.classList.toggle("selected", x === tr));
+    if (!tr) {
+        // Empty space below the rows: drop the selection.
+        if (ev.target === TBODY) setSelection([]);
+        return;
+    }
+    const id = tr.dataset.id;
+    if (ev.shiftKey) extendSelection(id);
+    else if (ev.ctrlKey || ev.metaKey) toggleSelection(id);
+    else setSelection([id], id);
 };
 TBODY.ondblclick = (ev) => {
     const tr = ev.target.closest("tr");
     if (!tr) return;
-    selectedId = tr.dataset.id;
-    renderKeepSelection();
+    setSelection([tr.dataset.id], tr.dataset.id);
     openDetails(tr.dataset.id);
 };
 TBODY.oncontextmenu = (ev) => {
     const tr = ev.target.closest("tr");
     if (!tr) return;
     ev.preventDefault();
-    selectedId = tr.dataset.id;
-    renderKeepSelection();
+    const id = tr.dataset.id;
+    // Right-clicking a row inside a multi-selection keeps it (that is how you
+    // act on the group); anywhere else the menu targets just this row.
+    if (!selectedIds.has(id)) setSelection([id], id);
+    else selectedId = id;
+    paintSelection();
     showCtx(ev.clientX, ev.clientY);
 };
 $("#side-items").onclick = (ev) => {
@@ -622,21 +816,35 @@ $("#side-items").onclick = (ev) => {
     render();
 };
 
-// Rerender without invalidating the selection highlight (implicit: selectedId survives).
-function renderKeepSelection() { render(); }
+// What the row / context-menu toggle does for a task, or null when there is
+// nothing to toggle. States that are doing work count as "pause"; anything
+// parked counts as "resume" (a paused row used to show no button at all, so
+// the only way back was a context menu that did not work either).
+const ACTIVE_STATES = ["running", "queued", "verifying", "metadata"];
+function toggleIntent(t) {
+    if (!t) return null;
+    if (ACTIVE_STATES.includes(t.state)) return "pause";
+    // A finished torrent keeps seeding until the user stops it.
+    if (t.state === "completed") {
+        return t.kind === "torrent" ? (t.seeding ? "pause" : "resume") : null;
+    }
+    if (["paused", "failed", "timed"].includes(t.state)) return "resume";
+    return null;
+}
+
+function toggleTitle(t) {
+    const intent = toggleIntent(t);
+    if (!intent) return "";
+    if (t.state === "completed") return intent === "pause" ? "Stop seeding" : "Start seeding";
+    return intent === "pause" ? "Pause" : "Resume";
+}
 
 function actionButtons(t) {
     const idAttr = `data-id="${t.id}"`;
-    const running = ["running", "queued"].includes(t.state);
-    // Completed torrents keep a seed toggle: pause stops serving the swarm,
-    // play restarts it. Other completed rows have nothing to pause/resume.
-    const seedable = t.state === "completed" && t.kind === "torrent";
-    const showStop = running || seedable;
-    const stop = showStop ? `
-      <button class="row-btn" ${idAttr} data-act="toggle" title="${
-        seedable ? (t.seeding ? "Stop seeding" : "Start seeding") : (running ? "Pause" : "Resume")
-      }">
-        ${ico(running || (seedable && t.seeding) ? "pause" : "play")}
+    const intent = toggleIntent(t);
+    const stop = intent ? `
+      <button class="row-btn" ${idAttr} data-act="toggle" title="${toggleTitle(t)}">
+        ${ico(intent === "pause" ? "pause" : "play")}
       </button>` : "";
     const openFile = t.state === "completed" ? `
       <button class="row-btn" ${idAttr} data-act="openFile" title="Open file">${ico("file")}</button>` : "";
@@ -654,54 +862,136 @@ function escapeHtml(s) {
 function showCtx(x, y) {
     // Retitle the toggle per task (Pause/Resume vs seed start/stop) and hide
     // entries that do not apply: details exist for every kind, refresh only
-    // for HTTP downloads that have not finished.
+    // for HTTP downloads that have not finished. With more than one row
+    // selected the per-task entries give way to bulk ones.
     const t = selectedId ? findTask(selectedId) : null;
-    const running = !!t && ["running", "queued"].includes(t.state);
-    const seedable = !!t && t.state === "completed" && t.kind === "torrent";
-    const stopping = running || (seedable && t.seeding);
-    const toggle = $("#ctx [data-act=toggle]");
+    const many = selectedIds.size > 1;
+    const group = many ? selectedTasks() : (t ? [t] : []);
+    // A group toggles the way its label says: pause when anything is moving,
+    // otherwise resume. Mixing both in one click reads as a random result.
+    const anyActive = group.some((x) => toggleIntent(x) === "pause");
+    const intent = group.length ? (anyActive ? "pause" : "resume") : null;
+    // Only the rows this click would actually change are counted: a mixed
+    // selection must not promise "Pause 4 tasks" and move two.
+    const affected = group.filter((x) => toggleIntent(x) === intent);
     const useEl = $("#ctx-toggle-ico use");
-    if (useEl) useEl.setAttribute("href", stopping ? "#i-pause" : "#i-play");
-    $("#ctx-toggle-lbl").textContent = seedable
-        ? (t.seeding ? "Stop seeding" : "Start seeding")
-        : (running ? "Pause" : "Resume");
-    toggle.classList.toggle("hidden", !!t && t.state === "completed" && t.kind !== "torrent");
-    $("#ctx [data-act=details]").classList.toggle("hidden", !t);
+    if (useEl) useEl.setAttribute("href", intent === "pause" ? "#i-pause" : "#i-play");
+    $("#ctx-toggle-lbl").textContent = many && affected.length
+        ? `${intent === "pause" ? "Pause" : "Resume"} ${affected.length} ${affected.length === 1 ? "task" : "tasks"}`
+        : (toggleTitle(t) || "Pause");
+    $("#ctx [data-act=toggle]").classList.toggle("hidden", !affected.length);
+    // Per-task entries only make sense for one row.
+    for (const act of ["details", "refresh", "openFile", "openFolder", "copyAddress"]) {
+        $("#ctx [data-act=" + act + "]").classList.toggle("hidden", many || !t);
+    }
     $("#ctx-details-lbl").textContent = t && t.kind === "torrent" ? "Torrent details…" : "Details…";
     $("#ctx [data-act=refresh]").classList.toggle(
         "hidden",
-        !t || t.kind !== "http" || t.state === "completed"
+        many || !t || t.kind !== "http" || t.state === "completed"
     );
+    // Nothing on disk to open until the task produced a file.
+    $("#ctx [data-act=openFile]").classList.toggle("hidden", many || !t || !t.dest_file);
+    $("#ctx [data-act=copyAddress]").classList.toggle("hidden", many || !t || !t.url);
+    $("#ctx-remove-lbl").textContent = many ? `Remove ${group.length} from list` : "Remove from list";
+    $("#ctx-delete-lbl").textContent = many ? `Remove ${group.length} & delete files` : "Remove & delete files";
 
     const menu = $("#ctx");
     menu.classList.remove("hidden");
-    menu.style.left = Math.min(x, innerWidth - 190) + "px";
-    menu.style.top = Math.min(y, innerHeight - 130) + "px";
+    // Position after it is laid out so the clamp uses the real height (the
+    // menu grew with the refresh/details entries and used to overflow short
+    // windows at the old fixed 130px guess).
+    const w = menu.offsetWidth || 190;
+    const h = menu.offsetHeight || 130;
+    menu.style.left = Math.max(0, Math.min(x, innerWidth - w - 4)) + "px";
+    menu.style.top = Math.max(0, Math.min(y, innerHeight - h - 4)) + "px";
 }
+
 document.addEventListener("click", () => { $("#ctx").classList.add("hidden"); closeMenus(); });
 $("#ctx").onclick = (ev) => {
-    const act = ev.target.dataset.act;
-    if (!act) return;
+    // The entry's own <div> carries data-act; the visible target is its icon
+    // or label, so resolve the ancestor instead of reading the target (that
+    // made every entry except the blank strip a no-op).
+    const entry = ev.target.closest("#ctx [data-act]");
+    if (!entry) return;
     $("#ctx").classList.add("hidden");
-    if (selectedId) doTaskAction(act, selectedId);
+    if (selectedId) doTaskAction(entry.dataset.act, selectedId);
 };
 
 function findTask(id) {
     return tasks.find((x) => x.id === id);
 }
 
+// Which tasks an action applies to: single-row entries always hit the row the
+// user aimed at; bulk-capable ones (toggle / remove / delete files) follow a
+// multi-selection.
+function actionTargets(act, id) {
+    const perRow = ["details", "refresh", "openFile", "openFolder", "copyAddress"];
+    if (perRow.includes(act)) return [id];
+    if (selectedIds.size > 1 && selectedIds.has(id)) return selectedTasks().map((t) => t.id);
+    return [id];
+}
+
+async function removeTasks(ids, deleteFiles) {
+    const list = ids.map(findTask).filter(Boolean);
+    if (!list.length) return;
+    if (deleteFiles) {
+        const what = list.length === 1 ? `"${rowName(list[0])}"` : `${list.length} tasks`;
+        if (!confirm(`Delete the downloaded file(s) for ${what} from disk?\nThis cannot be undone.`)) return;
+    } else {
+        // Removing a finished task loses nothing (the file stays); removing an
+        // unfinished one throws away its resume position, so ask first.
+        const risky = list.filter((t) => t.state !== "completed");
+        if (risky.length) {
+            const what = risky.length === 1
+                ? `"${rowName(risky[0])}"`
+                : `${risky.length} unfinished tasks`;
+            if (!confirm(`Remove ${what} from the list?\nThe partial download stays on disk, but its resume position and settings are lost.`)) return;
+        }
+    }
+    for (const t of list) {
+        try {
+            await invokeSafe("remove_task", { id: t.id, deleteFiles });
+        } catch (e) {
+            flashErr(String(e));
+            break;
+        }
+        selectedIds.delete(t.id);
+    }
+    if (!selectedIds.size) selectedId = null;
+    await poll();
+}
+
+async function toggleTasks(ids) {
+    const list = ids.map(findTask).filter(Boolean);
+    // One intent for the whole group, matching the menu label.
+    const pause = list.some((t) => toggleIntent(t) === "pause");
+    for (const t of list) {
+        const intent = toggleIntent(t);
+        if (intent !== (pause ? "pause" : "resume")) continue;
+        try {
+            await invokeSafe(pause ? "pause_task" : "resume_task", { id: t.id });
+        } catch (e) {
+            flashErr(String(e));
+            break;
+        }
+    }
+    await poll();
+}
+
 async function doTaskAction(act, id) {
     const t = findTask(id);
     if (!t) return;
+    const ids = actionTargets(act, id);
     try {
-        if (act === "remove") await invokeSafe("remove_task", { id, deleteFiles: false });
-        else if (act === "deleteFiles") {
-            if (!confirm(`Delete the downloaded file(s) for "${rowName(t)}" from disk?\nThis cannot be undone.`)) return;
-            await invokeSafe("remove_task", { id, deleteFiles: true });
-        } else if (act === "details") {
+        if (act === "remove") await removeTasks(ids, false);
+        else if (act === "deleteFiles") await removeTasks(ids, true);
+        else if (act === "details") {
             await openDetails(id);
         } else if (act === "refresh") {
             openRefreshDialog(id);
+        } else if (act === "copyAddress") {
+            await copyText(t.url);
+            flashStatus("address copied");
         } else if (act === "openFolder") {
             await invokeSafe("open_path", { path: t.dest_dir || "", reveal: null });
         } else if (act === "openFile") {
@@ -709,11 +999,8 @@ async function doTaskAction(act, id) {
             const dir = t.dest_file.replace(/[^\\/]+$/, "");
             await invokeSafe("open_path", { path: dir, reveal: baseName(t.dest_file) });
         } else if (act === "toggle") {
-            const active = ["running", "queued"].includes(t.state) || (t.state === "completed" && t.seeding);
-            const cmd = active ? "pause_task" : "resume_task";
-            await invokeSafe(cmd, { id });
+            await toggleTasks(ids);
         }
-        selectedId = id;
         await poll();
     } catch (e) {
         flashErr(String(e));
@@ -762,8 +1049,10 @@ async function poll() {
     try {
         const list = await invoke("list_tasks");
         tasks = list;
-        // Selection must not outlive its task (ghost context-menu actions).
-        if (selectedId && !tasks.some((t) => t.id === selectedId)) selectedId = null;
+        // Selection must not outlive its tasks (ghost context-menu actions).
+        const live = new Set(tasks.map((t) => t.id));
+        for (const id of [...selectedIds]) if (!live.has(id)) selectedIds.delete(id);
+        if (selectedId && !live.has(selectedId)) selectedId = [...selectedIds].pop() || null;
         setConn(true);
         // Structural changes (task set, state, name, errors) repaint the
         // tbody + sidebar; bytes-only changes update cells in place - no DOM
@@ -860,7 +1149,7 @@ function drawSpeedGraph() {
 window.addEventListener("resize", drawSpeedGraph);
 
 function renderStatusbar() {
-    const totalSpeed = tasks.reduce((s, t) => s + (t.speed_bps || 0), 0);
+    const totalSpeed = tasks.reduce((s, t) => s + liveSpeed(t), 0);
     sampleSpeed(totalSpeed);
     const nowEl = $("#ss-now");
     if (nowEl) nowEl.textContent = `${humans(totalSpeed)}/s`;
@@ -875,9 +1164,13 @@ function renderStatusbar() {
 
     if (Date.now() < statusFlashUntil) return; // flashing a message
     // Selection readout doubles as a "what am I looking at" hint; the plain
-    // counts return as soon as nothing is selected.
+    // counts return as soon as nothing is selected. A multi-selection says so
+    // instead of pretending only the primary row is selected.
     const sel = selectedId ? findTask(selectedId) : null;
-    const countsTxt = sel ? `${rowName(sel)} · ${stateLabel(sel)}` : statusbarText();
+    const n = selectedIds.size;
+    const countsTxt = n > 1
+        ? `${n} selected · ${sel ? rowName(sel) : ""}`.trim()
+        : (sel ? `${rowName(sel)} · ${stateLabel(sel)}` : statusbarText());
     if (ST_COUNTS.textContent !== countsTxt) ST_COUNTS.textContent = countsTxt;
 }
 
@@ -885,13 +1178,13 @@ function renderStatusbar() {
 let dlgDestTouched = false;
 
 async function resumeAll() {
-    for (const t of tasks.filter((x) => ["paused", "failed"].includes(x.state))) {
+    for (const t of tasks.filter((x) => ["paused", "failed", "timed"].includes(x.state))) {
         try { await invokeSafe("resume_task", { id: t.id }); } catch (e) { flashErr(String(e)); break; }
     }
     poll();
 }
 async function stopAll() {
-    for (const t of tasks.filter((x) => ["running", "queued"].includes(x.state))) {
+    for (const t of tasks.filter((x) => ACTIVE_STATES.includes(x.state))) {
         try { await invokeSafe("pause_task", { id: t.id }); } catch (e) { flashErr(String(e)); break; }
     }
     poll();
@@ -907,7 +1200,7 @@ async function clearDone() {
 const MENUS = {
     file: () => [
         { label: "Add URL", hint: "Ctrl+N", act: () => openAddDialog() },
-        { label: "Add Torrent", hint: "Ctrl+T", act: () => pickTorrent() },
+        { label: "Add .torrent File", hint: "Ctrl+T", act: () => pickTorrent() },
         null,
         { label: "Send / Receive on Network", act: () => openLan() },
         null,
@@ -918,6 +1211,21 @@ const MENUS = {
         { label: "Stop All", act: () => stopAll() },
         null,
         { label: "Clear Completed", act: () => clearDone() },
+    ],
+    view: () => [
+        {
+            label: `${optCols.has("peers") ? "\u2713 " : "\u2003"}Peers column`,
+            hint: "torrents",
+            act: () => toggleColumn("peers"),
+        },
+        {
+            label: "Reset column widths",
+            act: () => {
+                colWidths = defaultWidths();
+                saveJson("ripdl.cols", colWidths);
+                applyColWidths();
+            },
+        },
     ],
     help: () => [
         { label: "Check for Updates", act: () => runUpdateCheck(false) },
@@ -1224,8 +1532,9 @@ async function renderBondNics() {
     } catch (e) {
         el.textContent = "";
     }
-    // What the *running* torrent session actually bound. The checkbox above is
-    // only the saved setting; a change does not reach torrents until restart.
+    // What the *running* torrent session actually bound. This follows the
+    // machine now (the daemon re-reads uplinks every 5 s and hot-swaps the
+    // session's bind list), so the checkbox is no longer "restart to apply".
     try {
         const st = await invokeSafe("bond_state");
         live.textContent = `Torrents: ${st.text}`;
@@ -1284,16 +1593,13 @@ async function saveSettings() {
         closeSettings();
         const bondingChanged = $("#set-bond").checked !== bondAtOpen;
         if (bondingChanged) {
-            // The torrent session binds its uplinks at creation, so a saved
-            // toggle is a no-op until the daemon restarts. Offer it right here
-            // instead of leaving a status-line hint that is easy to miss.
-            if (confirm("Torrent bonding applies after the daemon restarts.\nRestart it now? Active transfers resume by themselves.")) {
-                await invokeSafe("restart_daemon");
-                flashStatus("settings saved - daemon restarted, torrent bonding applied");
-                await poll();
-            } else {
-                flashStatus("settings saved - restart the daemon to apply bonding to torrents");
-            }
+            // The daemon hot-swaps the torrent session's bind list on save, so
+            // no restart: new peer connections spread over the new uplinks.
+            flashStatus(
+                $("#set-bond").checked
+                    ? "settings saved - torrent bonding applied"
+                    : "settings saved - torrent bonding turned off",
+            );
         } else {
             flashStatus("settings saved");
         }
@@ -1576,6 +1882,7 @@ $("#lan-pick").onclick = async () => {
 
 document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") {
+        $("#ctx").classList.add("hidden");
         $("#dlg-backdrop").classList.add("hidden");
         torrentPick = null;
         closeDetails();
@@ -1599,7 +1906,11 @@ document.addEventListener("keydown", (ev) => {
     // text field has focus, so typing in the toolbar/filter still works.
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement && document.activeElement.tagName);
     if (typing) return;
-    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "a") {
+        ev.preventDefault();
+        const all = visibleTasks().map((t) => t.id);
+        if (all.length) setSelection(all, selectedId || all[0]);
+    } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
         const view = visibleTasks();
         if (!view.length) return;
         ev.preventDefault();
@@ -1607,8 +1918,12 @@ document.addEventListener("keydown", (ev) => {
         const next = ev.key === "ArrowDown"
             ? Math.min(view.length - 1, i + 1)
             : Math.max(0, i < 0 ? 0 : i - 1);
-        selectRow(view[next].id);
-        renderStatusbar();
+        if (ev.shiftKey && selectedIds.size >= 1) {
+            if (!anchorId) anchorId = selectedId;
+            extendSelection(view[next].id);
+        } else {
+            selectRow(view[next].id);
+        }
     } else if (ev.key === "Enter" && selectedId) {
         ev.preventDefault();
         openDetails(selectedId);

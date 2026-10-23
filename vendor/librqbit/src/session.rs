@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -32,7 +32,8 @@ use crate::{
         BoxStorageFactory, StorageFactoryExt, TorrentStorage, filesystem::FilesystemStorageFactory,
     },
     stream_connect::{
-        ConnectionKind, ConnectionOptions, SocksProxyConfig, StreamConnector, StreamConnectorArgs,
+        BindMeter, ConnectionKind, ConnectionOptions, SocksProxyConfig, StreamConnector,
+        StreamConnectorArgs,
     },
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
@@ -117,6 +118,12 @@ pub struct Session {
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
+    /// Live bonded source addresses shared with `connector`; see
+    /// `Session::set_bind_ips`. Always allocated so bonding can be turned on
+    /// or off after the session was built.
+    bound_ips: Arc<std::sync::RwLock<Vec<IpAddr>>>,
+    /// Per-uplink byte accounting for bonded peer connections.
+    bind_meter: Arc<BindMeter>,
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
@@ -148,7 +155,7 @@ pub struct Session {
     // Feature flags
     #[cfg(feature = "disable-upload")]
     _disable_upload: bool,
-    pub ipv4_only: bool,
+    ipv4_only: Arc<AtomicBool>,
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
 }
@@ -578,6 +585,45 @@ impl Session {
         &self.cancellation_token
     }
 
+    /// Bonded source addresses outgoing peer connections rotate over, as the
+    /// session sees them right now (empty = OS route).
+    pub fn bind_ips(&self) -> Vec<IpAddr> {
+        self.bound_ips.read().unwrap().clone()
+    }
+
+    /// Hot-swap the bonded source addresses: uplinks appear and disappear
+    /// (Wi-Fi finishing DHCP after the session was built, a tether being
+    /// plugged in). New outgoing peer connections use the new set; peers
+    /// already connected keep their source address. An empty list unbinds
+    /// (OS default route). Returns true if bonding was enabled for this
+    /// session, i.e. the session is not in "connector has no bind list" mode.
+    pub fn set_bind_ips(&self, ips: Vec<IpAddr>) {
+        *self.bound_ips.write().unwrap() = ips;
+    }
+
+    /// Whether IPv6 peer connections are refused. Live: flip it when bonding
+    /// needs every connection to be able to pick an uplink (a v6 peer would
+    /// otherwise always take the OS default route, i.e. one link).
+    pub fn is_ipv4_only(&self) -> bool {
+        self.ipv4_only.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ipv4_only(&self, ipv4_only: bool) {
+        self.ipv4_only.store(ipv4_only, Ordering::Relaxed);
+    }
+
+    /// How much of each bonded uplink new peer connections should get, from
+    /// measured throughput. `weight` 0 quarantines an uplink (no new
+    /// connections) until it is set again; missing entries mean 1.
+    pub fn set_bind_weights(&self, weights: Vec<(IpAddr, u32)>) {
+        self.bind_meter.set_weights(&weights);
+    }
+
+    /// Monotonic bytes read over each bonded uplink, for rate sampling.
+    pub fn bind_totals(&self) -> Vec<(IpAddr, u64)> {
+        self.bind_meter.totals()
+    }
+
     pub fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
     }
@@ -758,14 +804,20 @@ impl Session {
                     .context("error building HTTP(S) client")?
             };
 
+            let ipv4_only = Arc::new(AtomicBool::new(opts.ipv4_only));
+            let bind_meter = Arc::new(BindMeter::default());
+            let bound_ips = Arc::new(std::sync::RwLock::new(
+                opts.bind_ips.clone().unwrap_or_default(),
+            ));
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
                     socks_proxy_config: proxy_config,
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
-                    bind_ips: opts.bind_ips.clone().map(Arc::from),
-                    ipv4_only: opts.ipv4_only,
+                    bind_ips: Some(bound_ips.clone()),
+                    bind_meter: Some(bind_meter.clone()),
+                    ipv4_only: ipv4_only.clone(),
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -829,6 +881,9 @@ impl Session {
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
                 connector: stream_connector,
+                bound_ips,
+                bind_meter,
+                ipv4_only,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
                 concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -836,7 +891,6 @@ impl Session {
                 )),
                 udp_tracker_client,
                 ratelimits: Limits::new(opts.ratelimits),
-                ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,

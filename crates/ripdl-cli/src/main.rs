@@ -583,7 +583,13 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
         Reply::Ok => println!("ok"),
         Reply::Added { id } => println!("queued: {id}"),
         Reply::Error { message } => bail!("{message}"),
-        Reply::Config { settings, torrent_session, torrent_bind } => {
+        Reply::Config {
+            settings,
+            torrent_session,
+            torrent_bind,
+            torrent_rates,
+            torrent_unreachable,
+        } => {
             println!("max_concurrent:       {}", settings.max_concurrent.unwrap_or(3));
             println!("max_segments:         {}", settings.max_segments.unwrap_or(8));
             println!(
@@ -632,6 +638,14 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     .join(" \u{b7} ")
             };
             println!("uplinks:              {list}");
+            if !torrent_unreachable.is_empty() {
+                // Discovery found them, the daemon's live check rejected them:
+                // say so, or "my second connection is ignored" repeats.
+                println!(
+                    "unreachable uplinks:  {} (no working path, not bonded)",
+                    torrent_unreachable.join(" \u{b7} ")
+                );
+            }
             if settings.bond_interfaces() && nics.len() < 2 {
                 println!("note:                 only one uplink - combining cannot add bandwidth");
             }
@@ -649,6 +663,41 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     &bind
                 )
             );
+            if !torrent_rates.is_empty() {
+                let nics = ripdl_core::engine::bonded_nics();
+                // One uplink can be bound on both families: fold its v4+v6
+                // rates into a single per-interface number, or the line reads
+                // like the same adapter twice.
+                let mut merged: Vec<(String, f64)> = Vec::new();
+                for (ip, rate) in &torrent_rates {
+                    let addr: Option<std::net::IpAddr> = ip.parse().ok();
+                    let name = addr
+                        .and_then(|a| {
+                            nics.iter()
+                                .find(|n| {
+                                    std::net::IpAddr::V4(n.addr) == a
+                                        || n.v6.map(std::net::IpAddr::V6) == Some(a)
+                                })
+                                .map(|n| n.name.clone())
+                        })
+                        .unwrap_or_else(|| ip.clone());
+                    match merged.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, r)) => *r += *rate,
+                        None => merged.push((name, *rate)),
+                    }
+                }
+                let parts: Vec<String> = merged
+                    .iter()
+                    .map(|(name, rate)| {
+                        if *rate < 1024.0 {
+                            format!("{name} idle")
+                        } else {
+                            format!("{name} {}/s", humans(*rate as u64))
+                        }
+                    })
+                    .collect();
+                println!("torrent uplinks:      {}", parts.join(" \u{00b7} "));
+            }
             println!("update_check:         {}", settings.update_check.unwrap_or(true));
             println!("update_auto_install:  {}", settings.update_auto_install.unwrap_or(false));
             println!("seed_enabled:         {}", settings.seed_enabled());
@@ -874,6 +923,10 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     // Hash check: bytes move at disk speed, not download speed.
                     state = "verifying".to_string();
                 }
+                if t.state == ripdl_core::TaskState::Running && t.probing {
+                    // Still probing the URL / planning segments: no bytes yet.
+                    state = "connecting".to_string();
+                }
                 if let Some(start) = t.start_at {
                     if start > now && matches!(t.state, ripdl_core::TaskState::Queued) {
                         state = "timed".to_string();
@@ -896,6 +949,13 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     t.upload_bps
                         .map(|s| format!("\u{2191} {}/s", humans(s as u64)))
                         .unwrap_or_else(|| "\u{2191} -".to_string())
+                } else if !matches!(
+                    t.state,
+                    ripdl_core::TaskState::Running | ripdl_core::TaskState::Queued
+                ) {
+                    // A parked task keeps its last sample for the resume
+                    // bookkeeping; printing it here reads as live bandwidth.
+                    "-".to_string()
                 } else {
                     t.speed_bps
                         .map(|s| format!("{}/s", humans(s as u64)))

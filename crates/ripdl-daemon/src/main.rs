@@ -118,17 +118,54 @@ struct ProgressTrack {
     /// window over real elapsed time beats a per-tick delta: tick jitter and
     /// short bursts (a stalled link catching up) otherwise read as GB/s
     /// spikes followed by hard zeros. Torrents use a longer span
-    /// (`TORRENT_RATE_WINDOW`) because pieces land in bursts.
+    /// (`TORRENT_RATE_WINDOW`) plus the adoption guard.
     window: VecDeque<(Instant, u64)>,
+    /// When the last sample landed (elapsed time for the adoption guard).
+    at: Instant,
 }
 
 /// Speed is averaged over this much wall time (>= 2 samples).
 const RATE_WINDOW: Duration = Duration::from_secs(2);
-/// Torrents arrive in piece-sized bursts and rqbit's own estimator is a
-/// short-interval number, so a 2 s readout flaps between 0 and peak. Average
-/// over a longer span instead: still bytes-moved-over-elapsed, just settled
-/// (what mature clients show).
-const TORRENT_RATE_WINDOW: Duration = Duration::from_secs(6);
+/// Torrents get a longer span: pieces land in bursts, and the row used to
+/// flap between 0 and peak on every 2 s tick.
+const TORRENT_RATE_WINDOW: Duration = Duration::from_secs(4);
+/// Above this a byte jump in one tick cannot be network traffic (200 MiB/s
+/// per tick ≈ 1.6 Gbps), it is librqbit adopting data already on disk.
+const MAX_PLAUSIBLE_BPS: f64 = 200.0 * 1024.0 * 1024.0;
+/// A stalled task (tool rate ~0) that suddenly gains this much in one tick is
+/// a resume adoption, not a burst.
+const ADOPTION_JUMP: u64 = 32 * 1024 * 1024;
+
+/// Is this `downloaded` jump a resume/restart adoption rather than traffic?
+/// librqbit reports 0 first and then counts the bytes already on disk, which
+/// a byte delta would read as multi-GB/s (seen: 943 MiB/s on the row).
+fn adoption_jump(prev_bytes: u64, prev_tool_bps: Option<f64>, new_bytes: u64, dt: Duration) -> bool {
+    let jump = new_bytes.saturating_sub(prev_bytes);
+    let secs = dt.as_secs_f64().max(0.001);
+    let stalled = prev_tool_bps.unwrap_or(0.0) < 1024.0;
+    jump as f64 / secs > MAX_PLAUSIBLE_BPS || (stalled && jump > ADOPTION_JUMP)
+}
+
+/// Turn measured per-uplink rates into connection weights. Relative to the
+/// fastest link, 1..=10; a link under 5% of the best is quarantined (0) so new
+/// peer connections stop landing on a dying tether. With no meaningful traffic
+/// yet (a quiet swarm) everything stays even: 1.
+fn weights_from_rates(rates: &[(std::net::IpAddr, f64)]) -> Vec<(std::net::IpAddr, u32)> {
+    let best = rates.iter().map(|(_, r)| *r).fold(0.0, f64::max);
+    rates
+        .iter()
+        .map(|(ip, rate)| {
+            if best < 1024.0 {
+                return (*ip, 1);
+            }
+            if *rate < best * 0.05 {
+                return (*ip, 0);
+            }
+            (*ip, ((10.0 * rate / best).round() as u32).clamp(1, 10))
+        })
+        .collect()
+}
+
 
 /// Push one `(now, cumulative bytes)` sample, dropping what fell out of the
 /// window. A gap longer than the window (pause, suspend, a recheck) starts a
@@ -184,6 +221,23 @@ struct Daemon {
     /// without bonding). `bind_ips` is fixed at creation, so this is the only
     /// truth about whether a `bond_interfaces` change actually applied.
     torrent_bind: std::sync::Mutex<Option<Vec<std::net::IpAddr>>>,
+    /// Uplinks whose path actually works (probed, not just discovered), plus
+    /// the ones discovery found but reachability rejected. The latter is
+    /// display-only, but it is what makes "my tether is configured and
+    /// ignored" visible instead of mysterious.
+    uplinks: std::sync::Mutex<Vec<ripdl_core::engine::UplinkNic>>,
+    uplinks_dead: std::sync::Mutex<Vec<ripdl_core::engine::UplinkNic>>,
+    /// Consecutive failed reachability probes per address. One dropped
+    /// handshake is a phone call or a roam, not an outage: a link is only
+    /// evicted on the second failure in a row and comes back on the first
+    /// success.
+    uplink_failures: std::sync::Mutex<HashMap<std::net::IpAddr, u8>>,
+    /// Last per-uplink byte totals (for rate sampling) and the smoothed rates.
+    bind_sample: std::sync::Mutex<Option<(Instant, Vec<(std::net::IpAddr, u64)>)>>,
+    bind_rates: std::sync::Mutex<Vec<(std::net::IpAddr, f64)>>,
+    bind_weights: std::sync::Mutex<Vec<(std::net::IpAddr, u32)>>,
+    /// When the weights were last reset so a quarantined link can retry.
+    bind_explore: std::sync::Mutex<Instant>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
     /// Set during an install fetch (concurrent ones would share a .part).
@@ -240,6 +294,13 @@ impl Daemon {
             seed_gen: std::sync::atomic::AtomicU64::new(0),
             torrents: tokio::sync::Mutex::new(None),
             torrent_bind: std::sync::Mutex::new(None),
+    uplinks: std::sync::Mutex::new(Vec::new()),
+    uplinks_dead: std::sync::Mutex::new(Vec::new()),
+    uplink_failures: std::sync::Mutex::new(HashMap::new()),
+    bind_sample: std::sync::Mutex::new(None),
+    bind_rates: std::sync::Mutex::new(Vec::new()),
+    bind_weights: std::sync::Mutex::new(Vec::new()),
+    bind_explore: std::sync::Mutex::new(Instant::now()),
             shutdown: tokio::sync::Notify::new(),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
@@ -397,8 +458,18 @@ impl Daemon {
                             continue; // removed during the restore
                         };
                         if let Some((downloaded, total)) = live {
-                            r.downloaded = downloaded;
-                            r.total = total;
+                            // A just-restored handle reports 0 bytes and the
+                            // whole-torrent total until its check lands: never
+                            // overwrite a real byte count with that (it made a
+                            // paused 2.9 GB task read "0 B / 114 GiB").
+                            if downloaded > 0 {
+                                r.downloaded = downloaded;
+                            }
+                            // With a per-file selection the record's total is
+                            // the selected bytes; librqbit reports all files.
+                            if r.only_files.is_none() {
+                                r.total = total;
+                            }
                         }
                         let v = (r.state, r.seed_paused);
                         let snapshot = records.clone();
@@ -732,8 +803,15 @@ impl Daemon {
             let progress = self.progress.lock().unwrap();
             for r in records.iter_mut() {
                 if let Some(t) = progress.get(&r.id) {
-                    r.downloaded = t.last.downloaded;
-                    r.total = t.last.total;
+                    // A paused/restored torrent may carry a 0-byte sample
+                    // from before its check; keep the last real count. And a
+                    // selection fixes the total (the tool reports all files).
+                    if t.last.downloaded > 0 {
+                        r.downloaded = t.last.downloaded;
+                    }
+                    if r.only_files.is_none() {
+                        r.total = t.last.total;
+                    }
                 }
             }
         }
@@ -1161,6 +1239,20 @@ impl Daemon {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            torrent_rates: self
+                .bind_rates
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(ip, rate)| (ip.to_string(), *rate))
+                .collect(),
+            torrent_unreachable: self
+                .uplinks_dead
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|n| format!("{} ({})", n.name, n.addr))
+                .collect(),
         }
     }
 
@@ -1362,6 +1454,11 @@ impl Daemon {
         if lan_before != lan_after {
             self.apply_lan().await;
         }
+        // Bonding applies to the live torrent session immediately: uplink
+        // lists are hot-swappable now, so saving the toggle must not wait for
+        // a daemon restart (HTTP tasks already read the setting per download).
+        self.refresh_uplinks().await;
+        self.sync_torrent_binding().await;
         Response {
             id: req_id,
             reply: self.config_reply(),
@@ -1430,14 +1527,11 @@ impl Daemon {
                 .clone()
                 .or_else(default_download_dir)
                 .unwrap_or_else(|| PathBuf::from("."));
-            // Torrents share one session, so bonding is session-wide:
-            // read the current uplinks once at creation (daemon restart
-            // re-reads; setting changes later only affect HTTP tasks live).
+            // Torrents share one session. Bonding is session-wide, but the
+            // address list is hot-swappable (`sync_torrent_binding`), so a
+            // boot-time race with Wi-Fi DHCP heals instead of sticking.
             let bind = if self.conf().bond_interfaces() {
-                let ips: Vec<std::net::IpAddr> = ripdl_core::engine::bonded_nics()
-                    .into_iter()
-                    .map(|n| std::net::IpAddr::V4(n.addr))
-                    .collect();
+                let ips = self.uplink_addrs();
                 (!ips.is_empty()).then_some(ips)
             } else {
                 None
@@ -1449,9 +1543,256 @@ impl Daemon {
             // Only after creation succeeded: this is what the session really
             // bound, not what the config says.
             *self.torrent_bind.lock().unwrap() = Some(bind.unwrap_or_default());
-            *guard = Some(Arc::new(session));
+            let session = Arc::new(session);
+            *guard = Some(session);
         }
         Ok(Arc::clone(guard.as_ref().unwrap()))
+    }
+
+    /// Bindable addresses of the uplinks that are *proven* to work right now:
+    /// one IPv4 per interface plus its global IPv6 when it has one, so v6
+    /// peers are bonded and metered too instead of taking the OS route.
+    fn uplink_addrs(&self) -> Vec<std::net::IpAddr> {
+        let mut out: Vec<std::net::IpAddr> = Vec::new();
+        for n in self.uplinks.lock().unwrap().iter() {
+            out.push(std::net::IpAddr::V4(n.addr));
+            if let Some(v6) = n.v6 {
+                out.push(std::net::IpAddr::V6(v6));
+            }
+        }
+        out
+    }
+
+    /// Re-check the machine's uplinks: discovery plus a live reachability
+    /// handshake. A discovered interface is not an uplink - an unplugged USB
+    /// tether keeps its address *and* its DHCP gateway, and binding peer
+    /// dials to a path that drops packets is what made bonding slower than a
+    /// single link. A 400 Mbps phone tether is a real uplink too, though, and
+    /// it drops out during a call: evict on two consecutive failures, restore
+    /// on the first success, so neither a blip nor a dead path wins.
+    async fn refresh_uplinks(&self) {
+        let scan = ripdl_core::engine::scan_uplinks().await;
+        let prev: Vec<ripdl_core::engine::UplinkNic> = self.uplinks.lock().unwrap().clone();
+        let mut live = Vec::new();
+        let mut dead = Vec::new();
+        {
+            let mut failures = self.uplink_failures.lock().unwrap();
+            for nic in scan.live {
+                failures.remove(&std::net::IpAddr::V4(nic.addr));
+                live.push(nic);
+            }
+            for nic in scan.dead {
+                let addr = std::net::IpAddr::V4(nic.addr);
+                let strikes = failures.entry(addr).or_insert(0);
+                *strikes = strikes.saturating_add(1);
+                let was_live = prev.iter().any(|p| p.addr == nic.addr);
+                if was_live && *strikes < 2 {
+                    tracing::info!(
+                        name = %nic.name,
+                        addr = %nic.addr,
+                        "bonding: uplink missed a probe, keeping it until the next one"
+                    );
+                    live.push(nic);
+                } else {
+                    if was_live {
+                        tracing::info!(
+                            name = %nic.name,
+                            addr = %nic.addr,
+                            "bonding: uplink is down, dropping it until it answers"
+                        );
+                    }
+                    dead.push(nic);
+                }
+            }
+            // Forget history for interfaces that vanished from discovery.
+            let known: Vec<std::net::IpAddr> =
+                live.iter().chain(dead.iter()).map(|n| std::net::IpAddr::V4(n.addr)).collect();
+            failures.retain(|addr, _| known.contains(addr));
+        }
+        *self.uplinks.lock().unwrap() = live;
+        *self.uplinks_dead.lock().unwrap() = dead;
+    }
+
+    /// Keep the shared torrent session's bonded uplinks in step with the
+    /// machine. `bind_ips` used to be frozen when the session was created, so
+    /// a session built at boot (restore runs immediately) before Wi-Fi
+    /// finished DHCP - or before a tether was plugged in - kept that stale
+    /// uplink set forever. That is the "I have two connections but torrents
+    /// only use one" report. Swapping is live: new peer connections rotate
+    /// over the new set, existing peers keep their source address.
+    async fn sync_torrent_binding(&self) {
+        let Some(session) = self.torrents.lock().await.clone() else {
+            return;
+        };
+        let mut want: Vec<std::net::IpAddr> = if self.conf().bond_interfaces() {
+            self.uplink_addrs()
+        } else {
+            Vec::new()
+        };
+        want.sort();
+        let mut current = session.bind_ips();
+        current.sort();
+        if current == want {
+            return;
+        }
+        session.set_bind_ips(want.clone());
+        *self.torrent_bind.lock().unwrap() = Some(want.clone());
+        tracing::info!(uplinks = ?want, "torrent bonding follows the current uplinks");
+    }
+
+    /// Uplinks appear and disappear while the daemon runs (Wi-Fi re-associates,
+    /// a phone gets plugged in - or loses its data during a call and comes
+    /// back). Probe every tick so a returning link is used within 5 s; two
+    /// consecutive failures are needed to evict one, so a blip costs nothing.
+    async fn watch_bonding(self: Arc<Self>) {
+        let mut ticks = 0u64;
+        loop {
+            self.refresh_uplinks().await;
+            self.sync_torrent_binding().await;
+            self.apply_bind_weights().await;
+            if ticks % 3 == 0 {
+                self.reconcile_torrent_records().await;
+            }
+            ticks += 1;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Weight new peer connections by what each bonded uplink actually
+    /// delivers. A 50/50 split across two very different paths parks half the
+    /// swarm on the slower one, which is the "bonding is slower than one
+    /// connection" report. Measured from the bytes librqbit reads per bound
+    /// connection (`bind_totals`), so this costs no probe traffic.
+    ///
+    /// Delivered bytes - not bytes per connection - on purpose: per-connection
+    /// speed here mostly reflects *which* peers a link happened to get (this
+    /// swarm is IPv6-heavy while its v4 peers are 95% dead), so dividing by
+    /// connection count zeroes whole addresses and starves the fast link.
+    /// Aggregate bytes are self-correcting: a saturated link stops growing
+    /// while an idle fast one keeps scaling. A link under 5% of the best is
+    /// quarantined, and every minute the weights reset to 1 for one tick so a
+    /// recovered - or newly wired - link can compete.
+    async fn apply_bind_weights(&self) {
+        let Some(session) = self.torrents.lock().await.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        let totals = session.bind_totals();
+        if totals.is_empty() {
+            return;
+        }
+        let mut prev = self.bind_sample.lock().unwrap();
+        let Some((t0, before)) = prev.clone() else {
+            *prev = Some((now, totals));
+            return;
+        };
+        // A new session (daemon restart, session rebuild) restarts every
+        // counter at 0: rebaseline instead of reading a bogus negative delta.
+        if totals
+            .iter()
+            .any(|(ip, total)| before.iter().any(|(i, b)| i == ip && total < b))
+        {
+            *prev = Some((now, totals));
+            return;
+        }
+        let dt = now.duration_since(t0).as_secs_f64().max(0.1);
+        *prev = Some((now, totals.clone()));
+
+        let mut rates = self.bind_rates.lock().unwrap();
+        for (ip, total) in &totals {
+            let old = before
+                .iter()
+                .find(|(i, _)| i == ip)
+                .map(|(_, b)| *b)
+                .unwrap_or(*total);
+            let sample = total.saturating_sub(old) as f64 / dt;
+            // Ease in: one 5 s window is noisy on a phone link.
+            let ema = match rates.iter().find(|(i, _)| i == ip) {
+                Some((_, r)) => r * 0.6 + sample * 0.4,
+                None => sample,
+            };
+            if let Some(entry) = rates.iter_mut().find(|(i, _)| i == ip) {
+                entry.1 = ema;
+            } else {
+                rates.push((*ip, ema));
+            }
+        }
+        let mut weights = weights_from_rates(&rates);
+        if self.bind_explore.lock().unwrap().elapsed() > Duration::from_secs(60) {
+            *self.bind_explore.lock().unwrap() = Instant::now();
+            weights = weights.iter().map(|(ip, _)| (*ip, 1)).collect();
+        }
+        session.set_bind_weights(weights.clone());
+        let changed = *self.bind_weights.lock().unwrap() != weights;
+        if changed {
+            *self.bind_weights.lock().unwrap() = weights.clone();
+            tracing::info!(
+                rates = ?rates.iter().map(|(i, r)| (i.to_string(), (r / 1024.0).round())).collect::<Vec<_>>(),
+                weights = ?weights.iter().map(|(i, w)| (i.to_string(), *w)).collect::<Vec<_>>(),
+                "bonding weights updated from measured uplink throughput"
+            );
+        }
+    }
+
+    /// A paused torrent has no runner, so nothing folds its real byte count
+    /// back into the queue: after a restart it used to sit at "0 B / 114 GiB"
+    /// (the pre-check snapshot) until the user resumed it. The session is the
+    /// source of truth while it is alive - adopt it on the same slow tick.
+    async fn reconcile_torrent_records(&self) {
+        let Some(session) = self.torrents.lock().await.clone() else {
+            return;
+        };
+        let targets: Vec<(String, String, bool)> = {
+            let records = self.records.lock().unwrap();
+            records
+                .iter()
+                .filter(|r| {
+                    r.kind == TaskKind::Torrent
+                        && matches!(r.state, TaskState::Paused | TaskState::Completed)
+                })
+                .filter_map(|r| {
+                    r.info_hash
+                        .clone()
+                        .map(|h| (r.id.clone(), h, r.only_files.is_some()))
+                })
+                .collect()
+        };
+        let mut changed = false;
+        for (id, hash, selected) in targets {
+            let Ok(d) = session.details(&hash) else { continue };
+            let want_total = if selected {
+                // A selection fixes the total, but the session reports the
+                // whole-torrent byte count until its check has run: accept its
+                // number only when it is plausible (<= every file's size).
+                let all: u64 = d.files.iter().map(|f| f.size).sum();
+                let picked: u64 = d.files.iter().filter(|f| f.included).map(|f| f.size).sum();
+                if d.total > 0 && all > 0 && d.total <= all {
+                    d.total
+                } else {
+                    picked
+                }
+            } else {
+                d.total
+            };
+            let mut records = self.records.lock().unwrap();
+            let Some(r) = records.iter_mut().find(|r| r.id == id) else {
+                continue;
+            };
+            // 0 means "not checked yet" (a restore starts there): keep what
+            // the queue already knows instead of zeroing real progress.
+            if d.downloaded > 0 && r.downloaded != d.downloaded {
+                r.downloaded = d.downloaded;
+                changed = true;
+            }
+            if want_total > 0 && r.total != Some(want_total) {
+                r.total = Some(want_total);
+                changed = true;
+            }
+        }
+        if changed {
+            let snapshot = self.records.lock().unwrap().clone();
+            let _ = self.persist(&snapshot);
+        }
     }
 
     /// Pre-add torrent preview (Add dialog file list). No task is queued;
@@ -1835,12 +2176,20 @@ impl Daemon {
         let tasks = records
             .iter()
             .map(|r| {
+                // A parked task keeps its last sample for resume bookkeeping,
+                // but reporting it as a live rate prints bandwidth that is not
+                // moving (and inflates a frontend's total-speed strip).
+                let live = matches!(r.state, TaskState::Running | TaskState::Queued);
+                // No sample yet on a live task: the engine is still probing the
+                // URL and planning segments (HTTP/video only - a torrent has
+                // its own metadata state).
+                let probing = live && r.kind != TaskKind::Torrent && !progress.contains_key(&r.id);
                  let (downloaded, total, speed_bps, percent, uploaded, upload_bps, verifying) =
                     match progress.get(&r.id) {
                         Some(t) => (
                             t.last.downloaded,
                             t.last.total,
-                            t.speed,
+                            if live { t.speed } else { None },
                             t.last.percent,
                             t.last.uploaded.max(r.uploaded),
                             r.upload_bps.or(t.last.upload_bps),
@@ -1850,7 +2199,9 @@ impl Daemon {
                             r.downloaded,
                             r.total,
                             None,
-                            r.total.map(|_| 100.0),
+                            // No live sample: never claim 100%. A paused task
+                            // has a total too (it used to read "paused 100%").
+                            None,
                             r.uploaded,
                             r.upload_bps,
                             false,
@@ -1870,6 +2221,7 @@ impl Daemon {
                     seeding_stopped: r.seed_paused,
                     peers: r.peers,
                     verifying,
+                    probing,
                     error: r.error.clone(),
                     start_at: r.start_at,
                     kind: r.kind,
@@ -2291,7 +2643,7 @@ impl Daemon {
                         if downloaded > 0 {
                             r.downloaded = downloaded;
                         }
-                        if total.is_some() {
+                        if total.is_some() && r.only_files.is_none() {
                             r.total = total;
                         }
                         if r.dest_file.is_none() {
@@ -2413,6 +2765,7 @@ impl Daemon {
             last: p.clone(),
             speed: None,
             window: VecDeque::new(),
+            at: now,
         });
         // Resume/recheck hash pass: `downloaded` counts verified bytes and
         // climbs at disk speed, so a derived rate would show hundreds of MB/s
@@ -2422,25 +2775,33 @@ impl Daemon {
         if p.verifying || p.percent.is_some() {
             entry.speed = None;
             entry.window.clear();
+            entry.at = now;
             entry.last = p;
             return;
         }
-        let span = if is_torrent {
-            TORRENT_RATE_WINDOW
+        if is_torrent {
+            // Byte-based like HTTP (the tool's own rate is an estimate that
+            // keeps reporting when nothing arrives - measured 0-600 KiB/s
+            // across 30 s with `downloaded` frozen), over a longer span, with
+            // an adoption guard: a resume counts data already on disk in one
+            // jump, and that must not read as throughput.
+            if adoption_jump(
+                entry.last.downloaded,
+                entry.last.speed_bps,
+                p.downloaded,
+                now.duration_since(entry.at),
+            ) {
+                entry.window.clear();
+            }
+            push_rate_sample(&mut entry.window, now, p.downloaded, TORRENT_RATE_WINDOW);
+            entry.speed = window_rate(&entry.window);
         } else {
-            RATE_WINDOW
-        };
-        push_rate_sample(&mut entry.window, now, p.downloaded, span);
-        let rate = window_rate(&entry.window);
-        // Torrents: the derived window beats rqbit's short-interval number
-        // (the row used to flap between 0 B/s and peak), so use it and fall
-        // back to the tool rate until two samples span enough time. HTTP
-        // keeps the old preference (the engine reports its own window).
-        entry.speed = if is_torrent {
-            rate.or(p.speed_bps)
-        } else {
-            p.speed_bps.or(rate)
-        };
+            push_rate_sample(&mut entry.window, now, p.downloaded, RATE_WINDOW);
+            let rate = window_rate(&entry.window);
+            // HTTP samples carry the engine's own windowed rate; the derived
+            // one is the fallback.
+            entry.speed = p.speed_bps.or(rate);
+        }
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
                 id,
@@ -2451,6 +2812,7 @@ impl Daemon {
                 "progress sample"
             );
         }
+        entry.at = now;
         entry.last = p;
     }
 
@@ -2988,53 +3350,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // Torrent rows used to flap between 0 B/s and peak because librqbit's
-    // estimator is a short-interval number; the derived window over a longer
-    // span is what the row shows now.
+    // A resume makes librqbit jump from 0 to "everything already on disk" in
+    // one tick; the row used to read 943 MiB/s because of it.
     #[test]
-    fn torrent_rate_window_needs_two_samples() {
-        let t0 = Instant::now();
-        let mut w = VecDeque::new();
-        push_rate_sample(&mut w, t0, 1_000, TORRENT_RATE_WINDOW);
-        assert_eq!(window_rate(&w), None, "one sample has no span");
-
-        push_rate_sample(&mut w, t0 + Duration::from_secs(2), 3_000, TORRENT_RATE_WINDOW);
-        let r = window_rate(&w).expect("two samples over 2 s");
-        assert!((r - 1_000.0).abs() < 1.0, "rate {r}");
+    fn adoption_jump_ignores_a_resume() {
+        let dt = Duration::from_secs(1);
+        assert!(adoption_jump(0, Some(0.0), 2_252_154_753, dt), "resume adoption");
+        assert!(adoption_jump(0, None, 2_252_154_753, dt), "no tool rate yet");
+        // A stalled task that suddenly gains 40 MiB in a tick.
+        assert!(adoption_jump(1_000, Some(0.0), 42_000_000, dt));
     }
 
     #[test]
-    fn torrent_rate_window_smooths_across_samples() {
+    fn adoption_jump_keeps_real_traffic() {        let dt = Duration::from_secs(1);
+        // 40 MiB/s on a fast link, tool agrees.
+        assert!(!adoption_jump(0, Some(40.0 * 1024.0 * 1024.0), 41_943_040, dt));
+        // Steady swarm traffic.
+        assert!(!adoption_jump(1_000_000_000, Some(3_000_000.0), 1_003_000_000, dt));
+    }
+
+    #[test]
+    fn torrent_window_averages_piece_bursts() {
         let t0 = Instant::now();
         let mut w = VecDeque::new();
-        // A bursty swarm: 300 KiB, 2.1 MiB, 0, 900 KiB on 2 s ticks.
-        for (i, bytes) in [0u64, 300, 2_400, 2_400, 3_300].iter().enumerate() {
+        // 0, 4 MiB, 4 MiB, 8 MiB over 1 s ticks (pieces land in clumps).
+        for (i, bytes) in [0u64, 4, 4, 8].iter().enumerate() {
             push_rate_sample(
                 &mut w,
-                t0 + Duration::from_secs(i as u64 * 2),
-                bytes * 1024,
+                t0 + Duration::from_secs(i as u64),
+                bytes * 1024 * 1024,
                 TORRENT_RATE_WINDOW,
             );
         }
-        // 3.0 MiB moved over the last 6 s (500 KiB/s), not "0 B/s" - which is
-        // what the raw last tick reported.
         let r = window_rate(&w).expect("windowed rate");
-        assert!((r - 500.0 * 1024.0).abs() < 2_000.0, "rate {r}");
+        // 8 MiB over 3 s, not 4 MiB/s and not 0.
+        assert!((r - (8.0 * 1024.0 * 1024.0 / 3.0)).abs() < 2_000.0, "rate {r}");
+    }
+
+    // HTTP tasks keep the sliding window (bytes moved / elapsed).
+    #[test]
+    fn rate_window_needs_two_samples() {
+        let t0 = Instant::now();
+        let mut w = VecDeque::new();
+        push_rate_sample(&mut w, t0, 1_000, RATE_WINDOW);
+        assert_eq!(window_rate(&w), None, "one sample has no span");
+
+        push_rate_sample(&mut w, t0 + Duration::from_secs(2), 3_000, RATE_WINDOW);
+        let r = window_rate(&w).expect("two samples over 2 s");
+        assert!((r - 1_000.0).abs() < 1.0, "rate {r}");
     }
 
     #[test]
     fn rate_window_restarts_after_a_gap() {
         let t0 = Instant::now();
         let mut w = VecDeque::new();
-        push_rate_sample(&mut w, t0, 0, TORRENT_RATE_WINDOW);
-        push_rate_sample(&mut w, t0 + Duration::from_secs(2), 2_000, TORRENT_RATE_WINDOW);
-        // 60 s pause: the stale sample must not stretch the jump over a
-        // minute (the row would read a fraction of the truth for a tick).
-        push_rate_sample(&mut w, t0 + Duration::from_secs(62), 5_000, TORRENT_RATE_WINDOW);
+        push_rate_sample(&mut w, t0, 0, RATE_WINDOW);
+        push_rate_sample(&mut w, t0 + Duration::from_secs(2), 2_000, RATE_WINDOW);
+        // 60 s pause: the stale sample must not stretch the jump over a minute.
+        push_rate_sample(&mut w, t0 + Duration::from_secs(62), 5_000, RATE_WINDOW);
         assert_eq!(w.len(), 1, "gap starts a fresh baseline");
         assert_eq!(window_rate(&w), None);
 
-        push_rate_sample(&mut w, t0 + Duration::from_secs(64), 7_000, TORRENT_RATE_WINDOW);
+        push_rate_sample(&mut w, t0 + Duration::from_secs(64), 7_000, RATE_WINDOW);
         let r = window_rate(&w).expect("rate after the gap");
         assert!((r - 1_000.0).abs() < 1.0, "rate {r}");
     }
@@ -3047,6 +3424,28 @@ mod tests {
             push_rate_sample(&mut w, t0 + Duration::from_secs(i * 2), i * 1_000, RATE_WINDOW);
         }
         assert!(w.len() <= 2, "2 s window keeps at most two samples, got {}", w.len());
+    }
+
+    // The "bonding is slower than one connection" report: 50/50 across a fast
+    // link and a dying one parks half the swarm on the dead path.
+    #[test]
+    fn weights_follow_measured_throughput() {
+        use std::net::IpAddr;
+        let wifi: IpAddr = "192.168.1.8".parse().unwrap();
+        let tether: IpAddr = "10.118.70.127".parse().unwrap();
+
+        // 7 MB/s vs 2 MB/s: about 10 vs 3.
+        let w = weights_from_rates(&[(wifi, 7.0e6), (tether, 2.0e6)]);
+        assert_eq!(w, vec![(wifi, 10), (tether, 3)]);
+
+        // Tether collapsed to 20 KB/s: quarantined.
+        let w = weights_from_rates(&[(wifi, 7.0e6), (tether, 2.0e4)]);
+        assert_eq!(w, vec![(wifi, 10), (tether, 0)]);
+
+        // Quiet swarm (<1 KiB/s everywhere): stay even instead of quarantining
+        // every uplink.
+        let w = weights_from_rates(&[(wifi, 500.0), (tether, 0.0)]);
+        assert_eq!(w, vec![(wifi, 1), (tether, 1)]);
     }
 }
 
@@ -3076,6 +3475,12 @@ async fn real_main() -> Result<()> {
     {
         let d = daemon.clone();
         tokio::spawn(async move { d.boot_restore_torrents().await });
+    }
+    // Bonding follows the machine from here on (an uplink may show up after
+    // the session was created, e.g. Wi-Fi finishing DHCP at boot).
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { d.watch_bonding().await });
     }
     // Opt-in unattended updates; silent on failure (checked again next boot).
     if daemon.conf().update_check() && daemon.conf().update_auto_install() {

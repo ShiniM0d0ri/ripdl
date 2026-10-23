@@ -93,6 +93,11 @@ the single-stream path.
   (the extension zip ships that manifest; Chrome only reads it for Web Store
   uploads, but keep it matching), then:
   `git tag -a vX.Y.Z; git push origin vX.Y.Z`.
+  Release notes are hand-written: `.github/release-notes/<version>.md`, a
+  handful of user-facing bullets (no commit log, no auto-generated changelog -
+  the workflow concatenates that file with the fixed `.github/release-notes/
+  assets.md` blurb and uses it as the release body). Keep them short and
+  concrete: what changed for the user, not what moved in the tree.
   Proven against v0.2.0 (2026-10-18): release published with all 7 assets.
   Gotchas folded in: CLI bin is `ripdl` (packaging must not invent names),
   `crates/ripdl-gui/icons/icon.png` is required (tauri-build embeds it on
@@ -453,12 +458,74 @@ first-timer README with real screenshots and a bonding diagram, and a
 Windows-CI gate for the LSD-only torrent loopback test (the runner blocks
 that multicast; the ubuntu job still runs it). No RPC changes beyond
 v0.3.16, so 0.3.16 frontends work against a 0.4.0 daemon.
-On main after v0.4.0: torrent rows show a 6 s sliding rate
-(`TORRENT_RATE_WINDOW`) instead of librqbit's short-interval number, which
-flapped between 0 B/s and peak on every tick. The sample pipeline is now
-`push_rate_sample`/`window_rate` (pure, unit-tested, restarts the window after
-a pause-sized gap); HTTP tasks keep the 2 s window, and
-`RUST_LOG=ripdl_daemon=debug` logs one line per sample (shown rate, tool rate)
-for jitter reports. The Settings toolbar button is a real cog (`#i-gear`); the
-unused `#i-sliders` sprite entry is gone.
+On main after v0.4.0: **bonding follows the machine** (vendor delta 5).
+`bind_ips` used to be frozen when the shared torrent session was created, so a
+session built at boot before Wi-Fi finished DHCP - the normal case - stayed on
+one uplink forever; settings even said "restart the daemon". `SessionOptions::
+bind_ips` is now an `Arc<RwLock<Vec<IpAddr>>>` read per outgoing connection
+(`Session::set_bind_ips`), `ipv4_only` is a shared `Arc<AtomicBool>`
+(`set_ipv4_only`), ripdl_core exposes both, and the daemon re-reads
+`bonded_nics()` every 5 s (`watch_bonding`/`sync_torrent_binding`) plus on
+every `SetConfig`. Measured on a Wi-Fi + USB-tether laptop: 30 of 36 peer
+connections were on the default route's **IPv6** address (IPv6 peers never hit
+the bind list, which is IPv4-only), 2 on the tether. Forcing IPv4 fixed the
+spread (5 Wi-Fi / 6 tether) but **cut the peer count** (36 -> 11) - the swarm
+is v6-heavy here, so that policy was reverted.
+What actually decides throughput is path *quality*: measured with curl against
+the same host, Wi-Fi delivered 7 MB/s while the tethered phone delivered
+0.24-2.1 MB/s (it degrades with mobile conditions). A fixed 50/50 split parks
+half the swarm on the dead path - the "bonding is slower than one connection"
+report. Vendor delta 6 meters the bytes each bound connection actually reads
+(`BindMeter`, per-connection `AtomicU64`, no probe traffic) and picks new
+connections with smooth weighted round-robin: weight = measured rate relative
+to the fastest link (1..10), a link under 5% of the best is quarantined (0),
+and every 60 s the weights reset to 1 for one tick so a recovered link can
+prove itself. The daemon samples totals every 5 s, EMA-smooths the rates, and
+publishes them as `Reply::Config.torrent_rates`; `ripdl config` prints
+`torrent uplinks: Wi-Fi 7.0 MB/s · Ethernet 2 idle` and Settings appends the
+same to the bonding line. Weights only steer *new* peer connections - peers
+already connected to a dying uplink stay until they disconnect (candidate
+follow-up: disconnect peers on a quarantined address). The Settings toggle
+applies live (no restart prompt); bound addresses now cover global IPv6 as well
+as IPv4, and the manual "Restart daemon" button stays.
+An uplink must also *prove* it carries traffic: a tether that loses its data
+connection keeps a link-up adapter, an address and a DHCP gateway while
+dropping every packet (measured: 86% of peer dials timed out, 11 live peers vs
+45 with bonding off). `engine/nic.rs::scan_uplinks` runs a source-bound TCP
+handshake per address (1.1.1.1:443, 8.8.8.8:53, 1.2 s, parallel), the daemon
+drops a link after two consecutive failures and re-adopts it on the first
+success, and `Reply::Config.torrent_unreachable` explains a skipped uplink in
+`ripdl config`/Settings.
+Torrent speed display: rows derive bytes/elapsed over a 4 s window
+(`TORRENT_RATE_WINDOW`) instead of trusting librqbit's estimate - measured
+0-600 KiB/s from the tool across 30 s while `downloaded` was frozen, so the
+number lied in the other direction too. A resume makes librqbit report 0 and
+then adopt everything already on disk in one tick; `adoption_jump` (pure,
+unit-tested, plus a 200 MiB/s plausibility cap) drops that baseline instead of
+showing 943 MiB/s. HTTP keeps its 2 s window and tool-rate preference.
+`RUST_LOG=ripdl_daemon=debug` logs one `progress sample` line per tick
+(downloaded, shown rate, tool rate) - that is how the above was measured.
+The Settings toolbar button is a real cog (`#i-gear`); the unused `#i-sliders`
+sprite entry is gone.
+GUI row/context toggle: one `toggleIntent()` (running/queued/verifying/metadata
+= pause, paused/failed/timed = resume, completed torrent = seed stop/start)
+feeds the row button, the context entry and Tasks > Resume/Stop all - a paused
+row used to have no button at all. The context menu resolves
+`closest("#ctx [data-act]")`; reading `ev.target.dataset.act` made every
+icon/label click a no-op (only the blank strip of an entry worked). Parked rows
+report no rate: the daemon answers `speed_bps` only for running/queued, and
+frontends treat it as live (it used to keep the last sample, so a paused row
+printed 8 MiB/s and inflated the total-speed strip).
+GUI selection + row states, round 2: a running task with no progress sample yet
+reports `probing` (the daemon infers it, no engine plumbing) and both frontends
+label it "connecting" instead of `running` + 0 B for the ~6 s probe/plan phase.
+Ctrl/Shift-click, Shift+arrows and Ctrl+A build a multi-selection (`selectedIds`
++ a primary `selectedId` for details/Enter) that drives bulk pause/resume/remove;
+the menu counts only the rows the click would change ("Pause 3 tasks"), hides
+per-row entries, and removing an unfinished task asks first (completed ones stay
+one click so the flow is not slowed down). Headers are generated from `COLS`, so
+View > Peers column (off by default, torrents only, width taken from the name
+column) toggles a column without the header drifting; saved widths are shrunk to
+fit a narrower window (`fitWidths`) instead of growing a scrollbar. The row menu
+also gained "Copy address", and "Open file" only shows when a file exists.
 

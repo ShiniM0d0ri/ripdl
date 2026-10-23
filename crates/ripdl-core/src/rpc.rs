@@ -397,6 +397,16 @@ pub enum Reply {
         /// connections to (empty when the session is not bonded).
         #[serde(default)]
         torrent_bind: Vec<String>,
+        /// Measured download rate per bound uplink (address, bytes/s) from the
+        /// bytes peer connections actually read. Lets frontends say why an
+        /// uplink is being avoided (a dying tether) instead of guessing.
+        #[serde(default)]
+        torrent_rates: Vec<(String, f64)>,
+        /// `"name (addr)"` of interfaces that look like uplinks but failed the
+        /// daemon's reachability check, so a configured-but-dead tether is
+        /// explained rather than silently ignored.
+        #[serde(default)]
+        torrent_unreachable: Vec<String>,
     },
     /// Result of a `CheckUpdate`.
     Update {
@@ -497,6 +507,11 @@ pub struct TaskInfo {
     /// downloading; speed is suppressed while true.
     #[serde(default)]
     pub verifying: bool,
+    /// Running, but no bytes have been reported yet: the engine is still
+    /// probing the URL / planning segments. Frontends show "connecting" so a
+    /// few seconds of setup does not read as a stalled download.
+    #[serde(default)]
+    pub probing: bool,
     #[serde(default)]
     pub error: Option<String>,
     /// Unix seconds when the task may start (None = immediately).
@@ -570,10 +585,14 @@ mod tests {
                 settings,
                 torrent_session,
                 torrent_bind,
+                torrent_rates,
+                torrent_unreachable,
             } => {
                 assert_eq!(settings.max_segments, Some(4));
                 assert!(!torrent_session);
                 assert!(torrent_bind.is_empty());
+                assert!(torrent_rates.is_empty());
+                assert!(torrent_unreachable.is_empty());
             }
             other => panic!("unexpected reply: {other:?}"),
         }
@@ -585,16 +604,25 @@ mod tests {
             settings: DaemonSettings::default(),
             torrent_session: true,
             torrent_bind: vec!["10.0.0.2".to_string()],
+            torrent_rates: vec![("10.0.0.2".to_string(), 7.0e6)],
+            torrent_unreachable: vec!["Ethernet 2 (10.99.0.5)".to_string()],
         };
         let json = serde_json::to_string(&reply).expect("serialize");
         match serde_json::from_str::<Reply>(&json).expect("parse") {
             Reply::Config {
                 torrent_session,
                 torrent_bind,
+                torrent_rates,
+                torrent_unreachable,
                 ..
             } => {
                 assert!(torrent_session);
                 assert_eq!(torrent_bind, vec!["10.0.0.2".to_string()]);
+                assert_eq!(torrent_rates, vec![("10.0.0.2".to_string(), 7.0e6)]);
+                assert_eq!(
+                    torrent_unreachable,
+                    vec!["Ethernet 2 (10.99.0.5)".to_string()]
+                );
             }
             other => panic!("unexpected reply: {other:?}"),
         }

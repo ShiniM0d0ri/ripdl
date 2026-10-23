@@ -154,6 +154,8 @@ tr:hover .row-btn { opacity: 1; }
 .row-btn:hover { background: #e8f0f8; border-color: #9fb8d0; }
 .actions { white-space: nowrap; }
 td.col-act { text-overflow: clip; overflow: visible; }
+/* The kind cell is one icon: an ellipsis here would just be dots. */
+td.kind-cell { text-overflow: clip; overflow: visible; }
 
 .fname-cell { display: flex; align-items: center; gap: 6px; }
 .ficon { width: 16px; text-align: center; flex: none; display: inline-flex; }
@@ -192,6 +194,7 @@ td.prog-cell .pct { margin-left: 6px; color: #45505a; }
 .st-err { color: #b02a2a; font-weight: 400; font-size: 11px; max-width: 150px; white-space: normal; line-height: 1.15; }
 .st-timed { color: #9a7d3c; font-weight: 600; }
 .st-verifying { color: #7a5ca8; font-weight: 600; }
+.st-connecting { color: #34689b; font-weight: 600; }
 
 /* Update banner: only ever shown when a newer GitHub release exists. */
 #update-banner {

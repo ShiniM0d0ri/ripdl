@@ -89,6 +89,14 @@ Guiding rules:
       Content-Disposition name or a `.torrent` payload name beats an opaque
       URL tail (`.../12e29558-...?rscd=...filename=X`) and the file-type
       glyph/category/icon pick the real extension
+- [x] Selection + row states: Ctrl/Shift-click, Shift+arrows and Ctrl+A build
+      a multi-selection that drives bulk pause/resume/remove (the menu counts
+      only the rows the click changes); removing an unfinished task asks first
+      while a finished one stays one click; `probing` (daemon-side: running with
+      no sample yet) reads as "connecting" instead of 0 B; View > Peers column
+      (off by default, torrents only, takes its width from the name column) and
+      "Copy address" in the row menu; saved widths shrink to fit a narrower
+      window instead of scrolling
 - [x] Tray footprint: the WebView2 is suspended while the window is hidden
       (`webview_mem.rs` - controller visible flag, `TrySuspend`, Low memory
       target; `reveal()` resumes before showing), and the webview runs
@@ -302,6 +310,21 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       "active on <uplinks>", "enabled, but the running session is not bonded -
       restart the daemon", or "off, but the session is still bonded - restart"
       instead of repeating a config value torrents have not picked up
+- [x] Bonding follows the machine (post-0.4.0): the shared torrent session's
+      bind list is hot-swapped (`Session::set_bind_ips`, vendored delta 5), so
+      an uplink that appears after boot (Wi-Fi DHCP finishing, a phone plugged
+      in) joins within seconds and the Settings toggle applies without a
+      restart. Bonding also measures instead of assuming: vendor delta 6 meters
+      the bytes each bound connection reads and weights new peer connections by
+      relative throughput (quarantining a link under 5 % of the fastest), which
+      fixes "combined is slower than one connection" when a tether degrades.
+      Forcing IPv4 to spread a v6-heavy swarm was tried and reverted (it cost
+      two thirds of the peers). Uplinks must also pass a source-bound TCP probe
+      before joining (a dead tether keeps its adapter, address and gateway while
+      dropping every packet: 86 % of dials timed out); two failures drop a link,
+      the first success re-adopts it, and dead ones are listed as unreachable.
+      Torrent rows report bytes/elapsed over 4 s with an adoption guard (a resume
+      no longer reads as 943 MiB/s).
 - [x] Torrent fastresume: librqbit gained `SessionOptions::fastresume_folder`
       (vendored delta 4) pointing at `<data_dir>/ripdl/torrent-state`. Only
       the bitfield half of the JSON store is used, so `<info-hash>.bitv` is

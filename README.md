@@ -74,8 +74,22 @@ bytes add up.
 **Honest limits:** the uplinks must be genuinely independent. A cable and Wi-Fi
 that both belong to the same router still share one ISP line, so you gain
 nothing; a laptop on Wi-Fi plus a phone on mobile data (USB-tethered) really do
-add up. It is off by default for that reason, and torrent bonding is fixed when
-the daemon starts — restart it after toggling.
+add up. It is off by default for that reason.
+
+Torrents follow the network too: the set of uplinks is re-read every few
+seconds (plug the phone in later and it joins without a restart), and new peer
+connections are weighted by what each uplink **actually delivers**. A tethered
+phone that drops from 30 Mbps to 2 Mbps stops receiving half the swarm — ripdl
+measures the bytes each link moves and sends new connections to the fast one,
+quarantining a link that falls below 5 % of the best until it recovers.
+`ripdl config` (and Settings) show the live per-uplink rates.
+
+An uplink also has to *prove* it works: a phone tether that loses its data
+connection (a call, a dead spot) keeps its adapter up, its address and even its
+DHCP gateway, so it looks like a normal interface while every packet is
+dropped. ripdl probes each uplink with a source-bound TCP handshake before
+bonding it, drops a link after two failed probes and re-adopts it on the first
+success — no dead path ever eats half the peer connections.
 
 ## Features
 

@@ -447,6 +447,41 @@ impl TorrentSession {
         &self.session
     }
 
+    /// Bonded source addresses the shared session rotates peer connections
+    /// over right now (empty when bonding is off).
+    pub fn bind_ips(&self) -> Vec<IpAddr> {
+        self.session.bind_ips()
+    }
+
+    /// Hot-swap the bonded uplinks without rebuilding the session: Wi-Fi can
+    /// finish DHCP after boot restore created the session, and a tether can
+    /// be plugged in later. Peers already connected keep their address.
+    pub fn set_bind_ips(&self, ips: Vec<IpAddr>) {
+        self.session.set_bind_ips(ips);
+    }
+
+    /// Refuse IPv6 peer connections. Bonding needs this when more than one
+    /// uplink is bound: a v6 peer can only ever take the OS default route, so
+    /// it would pin the whole swarm to one link while the other idles.
+    pub fn set_ipv4_only(&self, ipv4_only: bool) {
+        self.session.set_ipv4_only(ipv4_only);
+    }
+
+    pub fn is_ipv4_only(&self) -> bool {
+        self.session.is_ipv4_only()
+    }
+
+    /// Share of new peer connections per bonded uplink (0 = quarantine).
+    /// Derived from `bind_totals`, so a slow link stops stealing peers.
+    pub fn set_bind_weights(&self, weights: Vec<(IpAddr, u32)>) {
+        self.session.set_bind_weights(weights);
+    }
+
+    /// Monotonic bytes read over each bonded uplink.
+    pub fn bind_totals(&self) -> Vec<(IpAddr, u64)> {
+        self.session.bind_totals()
+    }
+
     /// Make sure the torrent is managed, in the requested run state.
     /// Idempotent per info-hash: an already-managed torrent is paused or
     /// unpaused to match `running`; a fresh one is added with this task's
