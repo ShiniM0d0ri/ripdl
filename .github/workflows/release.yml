@@ -167,23 +167,24 @@ jobs:
       - name: Named artifacts (dry-run inspection)
         run: ls -la dist/
 
+      - name: Compose release notes
+        # Notes are hand-written per release: .github/release-notes/<version>.md
+        # (a few bullets), followed by the fixed asset blurb. No auto-generated
+        # changelog - the release page stays short and readable.
+        run: |
+          V=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          F=".github/release-notes/$V.md"
+          {
+            if [ -f "$F" ]; then cat "$F"; else echo "Maintenance release."; fi
+            printf '\n'
+            cat .github/release-notes/assets.md
+          } > release-notes.md
+        id: notes
+
       - name: Attach to release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
-          body: |
-            **Windows**: `...-windows-setup.exe` installs ripdl (the GUI
-            auto-spawns the daemon on first run). `...-windows-portable.zip`
-            is unzip-and-run - no admin needed.
-
-            **Linux**: the `.deb` / `.rpm` install CLI + daemon + GUI with
-            runtime dependencies declared. Portable tar users need the GUI
-            runtime installed for the window to start
-            (`libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3`).
-            The CLI and daemon alone need nothing beyond libc.
-
-            **Browser extension**: `ripdl-browser-extension-*.zip` - unzip and
-            load it via chrome://extensions > Developer mode > Load unpacked
-            (see ext/README.md inside the zip).
+          body_path: release-notes.md
