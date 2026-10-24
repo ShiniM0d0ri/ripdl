@@ -5,11 +5,14 @@
 //! once here and every frontend gets them.
 
 pub mod bridge;
+pub mod bundle;
 pub mod categories;
 pub mod engine;
 pub mod error;
+pub mod extplug;
 pub mod hunt;
 pub mod lan;
+pub mod names;
 pub mod queue;
 pub mod refresh;
 pub mod rpc;

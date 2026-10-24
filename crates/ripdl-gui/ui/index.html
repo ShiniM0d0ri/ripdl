@@ -51,6 +51,9 @@
     <button id="btn-add-torrent" class="tb-btn" title="Add a .torrent file (Ctrl+T)" aria-label="Add torrent file">
       <svg class="ico green"><use href="#i-tfile"/></svg>
     </button>
+    <button id="btn-add-bundle" class="tb-btn" title="Add multi-part links (Ctrl+B)" aria-label="Add multi-part download">
+      <svg class="ico amber"><use href="#i-layers"/></svg>
+    </button>
     <button id="btn-resume-all" class="tb-btn" title="Resume all paused / failed" aria-label="Resume all">
       <svg class="ico blue"><use href="#i-play"/></svg>
     </button>
@@ -150,6 +153,30 @@
     </div>
   </div>
 
+  <!-- Add multi-part (bundle) dialog: several direct links, one folder -->
+  <div id="bdlg-backdrop" class="hidden">
+    <div id="bdlg">
+      <div class="dlg-title">Add multi-part download</div>
+      <div class="dlg-hint">One link per line. Links that share a base name (x.part01.rar, x.part02.rar, x.part03.rar) become <b>one</b> task that owns a folder named after that base.</div>
+      <textarea id="bdlg-urls" rows="7" spellcheck="false" placeholder="https://example.com/x.part01.rar&#10;https://example.com/x.part02.rar&#10;https://example.com/x.part03.rar"></textarea>
+      <div class="dlg-row">
+        <label for="bdlg-name">Folder name</label>
+        <input id="bdlg-name" type="text" placeholder="(from the links)" />
+      </div>
+      <div class="dlg-row">
+        <label for="bdlg-dest">Save to</label>
+        <input id="bdlg-dest" type="text" placeholder="&lt;your downloads folder&gt;" />
+        <button id="bdlg-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
+      </div>
+      <div id="bdlg-preview" class="dlg-hint"></div>
+      <div class="dlg-actions">
+        <button id="bdlg-cancel">Cancel</button>
+        <button id="bdlg-ok" class="primary">Download all</button>
+      </div>
+      <div id="bdlg-err" class="hidden"></div>
+    </div>
+  </div>
+
   <!-- About dialog (Help > About ripdl) -->
   <div id="abt-backdrop" class="hidden">
     <div id="abt">
@@ -238,7 +265,7 @@
     <div data-act="details"><svg class="ico"><use href="#i-info"/></svg><span id="ctx-details-lbl">Details&hellip;</span></div>
     <div data-act="refresh"><svg class="ico"><use href="#i-globe"/></svg>Refresh address&hellip;</div>
     <div data-act="copyAddress"><svg class="ico"><use href="#i-copy"/></svg>Copy address</div>
-    <div data-act="openFile"><svg class="ico"><use href="#i-file"/></svg>Open file</div>
+    <div data-act="openFile"><svg class="ico"><use href="#i-file"/></svg><span id="ctx-open-lbl">Open file</span></div>
     <div data-act="openFolder"><svg class="ico"><use href="#i-folder"/></svg>Open download folder</div>
     <hr />
     <div data-act="remove"><svg class="ico"><use href="#i-x"/></svg><span id="ctx-remove-lbl">Remove from list</span></div>
@@ -270,6 +297,7 @@
       <div id="hdt-body"></div>
       <div id="hdt-actions">
         <button id="hdt-refresh"><svg class="ico"><use href="#i-globe"/></svg>Refresh address&hellip;</button>
+        <button id="hdt-addparts" class="hidden"><svg class="ico"><use href="#i-layers"/></svg>Add parts&hellip;</button>
         <button id="hdt-copy" title="Copy the download address to the clipboard"><svg class="ico"><use href="#i-file"/></svg>Copy address</button>
         <span class="hdt-gap"></span>
         <button id="hdt-open"><svg class="ico"><use href="#i-file"/></svg>Open file</button>
@@ -281,7 +309,7 @@
   <!-- Refresh download address (expired signed link, same file) -->
   <div id="rdlg-backdrop" class="hidden">
     <div id="rdlg">
-      <div class="dlg-title">Refresh download address<em> same file, fresh link</em></div>
+      <div class="dlg-title"><span id="rdlg-title">Refresh download address</span><em> same file, fresh link</em></div>
       <div class="rdlg-hint" id="rdlg-hint"></div>
       <textarea id="rdlg-url" rows="3" spellcheck="false" placeholder="https://example.com/file.zip?token=..."></textarea>
       <div class="dlg-actions">
@@ -289,6 +317,20 @@
         <button id="rdlg-ok" class="primary">Refresh &amp; resume</button>
       </div>
       <div id="rdlg-err" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- Add missing parts to an existing bundle -->
+  <div id="apdlg-backdrop" class="hidden">
+    <div id="apdlg">
+      <div class="dlg-title">Add parts<em> append links to this bundle</em></div>
+      <div class="rdlg-hint">One link per line. Each link must name a part of this bundle (same base name plus a part number, e.g. <b>x.part03.rar</b>); links the bundle already carries are skipped. The bundle restarts afterwards and finished parts never re-download.</div>
+      <textarea id="apdlg-urls" rows="6" spellcheck="false" placeholder="https://example.com/x.part03.rar"></textarea>
+      <div class="dlg-actions">
+        <button id="apdlg-cancel">Cancel</button>
+        <button id="apdlg-ok" class="primary">Add parts</button>
+      </div>
+      <div id="apdlg-err" class="hidden"></div>
     </div>
   </div>
 
@@ -306,6 +348,19 @@
           <button id="set-dir-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
         </div>
         <div class="set-row"><label for="set-ytdlp">yt-dlp path</label><input id="set-ytdlp" type="text" placeholder="yt-dlp (on PATH)" /></div>
+        <div class="set-sec">Browser extension</div>
+        <div class="set-row"><label>Browser setup</label>
+          <button id="set-ext-open" title="Open the detected browser's extensions page. Load the unpacked extension from the folder shown below.">Open extension settings</button>
+        </div>
+        <div id="set-browser-info" class="set-hint" aria-live="polite"></div>
+        <div class="set-row"><label for="set-ext" title="Optional path to an unpacked extension you loaded manually. User scripts install into its hosts/local folder.">Manual extension folder override</label>
+          <input id="set-ext" type="text" placeholder="(app-managed extension by default)" />
+          <button id="set-ext-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
+        </div>
+        <div id="set-ext-info" class="set-hint"></div>
+        <div class="set-row"><label>Install hoster plugin</label>
+          <button id="set-plugbtn" title="Copy a .js script into the extension's hosts/local folder and regenerate its registry; finish with the Reload click in chrome://extensions, then enable it on the Plugins page."><svg class="ico"><use href="#i-layers"/></svg>Pick .js file&hellip;</button>
+        </div>
         <div class="set-row"><label for="set-tray">Minimize to tray on close</label><input id="set-tray" type="checkbox" class="chk-box" /></div>
         <div class="set-row"><label for="set-bond">Combine network connections (bond all NICs)</label><input id="set-bond" type="checkbox" class="chk-box" /></div>
         <div id="set-bond-info" class="set-hint"></div>

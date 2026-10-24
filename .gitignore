@@ -6,6 +6,15 @@ dist/
 
 research/
 
+# User-loaded hoster scripts live in the extension folder but are user-owned:
+# never committed. The generated registry module is the exception - the
+# service worker statically imports it, so it must ship (empty by default).
+ext/hosts/local/*
+!ext/hosts/local/registry.js
+
+# Local hoster plugins - user-owned, never committed (see docs/plan-bundles-and-plugins.md)
+plugins/
+
 # OS junk
 Thumbs.db
 Desktop.ini

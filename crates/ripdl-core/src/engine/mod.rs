@@ -190,6 +190,24 @@ impl Engine {
         token: CancellationToken,
         on_progress: impl FnMut(Progress) + Send + 'static,
     ) -> Result<PathBuf> {
+        self.download_named(url, dest_dir, None, token, on_progress)
+            .await
+    }
+
+    /// Like [`Engine::download`], but the file is written under `filename`
+    /// instead of the name the server advertises.
+    ///
+    /// Bundle parts need this: hosters routinely answer every part with
+    /// `attachment; filename=download.zip`, which would otherwise collapse a
+    /// whole multi-part set onto one name. The name is still sanitized.
+    pub async fn download_named(
+        &self,
+        url: &str,
+        dest_dir: Option<PathBuf>,
+        filename: Option<String>,
+        token: CancellationToken,
+        on_progress: impl FnMut(Progress) + Send + 'static,
+    ) -> Result<PathBuf> {
         let info = self.plan(url).await?;
 
         let dir = match dest_dir {
@@ -197,7 +215,10 @@ impl Engine {
             None => std::env::current_dir()?,
         };
         std::fs::create_dir_all(&dir)?;
-        let dest = dir.join(&info.filename);
+        let name = filename
+            .map(|f| crate::names::sanitize_component(&f, &info.filename))
+            .unwrap_or_else(|| info.filename.clone());
+        let dest = dir.join(&name);
         let state_path = sidecar_path(&dest);
 
         let id = uuid::Uuid::new_v4().to_string();

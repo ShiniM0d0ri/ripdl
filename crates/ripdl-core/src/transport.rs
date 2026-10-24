@@ -10,7 +10,16 @@ use tokio::io::AsyncWrite;
 /// listeners visible outside the local session.
 pub const PIPE_NAME: &str = "\\\\.\\pipe\\ripdl-rpc";
 
-/// ripdl's per-user data directory (queue, config, manifests).
+/// ripdl's shared per-user data directory for queue, settings, and managed
+/// extension files. Kept aligned with `dirs::data_local_dir()` on all OSes.
+pub fn app_data_dir() -> io::Result<std::path::PathBuf> {
+    dirs::data_local_dir()
+        .map(|dir| dir.join("ripdl"))
+        .ok_or_else(|| io::Error::other("cannot resolve local data directory"))
+}
+
+/// Base directory for the local RPC socket on Unix and native-host files.
+/// Queue, settings, and the managed extension use [`app_data_dir`].
 pub fn data_dir() -> io::Result<std::path::PathBuf> {
     #[cfg(windows)]
     {

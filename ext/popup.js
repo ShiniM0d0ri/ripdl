@@ -4,9 +4,31 @@
 const statusEl = document.getElementById("status");
 const captureEl = document.getElementById("capture");
 const shareCookiesEl = document.getElementById("shareCookies");
+const versionEl = document.getElementById("version");
+
+async function loadVersion() {
+    versionEl.textContent = `Extension ${chrome.runtime.getManifest().version} · app version unavailable`;
+    try {
+        const info = await chrome.runtime.sendMessage({ type: "ripdl_ext_info" });
+        if (!info?.appVersion) return;
+        if (info.skew === 0) {
+            versionEl.textContent = `Extension ${info.extVersion} · app ${info.appVersion}`;
+        } else if (info.skew < 0) {
+            versionEl.textContent = `Extension ${info.extVersion} · app ${info.appVersion} · Reload in chrome://extensions`;
+            versionEl.className = "warn";
+        } else {
+            versionEl.textContent = `Extension ${info.extVersion} · app ${info.appVersion} · update ripdl`;
+            versionEl.className = "warn";
+        }
+    } catch {
+        // Daemon may be unavailable; the extension version remains useful.
+    }
+}
+
+loadVersion();
 
 async function probeDaemon() {
-  statusEl.textContent = "daemon: connecting…";
+    statusEl.textContent = "daemon: connecting";
   statusEl.className = "down";
   chrome.runtime.sendMessage({ type: "ripdl_light_probe" }); // wakes the SW
   // The SW answers through the badge; also try the storage of last state.
@@ -24,6 +46,8 @@ async function loadSettings() {
   statusEl.textContent = s.hostAlive ? "daemon: connected" : "daemon: not running";
   statusEl.className = s.hostAlive ? "ok" : "down";
 }
+
+loadSettings();
 
 captureEl.addEventListener("change", async () => {
   await chrome.storage.local.set({ capture: captureEl.checked });
@@ -121,3 +145,6 @@ chrome.runtime.sendMessage({ type: "ripdl_hunt_query" }, (hunt) => {
 // Ask the SW for fresh liveness; it mirrors it into storage.
 chrome.runtime.sendMessage({ type: "ripdl_light_probe" }).catch(() => {});
 probeDaemon();
+
+// Hoster plugins options page (chrome.runtime.openOptionsPage works from any extension page).
+document.getElementById("plugins-link").addEventListener("click", (e) => { e.preventDefault(); chrome.runtime.openOptionsPage(); });

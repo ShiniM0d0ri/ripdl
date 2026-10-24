@@ -11,14 +11,81 @@
  *      just enough to fetch the same bytes the browser would.
  *   3. If the daemon is missing or rejects a task, the browser downloads
  *      normally. The extension exists to make ripdl better, not to nag.
- *   4. No content scripts, no polling loops, no history permission, no
- *      remote messaging channels.
+ *   4. One content script (`capture.js`) and it only runs a `copy` listener:
+ *      no polling loops, no history permission, no remote messaging
+ *      channels, no page content read outside a copy the user made.
  *
  * The daemon owns capture policy (size floors, extension lists, fallback).
  * The extension only supplies what the wire protocol needs.
  */
 
+/* --- hoster plugins (user-loadable; see plugins.js) ------------------- */
+
+import { pluginNameFor, pluginResolve, registry, validateRecipe } from "./plugins.js";
+
+/** Fill in filenames a page never knew: a plugin may read a name carried in
+ * the URL fragment, so grouping works before any network happens. */
+async function nameLinks(links) {
+    const out = [];
+    for (const l of links) {
+        if (l.filename) { out.push(l); continue; }
+        try {
+            const name = await pluginNameFor(l.url);
+            out.push(name ? { ...l, filename: name } : l);
+        } catch {
+            out.push(l);
+        }
+    }
+    return out;
+}
+
+/** Resolve share links into direct ones at send time. A part that fails
+ * (plugin errors, host refuses, no plugin) keeps its original URL - the
+ * honest-fallback rule: queue it as-is rather than lose it. */
+async function resolveParts(parts) {
+    let resolved = 0;
+    let unresolved = 0;
+    const out = [];
+    for (const p of parts) {
+        let r = null;
+        try { r = await pluginResolve(p); } catch { r = null; }
+        if (r && r.url && r.url !== p.url) {
+            resolved++;
+            out.push({
+                ...p,
+                url: r.url,
+                filename: r.name || p.filename,
+                headers: r.headers && typeof r.headers === "object" ? { ...p.headers, ...r.headers } : p.headers,
+            });
+        } else {
+            if (r) { /* matched but returned the same URL */ resolved++; }
+            else { unresolved++; }
+            out.push(p);
+        }
+    }
+    return { parts: out, resolved, unresolved };
+}
+
 const HOST_NAME = "org.ripdl.host";
+
+/** Async message handlers must ALWAYS answer: a dropped sendResponse hangs
+ * the caller (the options page polls forever). Wrap, catch, reply. */
+function replyAsync(sendResponse, fn) {
+    (async () => {
+        try { sendResponse(await fn()); }
+        catch (e) { try { sendResponse({ ok: false, error: String(e?.message || e) }); } catch { /* channel closed */ } }
+    })();
+}
+
+function compareVersions(a, b) {
+    const left = String(a).split("-")[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+    const right = String(b).split("-")[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(left.length, right.length); i++) {
+        const delta = (left[i] || 0) - (right[i] || 0);
+        if (delta) return Math.sign(delta);
+    }
+    return 0;
+}
 
 /** webRequest requestHeaders we keep (MV3 hides UA without extraHeaders). */
 const KEPT_HEADERS = new Set(["referer", "user-agent"]);
@@ -167,10 +234,154 @@ function connectHost() {
         for (const p of pending.values()) p.resolve(null);
         pending.clear();
     });
+    send({
+        id: `ext-${nextId++}`,
+        cmd: { type: "extension_hello", version: chrome.runtime.getManifest().version },
+    });
     // Cheap liveness probe: the daemon replies `ok` to an empty listing.
     send({ id: `probe-${nextId++}`, cmd: { type: "list" } }).then((r) => {
         setHostAlive(!!r);
     });
+}
+
+/* --- multi-part offers (copy capture, selection menu) ------------------ */
+
+/** Links one offer may carry (capture.js caps too; the daemon validates). */
+const MAX_OFFER_LINKS = 100;
+/** Daemon bundle support, learned once from `get_config`: null = unknown.
+ * Older daemons omit the `bundles` capability field, so the offer falls back
+ * to the per-link path they already know - no probing with unknown commands. */
+let daemonBundles = null;
+
+function httpOnly(url) {
+    try {
+        const u = new URL(String(url));
+        return u.protocol === "http:" || u.protocol === "https:" ? u.href : "";
+    } catch {
+        return "";
+    }
+}
+
+/** Keep only what the wire protocol needs: http(s), deduped, bounded. */
+function sanitizeLinks(list) {
+    const out = [];
+    const seen = new Set();
+    for (const item of (Array.isArray(list) ? list : [])) {
+        if (out.length >= MAX_OFFER_LINKS) break;
+        const url = httpOnly(typeof item === "string" ? item : item && item.url);
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        const raw = item && typeof item.name === "string" ? item.name.trim().slice(0, 200) : "";
+        out.push({ url, filename: raw || null });
+    }
+    return out;
+}
+
+/** Referer for links the page never requested (hotlink checks). */
+function pageHeaders(page) {
+    const p = httpOnly(page);
+    return p ? { Referer: p } : {};
+}
+
+/** Ask the daemon how a selection groups; a pre-bundle daemon degrades to
+ * "every link is its own download", so the offer still works there. */
+async function previewGroups(links) {
+    // Plugins first: filenames from the URLs themselves (cheap, no network)
+    // make the grouping right even when the page only had bare links.
+    links = await nameLinks(links);
+    if (daemonBundles === null) {
+        // Capability, not a probe-unknown-command timeout: one `get_config`
+        // answers the same on every daemon, and `bundles: false` (older
+        // daemons just omit the field) says the bundle path is unavailable.
+        // A missing reply (host down) stays unknown: the next offer retries.
+        const cfg = await send({ id: `cfg-${nextId++}`, cmd: { type: "get_config" } });
+        if (cfg?.reply?.type === "config") {
+            daemonBundles = !!cfg.reply.bundles;
+        }
+    }
+    if (daemonBundles) {
+        const resp = await send({
+            id: `pv-${nextId++}`,
+            cmd: { type: "preview_bundle", links: links.map((l) => ({ url: l.url, filename: l.filename })) },
+        });
+        const groups = resp?.reply?.type === "bundle_preview" ? resp.reply.groups : null;
+        if (groups) return { groups, bundled: true };
+        // The daemon said it supports bundles but refused this preview; show
+        // the links ungrouped rather than nothing.
+        return { groups: links.map(singleGroup), bundled: false };
+    }
+    return { groups: links.map(singleGroup), bundled: false };
+}
+
+function singleGroup(link) {
+    return {
+        name: tailName(link.filename || link.url),
+        parts: [{ url: link.url, filename: link.filename, seq: null }],
+        first: 1,
+        total: null,
+        missing: [],
+    };
+}
+
+function tailName(url) {
+    try {
+        const tail = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+        return tail || "download";
+    } catch {
+        return "download";
+    }
+}
+
+/** Queue the offered groups: a multi-part group becomes ONE bundle task, a
+ * single link stays an ordinary download (same rule as the GUI dialog). */
+async function sendGroups(groups, page) {
+    const headers = pageHeaders(page);
+    let bundles = 0;
+    let singles = 0;
+    let failed = 0;
+    let unresolved = 0;
+    for (const g of Array.isArray(groups) ? groups : []) {
+        const raw = (g.parts || [])
+            .map((p) => ({
+                url: httpOnly(p && p.url),
+                filename: p && typeof p.filename === "string" ? p.filename : "",
+                headers,
+            }))
+            .filter((p) => p.url);
+        if (!raw.length) continue;
+        // Plugins turn share links into direct ones here - after the user
+        // said go, before anything is queued. A part no plugin could resolve
+        // keeps its original URL and is counted, never dropped.
+        const { parts, unresolved: unres } = await resolveParts(raw);
+        unresolved += unres;
+        if (parts.length > 1 && daemonBundles === true) {
+            const name = typeof g.name === "string" && g.name.trim() ? g.name.trim() : null;
+            const resp = await send({
+                id: `bundle-${nextId++}`,
+                cmd: { type: "add_bundle", name, dest_dir: null, parts },
+            });
+            if (resp?.reply?.type === "added") {
+                bundles++;
+                continue;
+            }
+            // Daemon too old (or a bad group): keep the promise - every link
+            // still gets queued, one task each.
+            if (resp) daemonBundles = false;
+        }
+        for (const p of parts) {
+            if (await sendSingle(p)) singles++;
+            else failed++;
+        }
+    }
+    return { ok: bundles + singles > 0, bundles, singles, failed, unresolved };
+}
+
+async function sendSingle(part) {
+    const resp = await send({
+        id: `link-${nextId++}`,
+        cmd: { type: "add", url: part.url, dest_dir: null, headers: part.headers || {} },
+    });
+    return resp?.reply?.type === "added";
 }
 
 /** Popup and other UI poke us here; answer is mirrored via storage. */
@@ -181,6 +392,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else {
             send({ id: `probe-${nextId++}`, cmd: { type: "list" } }).then((r) => setHostAlive(!!r));
         }
+    }
+    if (msg?.type === "ripdl_offer") {
+        // The copy chip: group the selection and describe it. Nothing is
+        // queued here - the user still has to click Send.
+        (async () => {
+            const links = sanitizeLinks(msg.links);
+            if (!links.length) {
+                sendResponse({ groups: [], bundled: daemonBundles !== false });
+                return;
+            }
+            const preview = await previewGroups(links);
+            sendResponse({ groups: preview.groups, bundled: preview.bundled, hostAlive });
+        })();
+        return true; // async reply
+    }
+    if (msg?.type === "ripdl_offer_send") {
+        (async () => {
+            sendResponse(await sendGroups(msg.groups, msg.page));
+        })();
+        return true; // async reply
     }
     if (msg?.type === "ripdl_hunt_query") {
         // activeTab is granted by the popup click, so the active page URL
@@ -201,6 +432,95 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sendResponse({ pageUrl, videoish, media });
         })();
         return true; // async reply
+    }
+    if (msg?.type === "ripdl_plugins_list") {
+        replyAsync(sendResponse, async () => {
+            const seen = (await chrome.storage.local.get("plugin_seen")).plugin_seen || {};
+            return {
+                plugins: (await registry()).map((e) => ({
+                    id: e.id, label: e.label, kind: e.kind, file: e.file || null,
+                    error: e.error || null, enabled: e.enabled, seen: e.kind !== "script" || seen[e.file] === true,
+                })),
+                dir: "hosts/local/",
+            };
+        });
+        return true;
+    }
+    if (msg?.type === "ripdl_ext_info") {
+        replyAsync(sendResponse, async () => {
+            if (!port) connectHost();
+            const resp = await send({ id: `cfg-${nextId++}`, cmd: { type: "get_config" } });
+            const appVersion = resp?.reply?.type === "config" && typeof resp.reply.version === "string"
+                ? resp.reply.version
+                : null;
+            const extVersion = chrome.runtime.getManifest().version;
+            const skew = appVersion === null ? null : compareVersions(extVersion, appVersion);
+            return { extVersion, appVersion, skew };
+        });
+        return true;
+    }
+    if (msg?.type === "ripdl_plugin_toggle" && typeof msg.id === "string") {
+        replyAsync(sendResponse, async () => {
+            const all = (await chrome.storage.local.get("plugins_enabled")).plugins_enabled || {};
+            all[msg.id] = !!msg.enabled;
+            await chrome.storage.local.set({ plugins_enabled: all });
+            return { ok: true };
+        });
+        return true;
+    }
+    if (msg?.type === "ripdl_plugin_seen" && typeof msg.file === "string") {
+        replyAsync(sendResponse, async () => {
+            const seen = (await chrome.storage.local.get("plugin_seen")).plugin_seen || {};
+            seen[msg.file] = true;
+            await chrome.storage.local.set({ plugin_seen: seen });
+            return { ok: true };
+        });
+        return true;
+    }
+    if (msg?.type === "ripdl_recipe_import" && typeof msg.text === "string") {
+        replyAsync(sendResponse, async () => {
+            // Validate, then store the RAW object: validateRecipe's output is
+            // engine-shaped, not recipe-shaped, and would fail re-validation
+            // (and therefore never load) on the next registry read.
+            const raw = JSON.parse(msg.text);
+            const recipe = validateRecipe(raw);
+            const all = (await chrome.storage.local.get("plugin_recipes")).plugin_recipes || [];
+            const kept = all.filter((r) => r && r.id !== recipe.id);
+            kept.push(raw);
+            await chrome.storage.local.set({ plugin_recipes: kept });
+            const en = (await chrome.storage.local.get("plugins_enabled")).plugins_enabled || {};
+            en[recipe.id] = true;
+            await chrome.storage.local.set({ plugins_enabled: en });
+            return { ok: true, id: recipe.id };
+        });
+        return true;
+    }
+    if (msg?.type === "ripdl_recipe_delete" && typeof msg.id === "string") {
+        replyAsync(sendResponse, async () => {
+            const all = (await chrome.storage.local.get("plugin_recipes")).plugin_recipes || [];
+            await chrome.storage.local.set({ plugin_recipes: all.filter((r) => r?.id !== msg.id) });
+            return { ok: true };
+        });
+        return true;
+    }
+    if (msg?.type === "ripdl_plugin_test" && typeof msg.id === "string" && typeof msg.url === "string") {
+        // Try one URL against one plugin: the name it would group under and
+        // the direct URL it would resolve to. Runs wherever the plugin runs
+        // in production; nothing is queued.
+        replyAsync(sendResponse, async () => {
+            const entry = (await registry()).find((e) => e.id === msg.id);
+            if (!entry?.plugin) return { ok: false, error: entry?.error || "plugin not found" };
+            const out = {};
+            if (entry.plugin.match) out.matched = !!entry.plugin.match(msg.url);
+            if (out.matched && entry.plugin.name) out.name = (await entry.plugin.name(msg.url)) ?? null;
+            if (out.matched && entry.plugin.resolve) {
+                const r = await entry.plugin.resolve({ url: msg.url, filename: null }, { fetch: (u, o) => fetch(u, o) });
+                out.resolved = r ? r.url : null;
+                if (r?.name) out.name = r.name;
+            }
+            return { ok: true, ...out };
+        });
+        return true;
     }
     if (msg?.type === "ripdl_send" && msg.cmd && typeof msg.cmd.type === "string") {
         // Popup-initiated task add (hunt buttons). Same rejection contract:
@@ -390,13 +710,21 @@ async function seize(item, suggest, rec) {
 
 /* --- selection / all-links: on-demand scripting, never resident ------- */
 
-/** Injected at menu-click time; collects links absolutely. */
+/** Injected at menu-click time; collects links absolutely. Anchor text is
+ * kept only when it names a file: a page full of "Download" anchors must not
+ * turn every link into a part called "Download". */
 function collectLinksInView(mode) {
-    const links = new Set();
+    const FILENAME_RE = /^[^\\/:*?"<>|\r\n]{1,120}\.[A-Za-z0-9]{1,8}$/;
+    const seen = new Set();
+    const links = [];
     const push = (a) => {
         try {
             const u = new URL(a.href, document.baseURI);
-            if (u.protocol === "http:" || u.protocol === "https:") links.add(u.href);
+            if (u.protocol !== "http:" && u.protocol !== "https:") return;
+            if (seen.has(u.href) || links.length >= 100) return;
+            seen.add(u.href);
+            const text = (a.textContent || "").trim();
+            links.push({ url: u.href, name: FILENAME_RE.test(text) ? text : "" });
         } catch {
             // unresolvable href: skip
         }
@@ -415,7 +743,7 @@ function collectLinksInView(mode) {
     } else {
         document.querySelectorAll("a[href]").forEach(push);
     }
-    return { links: [...links].slice(0, 100) };
+    return { links };
 }
 
 /* --- context menu: explicit, on-demand handoff ------------------------ */
@@ -443,11 +771,12 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
             setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
             return;
         }
-        // Queue every link; the daemon merges same-URL tasks by idempotency.
-        await Promise.all(links.map((u) =>
-            send({ id: `sel-${nextId++}`, cmd: { type: "add", url: u, dest_dir: null, headers: {} } })
-        ));
-        setBadge(String(links.length));
+        // An offer, not a pile: group it exactly the way the copy chip does,
+        // so twelve parts become one task with one folder.
+        const preview = await previewGroups(sanitizeLinks(links));
+        const res = await sendGroups(preview.groups, info.pageUrl);
+        // The badge counts what ripdl gained: bundles are one row each.
+        setBadge(String(res.bundles + res.singles));
         setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
         return;
     }
@@ -475,11 +804,6 @@ chrome.runtime.onInstalled.addListener(() => {
         id: "ripdl-selection",
         title: "Download selected links with ripdl",
         contexts: ["selection"],
-    });
-    chrome.contextMenus.create({
-        id: "ripdl-all-links",
-        title: "Download all page links with ripdl",
-        contexts: ["page"],
     });
 });
 

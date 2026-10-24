@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use ripdl_core::rpc::{Command, Reply, Request, Response};
+use ripdl_core::rpc::{BundlePart, Command, Reply, Request, Response};
 use ripdl_core::{Engine, EngineConfig};
 
 /// Lowercase label for one `ls` row (avoids `{state:?}` + `to_lowercase`
@@ -112,6 +112,32 @@ enum Cmd {
         #[arg(long = "only")]
         only: Option<String>,
     },
+    /// Queue multi-part direct links as ONE task that owns a folder
+    /// (`<dest>/<name>/<parts...>`). Links group by base name:
+    /// `x.part01.rar` + `x.part02.rar` -> `x/`. `--preview` prints the
+    /// grouping without queueing anything.
+    Bundle {
+        /// Direct links (several URLs, or repeat the flag).
+        #[arg(required = true)]
+        urls: Vec<String>,
+        /// Folder name; defaults to the grouped base name.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(short, long)]
+        dest: Option<PathBuf>,
+        /// Extra request header `Name: value`; repeatable.
+        #[arg(short = 'H', long = "header")]
+        header: Vec<String>,
+        /// Shorthand for --header "Referer: <url>".
+        #[arg(long)]
+        referer: Option<String>,
+        /// Shorthand for --header "Cookie: <value>".
+        #[arg(long)]
+        cookie: Option<String>,
+        /// Group and print the result without queueing anything.
+        #[arg(long = "preview")]
+        preview: bool,
+    },
     /// List tasks known to the daemon.
     Ls,
     /// Pause a running task.
@@ -130,13 +156,36 @@ enum Cmd {
     Details { id: String },
     /// Point a paused/failed task at a fresh URL (expired signed link keeps
     /// the same file). Bytes already on disk are kept; the new address must
-    /// serve the same file (name + size) and support byte ranges.
+    /// serve the same file (name + size) and support byte ranges. For a
+    /// bundle, `--part <number>` swaps one part's address instead.
     Refresh {
         id: String,
         url: String,
         /// Resume the download right after the swap.
         #[arg(long)]
         resume: bool,
+        /// Bundle-only: refresh just this part (the number in its name).
+        #[arg(long)]
+        part: Option<u32>,
+    },
+    /// Append links to an existing bundle ("I forgot part 7"). New links
+    /// must name parts of that bundle; URLs already in it are skipped. The
+    /// bundle restarts afterwards, so a completed task picks the new part
+    /// up immediately.
+    AddParts {
+        id: String,
+        /// Direct links (several URLs, or repeat the flag).
+        #[arg(required = true)]
+        urls: Vec<String>,
+        /// Extra request header `Name: value`; repeatable.
+        #[arg(short = 'H', long = "header")]
+        header: Vec<String>,
+        /// Shorthand for --header "Referer: <url>".
+        #[arg(long)]
+        referer: Option<String>,
+        /// Shorthand for --header "Cookie: <value>".
+        #[arg(long)]
+        cookie: Option<String>,
     },
     /// Change a torrent task's per-file selection: file indices
     /// comma-separated (`0,2,3`) or `all`.
@@ -185,6 +234,48 @@ enum Cmd {
         /// installed ripdl.
         #[arg(long)]
         force: bool,
+    },
+    /// Manage user script plugins for the browser extension: `ripdl plugin
+    /// add <file.js>` copies the script into the extension's `hosts/local/`
+    /// folder and regenerates its registry; finish in chrome://extensions
+    /// with the one Reload click (then enable it on the Plugins page).
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Copy a script plugin into the extension and regenerate its registry.
+    Add {
+        /// Path to the .js plugin file.
+        path: PathBuf,
+        /// Manual extension folder override (else: the configured override or app-managed copy).
+        #[arg(long)]
+        ext_dir: Option<PathBuf>,
+    },
+    /// Remove a script plugin and regenerate the registry.
+    Remove {
+        /// The file name as the Plugins page lists it (e.g. example-host.js).
+        name: String,
+        /// Manual extension folder override (else: the configured override or app-managed copy).
+        #[arg(long)]
+        ext_dir: Option<PathBuf>,
+    },
+    /// List the script plugins the extension's registry would load.
+    List {
+        /// Manual extension folder override (else: the configured override or app-managed copy).
+        #[arg(long)]
+        ext_dir: Option<PathBuf>,
+    },
+    /// Regenerate the extension's `registry.js` from the scripts already in
+    /// `hosts/local/`. The installer runs this after an upgrade to put back
+    /// the user's scripts; run it by hand after copying a .js in by hand.
+    Sync {
+        /// Manual extension folder override (else: the configured override or app-managed copy).
+        #[arg(long)]
+        ext_dir: Option<PathBuf>,
     },
 }
 
@@ -321,8 +412,34 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Cmd::Lan { cmd } => match cmd {
-            LanCmd::Info => rpc(Command::LanInfo).await,
+        Cmd::Bundle { urls, name, dest, header, referer, cookie, preview } => {
+            let headers = collect_headers(&header, referer, cookie, None)?;
+            let parts: Vec<BundlePart> = urls
+                .iter()
+                .map(|url| BundlePart {
+                    url: url.clone(),
+                    filename: None,
+                    headers: headers.clone(),
+                    state: ripdl_core::TaskState::Queued,
+                    downloaded: 0,
+                    total: None,
+                    seq: None,
+                    error: None,
+                })
+                .collect();
+            if preview {
+                rpc(Command::PreviewBundle { links: parts }).await
+            } else {
+                rpc(Command::AddBundle {
+                    name,
+                    dest_dir: dest,
+                    parts,
+                    start_at: None,
+                })
+                .await
+            }
+        }
+        Cmd::Lan { cmd } => match cmd {            LanCmd::Info => rpc(Command::LanInfo).await,
             LanCmd::Peers => rpc(Command::LanPeers).await,
             LanCmd::Sends => rpc(Command::LanSends).await,
             LanCmd::NewCode => rpc(Command::LanNewCode).await,
@@ -341,17 +458,53 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
         Cmd::Details { id } => rpc(Command::Details { id }).await,
-        Cmd::Refresh { id, url, resume } => {
-            let reply = rpc_reply(Command::RefreshUrl { id: id.clone(), url, resume }).await?;
+        Cmd::Refresh { id, url, resume, part } => {
+            let reply = rpc_reply(Command::RefreshUrl { id: id.clone(), url, resume, part }).await?;
             match reply {
-                Reply::Refreshed { kept, total, .. } => {
-                    println!(
-                        "address refreshed: keeping {} of {} already on disk",
-                        humans(kept),
-                        total.map(humans).unwrap_or_else(|| "?".to_string())
-                    );
+                Reply::Refreshed { kept, total, part: seq, .. } => {
+                    if let Some(seq) = seq {
+                        println!(
+                            "part {seq} address refreshed: keeping {} of {} already on disk",
+                            humans(kept),
+                            total.map(humans).unwrap_or_else(|| "?".to_string())
+                        );
+                    } else {
+                        println!(
+                            "address refreshed: keeping {} of {} already on disk",
+                            humans(kept),
+                            total.map(humans).unwrap_or_else(|| "?".to_string())
+                        );
+                    }
                     if !resume {
                         println!("resume it with: ripdl resume {id}");
+                    }
+                    Ok(())
+                }
+                other => print_reply(other),
+            }
+        }
+        Cmd::AddParts { id, urls, header, referer, cookie } => {
+            let headers = collect_headers(&header, referer, cookie, None)?;
+            let parts: Vec<BundlePart> = urls
+                .iter()
+                .map(|url| BundlePart {
+                    url: url.clone(),
+                    filename: None,
+                    headers: headers.clone(),
+                    state: ripdl_core::TaskState::Queued,
+                    downloaded: 0,
+                    total: None,
+                    seq: None,
+                    error: None,
+                })
+                .collect();
+            let reply = rpc_reply(Command::AddBundleParts { id: id.clone(), parts }).await?;
+            match reply {
+                Reply::BundlePartsAdded { id, added } => {
+                    if added == 0 {
+                        println!("nothing to add: the bundle already carries those links");
+                    } else {
+                        println!("added {added} part{} to {id}", if added == 1 { "" } else { "s" });
                     }
                     Ok(())
                 }
@@ -450,6 +603,7 @@ async fn main() -> anyhow::Result<()> {
                         settings.lan_port = Some(port);
                     }
                     "lan_dir" => settings.lan_dir = Some(PathBuf::from(val)),
+                    "extension_dir" => settings.extension_dir = Some(PathBuf::from(val)),
                     "lan_open" => {
                         settings.lan_open =
                             Some(val.parse().context("lan_open needs true|false")?)
@@ -459,8 +613,51 @@ async fn main() -> anyhow::Result<()> {
             }
             rpc(Command::SetConfig { settings }).await
         }
-        Cmd::Stop => rpc(Command::Shutdown).await,
-        Cmd::Update { install } => {
+        Cmd::Plugin { cmd } => match cmd {
+            PluginCmd::Add { path, ext_dir } => {
+                let dir = plugin_ext_dir(ext_dir).await?;
+                let content = std::fs::read(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let msg = ripdl_core::extplug::install(&dir, &name, &content)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!("installed {msg}");
+                println!("next: chrome://extensions -> Reload, then enable it on the Plugins page");
+                Ok(())
+            }
+            PluginCmd::Remove { name, ext_dir } => {
+                let dir = plugin_ext_dir(ext_dir).await?;
+                ripdl_core::extplug::uninstall(&dir, &name).map_err(|e| anyhow::anyhow!(e))?;
+                println!("removed {name} - chrome://extensions -> Reload");
+                Ok(())
+            }
+            PluginCmd::List { ext_dir } => {
+                let dir = plugin_ext_dir(ext_dir).await?;
+                let scripts = ripdl_core::extplug::installed(&dir);
+                if scripts.is_empty() {
+                    println!("no script plugins in {}", dir.display());
+                } else {
+                    for s in scripts {
+                        println!("{s}");
+                    }
+                }
+                Ok(())
+            }
+            PluginCmd::Sync { ext_dir } => {
+                let dir = plugin_ext_dir(ext_dir).await?;
+                let scripts = ripdl_core::extplug::sync(&dir).map_err(|e| anyhow::anyhow!(e))?;
+                println!(
+                    "registry.js now lists {} script(s) in {}",
+                    scripts.len(),
+                    dir.display()
+                );
+                Ok(())
+            }
+        },
+        Cmd::Stop => rpc(Command::Shutdown).await,        Cmd::Update { install } => {
             if install {
                 // Via the daemon: it owns the version stamp, does the
                 // verified download and launches the Inno setup.
@@ -555,6 +752,39 @@ async fn rpc(cmd: Command) -> anyhow::Result<()> {
     print_reply(rpc_reply(cmd).await?)
 }
 
+fn bundled_extension_dir() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let start = exe.parent().ok_or_else(|| anyhow::anyhow!("ripdl executable has no parent folder"))?;
+    for dir in start.ancestors().take(5) {
+        let candidate = dir.join("ext");
+        if candidate.join("manifest.json").is_file() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("cannot find bundled ext folder beside {}", exe.display())
+}
+
+/// Where the extension lives: the explicit flag and manual override win;
+/// otherwise initialize/use the per-user app-managed copy.
+async fn plugin_ext_dir(flag: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = flag {
+        return Ok(dir);
+    }
+    match rpc_reply(Command::GetConfig).await? {
+        Reply::Config { settings, .. } => match settings.extension_dir {
+            Some(dir) => Ok(dir),
+            None => {
+                let source = bundled_extension_dir()?;
+                let managed = ripdl_core::transport::app_data_dir()?.join("extension");
+                ripdl_core::extplug::sync_managed(&source, &managed)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(managed)
+            }
+        },
+        other => bail!("unexpected daemon reply: {other:?}"),
+    }
+}
+
 /// Transport only: connect, send, decode the reply without printing.
 async fn rpc_reply(cmd: Command) -> anyhow::Result<Reply> {
     let mut stream = ripdl_core::transport::connect_daemon()
@@ -582,6 +812,14 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
     match reply {
         Reply::Ok => println!("ok"),
         Reply::Added { id } => println!("queued: {id}"),
+        Reply::BundlePartsAdded { id, added } => {
+            if added == 0 {
+                println!("{id}: nothing to add, the bundle already carries those links");
+            } else {
+                println!("{id}: added {added} part{}", if added == 1 { "" } else { "s" });
+            }
+            return Ok(());
+        }
         Reply::Error { message } => bail!("{message}"),
         Reply::Config {
             settings,
@@ -589,6 +827,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             torrent_bind,
             torrent_rates,
             torrent_unreachable,
+            ..
         } => {
             println!("max_concurrent:       {}", settings.max_concurrent.unwrap_or(3));
             println!("max_segments:         {}", settings.max_segments.unwrap_or(8));
@@ -714,6 +953,14 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     .unwrap_or_else(|| "(Downloads/ripdl-inbox)".to_string())
             );
             println!("lan_open:             {}", settings.lan_open());
+            println!(
+                "extension_dir override: {}",
+                settings
+                    .extension_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(app-managed extension copy)".to_string())
+            );
         }
         Reply::Lan { info } => {
             let status = if !info.enabled {
@@ -840,6 +1087,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             let kind = match details.kind {
                 ripdl_core::task::TaskKind::Video => "video (yt-dlp sidecar)",
                 ripdl_core::task::TaskKind::Torrent => "torrent",
+                ripdl_core::task::TaskKind::Bundle => "bundle (multi-part)",
                 ripdl_core::task::TaskKind::Http => "http (multi-segment)",
             };
             println!("kind: {kind}");
@@ -888,6 +1136,30 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     );
                 }
             }
+            if !details.parts.is_empty() {
+                let done = details
+                    .parts
+                    .iter()
+                    .filter(|p| p.state == ripdl_core::TaskState::Completed)
+                    .count();
+                if let Some(name) = &details.bundle_name {
+                    println!("folder: {name}");
+                }
+                println!("parts: {done}/{} done", details.parts.len());
+                for (i, p) in details.parts.iter().enumerate() {
+                    println!(
+                        "  {:<5} {:<10} {:<20} {}",
+                        p.seq.map(|s| format!("#{s}")).unwrap_or_else(|| format!("#{i}")),
+                        state_label(p.state),
+                        match p.total {
+                            Some(total) =>
+                                format!("{} / {}", humans(p.downloaded), humans(total)),
+                            None => humans(p.downloaded),
+                        },
+                        p.filename.as_deref().unwrap_or(&p.url)
+                    );
+                }
+            }
         }
         Reply::Refreshed { kept, total, .. } => {
             println!(
@@ -896,8 +1168,27 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                 total.map(humans).unwrap_or_else(|| "?".to_string())
             );
         }
-        Reply::TorrentPreview { preview } => {
-            println!("name: {}", preview.name.as_deref().unwrap_or("(unknown)"));
+        Reply::BundlePreview { groups } => {
+            if groups.is_empty() {
+                println!("no usable links");
+            }
+            for g in groups {
+                println!(
+                    "{:<7} {}  ({})",
+                    if g.parts.len() > 1 { "bundle" } else { "single" },
+                    g.name,
+                    g.parts_summary()
+                );
+                if !g.missing.is_empty() {
+                    let missing: Vec<String> = g.missing.iter().map(|n| n.to_string()).collect();
+                    println!("        missing parts: {}", missing.join(", "));
+                }
+                for p in &g.parts {
+                    println!("        {}", p.url);
+                }
+            }
+        }
+        Reply::TorrentPreview { preview } => {            println!("name: {}", preview.name.as_deref().unwrap_or("(unknown)"));
             println!("hash: {}", preview.info_hash);
             for (i, f) in preview.files.iter().enumerate() {
                 println!("  {:>3} {:>10}  {}", i, humans(f.size), f.name);
@@ -944,6 +1235,13 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                         ),
                         None => humans(t.downloaded),
                     },
+                };
+                // Bundle rows also say how many parts are done: bytes alone
+                // hide whether a 3-part set is missing its last part.
+                let progress = if t.parts_total > 0 {
+                    format!("{progress} [{}/{} parts]", t.parts_done, t.parts_total)
+                } else {
+                    progress
                 };
                 let speed = if t.state == ripdl_core::TaskState::Completed && t.seeding {
                     t.upload_bps

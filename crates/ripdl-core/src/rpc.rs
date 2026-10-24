@@ -74,6 +74,10 @@ pub struct DaemonSettings {
     /// paired devices keep working across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lan_code: Option<String>,
+    /// Optional path to a manually loaded extension copy. The app-managed
+    /// extension under the per-user data directory is the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_dir: Option<PathBuf>,
 }
 
 impl DaemonSettings {
@@ -271,6 +275,26 @@ pub enum Command {
         #[serde(default)]
         only_files: Option<Vec<usize>>,
     },
+    /// Queue several direct links as **one** task that owns a folder
+    /// (`<dest>/<name>/<parts...>`), the way a torrent owns its root. The
+    /// daemon groups nothing here: the caller decides (usually after
+    /// `PreviewBundle`).
+    AddBundle {
+        /// Folder / display name. Derived from the first part when omitted.
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        dest_dir: Option<PathBuf>,
+        parts: Vec<BundlePart>,
+        #[serde(default)]
+        start_at: Option<i64>,
+    },
+    /// Group a selection of links **without** queueing anything: which links
+    /// belong together, what the folder would be called, and which part
+    /// numbers the numbering proves missing.
+    PreviewBundle {
+        links: Vec<BundlePart>,
+    },
     /// Pre-add torrent preview: resolve metadata + file list WITHOUT
     /// queueing anything. May take a while for magnets (swarm metadata
     /// fetch, same as qBittorrent's "Retrieving metadata").
@@ -286,11 +310,24 @@ pub enum Command {
     /// Point a paused/failed HTTP task at a fresh URL (expired signed link)
     /// while keeping the bytes already on disk. `resume` restarts it right
     /// away. Rejects a new address that serves a different file.
+    /// For a bundle task, `part` selects ONE part by its part number (the
+    /// seq the filename proves): the whole bundle pauses briefly, that
+    /// part's address swaps, and the bundle resumes.
     RefreshUrl {
         id: String,
         url: String,
         #[serde(default)]
         resume: bool,
+        #[serde(default)]
+        part: Option<u32>,
+    },
+    /// Append more links to an existing bundle task ("I forgot part 7").
+    /// New links must group under the bundle's own name; URLs already in
+    /// the bundle are skipped. The bundle resumes afterwards so a
+    /// completed task picks the missing part up immediately.
+    AddBundleParts {
+        id: String,
+        parts: Vec<BundlePart>,
     },
     /// Change a torrent task's per-file selection. `None` selects every
     /// file; works live and while paused. The choice is persisted and
@@ -323,6 +360,11 @@ pub enum Command {
     /// live, the rest take effect on the next task start.
     SetConfig {
         settings: DaemonSettings,
+    },
+    /// Extension service-worker wake heartbeat. Recorded by the daemon for
+    /// the Settings browser-install status; no page or browsing data is sent.
+    ExtensionHello {
+        version: String,
     },
     /// Receiving state: URL, pairing code, inbox path and its contents.
     LanInfo,
@@ -378,10 +420,24 @@ pub enum Reply {
         kept: u64,
         #[serde(default)]
         total: Option<u64>,
+        /// Bundle-only: the part number that was refreshed.
+        #[serde(default)]
+        part: Option<u32>,
+    },
+    /// Result of `AddBundleParts`: how many links actually joined the
+    /// bundle (URLs already present are skipped).
+    BundlePartsAdded {
+        id: String,
+        #[serde(default)]
+        added: usize,
     },
     /// Result of a `TorrentPreview`.
     TorrentPreview {
         preview: crate::torrent::TorrentPreviewSnapshot,
+    },
+    /// Result of a `PreviewBundle`: the groups a selection would become.
+    BundlePreview {
+        groups: Vec<crate::bundle::Group>,
     },
     /// Current daemon-wide settings.
     Config {
@@ -407,6 +463,17 @@ pub enum Reply {
         /// explained rather than silently ignored.
         #[serde(default)]
         torrent_unreachable: Vec<String>,
+        /// Capability flag: this daemon understands `AddBundle`/`PreviewBundle`
+        /// (multi-part tasks). Frontends check it instead of probing with an
+        /// unknown command - an older daemon simply omits the field, which
+        /// deserializes as `false` and routes links to the plain-add path.
+        #[serde(default)]
+        bundles: bool,
+        /// The daemon's own version (`CARGO_PKG_VERSION`).
+        version: String,
+        /// Last browser-extension service-worker heartbeat, persisted by the
+        /// daemon. `last_seen == 0` means the extension has never checked in.
+        extension: ExtensionStatus,
     },
     /// Result of a `CheckUpdate`.
     Update {
@@ -432,6 +499,12 @@ pub enum Reply {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionStatus {
+    pub version: String,
+    pub last_seen: i64,
 }
 
 /// Receiver status shown by every frontend.
@@ -539,6 +612,41 @@ pub struct TaskInfo {
     /// Torrent-only: current per-file selection (None = everything).
     #[serde(default)]
     pub only_files: Option<Vec<usize>>,
+    /// Bundle-only: parts finished and parts the numbering proves exist.
+    /// `0` means unknown (a selection that does not start at part 1).
+    #[serde(default)]
+    pub parts_done: u32,
+    #[serde(default)]
+    pub parts_total: u32,
+    /// Bundle-only: part numbers missing from the set.
+    #[serde(default)]
+    pub parts_missing: Vec<u32>,
+}
+
+/// One part of a bundle.
+///
+/// Frontends fill `url`/`filename`/`headers` and leave the rest defaulted;
+/// the daemon writes the progress fields as the part runs, so the same type
+/// travels as a request, lives in `queue.json`, and comes back in details.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundlePart {
+    pub url: String,
+    /// Filename the page knows (defaults to the URL tail).
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub state: crate::task::TaskState,
+    #[serde(default)]
+    pub downloaded: u64,
+    #[serde(default)]
+    pub total: Option<u64>,
+    /// Part number the filename proves (None when it carries no numbering).
+    #[serde(default)]
+    pub seq: Option<u32>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// One task's engine view behind the details dialog: where it writes, the
@@ -567,6 +675,12 @@ pub struct TaskDetailsSnapshot {
     /// planned, when the task finished, or for the yt-dlp sidecar).
     #[serde(default)]
     pub segments: Vec<crate::task::SegmentState>,
+    /// Bundle-only: the parts, in part-number order (empty for other kinds).
+    #[serde(default)]
+    pub parts: Vec<BundlePart>,
+    /// Bundle-only: folder that holds the parts (the task's own root).
+    #[serde(default)]
+    pub bundle_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -574,12 +688,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_reply_tolerates_a_daemon_without_bonding_fields() {
-        // A pre-0.3.10 daemon sends just `settings`; the new fields must
-        // default so a newer frontend can still talk to it.
-        let reply: Reply =
-            serde_json::from_str(r#"{"type":"config","settings":{"max_segments":4}}"#)
-                .expect("old reply parses");
+    fn config_reply_carries_extension_status() {
+        let reply: Reply = serde_json::from_str(
+            r#"{"type":"config","settings":{"max_segments":4},"version":"0.4.1","extension":{"version":"0.4.1","last_seen":42}}"#,
+        )
+        .expect("config reply parses");
         match reply {
             Reply::Config {
                 settings,
@@ -587,12 +700,21 @@ mod tests {
                 torrent_bind,
                 torrent_rates,
                 torrent_unreachable,
+                bundles,
+                version,
+                extension,
             } => {
                 assert_eq!(settings.max_segments, Some(4));
+                assert_eq!(version, "0.4.1");
+                assert_eq!(extension.version, "0.4.1");
+                assert_eq!(extension.last_seen, 42);
                 assert!(!torrent_session);
                 assert!(torrent_bind.is_empty());
                 assert!(torrent_rates.is_empty());
                 assert!(torrent_unreachable.is_empty());
+                // A pre-bundle daemon answers the same way, so the extension
+                // reads this as "no bundle support" instead of probing.
+                assert!(!bundles);
             }
             other => panic!("unexpected reply: {other:?}"),
         }
@@ -606,6 +728,12 @@ mod tests {
             torrent_bind: vec!["10.0.0.2".to_string()],
             torrent_rates: vec![("10.0.0.2".to_string(), 7.0e6)],
             torrent_unreachable: vec!["Ethernet 2 (10.99.0.5)".to_string()],
+            bundles: true,
+            version: "0.4.1".to_string(),
+            extension: ExtensionStatus {
+                version: "0.4.1".to_string(),
+                last_seen: 42,
+            },
         };
         let json = serde_json::to_string(&reply).expect("serialize");
         match serde_json::from_str::<Reply>(&json).expect("parse") {

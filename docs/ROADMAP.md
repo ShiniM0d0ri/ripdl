@@ -246,6 +246,81 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       as video" for known stream sites (activeTab, granted only while
       the popup is open)
 
+### Multi-part bundles + hoster plugins (plan: `docs/plan-bundles-and-plugins.md`)
+
+- [x] Core bundles: `ripdl_core::bundle` grouping (base name, part markers,
+      gaps, mirrors), `TaskKind::Bundle`, daemon coordinator sharing the
+      global `max_concurrent` pool, `AddBundle`/`PreviewBundle`, per-part
+      state on disk, CLI `ripdl bundle`.
+- [x] GUI: bundles kind column + row ("3/7 parts"), Bundles sidebar filter,
+      parts table in the details dialog (missing numbers named), Add
+      Multi-part Links dialog with live grouping preview, folder delete/open.
+- [x] Extension copy capture: selected links -> offer chip -> bundle (phase 3).
+      `capture.js` (the one resident content script) collects anchors + bare
+      URLs on copy and shows an in-page chip (Send / Edit / Dismiss; Edit =
+      per-group checkboxes + folder rename). Grouping runs daemon-side via
+      `PreviewBundle`; Send queues one `AddBundle` per multi-part group and
+      plain Adds for singles, with the page URL as Referer. Old daemons are
+      detected through the new `bundles` capability flag on `Reply::Config`
+      (probing with an unknown command cost a 15 s timeout per offer) and the
+      chip degrades to per-link downloads, stating the limitation. Verified
+      end to end over CDP with real copy events against a fixture hoster
+      page (26 checks) and against the installed pre-bundle daemon (7
+      checks); `research/ext-bundle-e2e.js`, `research/ext-bundle-compat.js`.
+- [x] Hoster plugins (phase 4, verified end to end): plugin API locked
+      against a real hoster (`name(url)` cheap pre-group naming +
+      `resolve(link, ctx)` -> `{url, name?, headers?}` | null = queue as-is);
+      `generic` is the only built-in (archive/media extensions, no resolve).
+      USER-LOADABLE: recipes `.json` (inert data, JSON.parse + a declarative
+      engine - match host/path, name from fragment/query/tail, resolve = one
+      GET/POST to a URL template, direct URL from a response header or JSON
+      dot-path, prefix-guarded; 16 validation failures with helpful errors)
+      imported from anywhere via the Plugins page; scripts `.js` load only
+      from `hosts/local/` via the generated `registry.js` (static namespace
+      imports - dynamic `import()` is disallowed on
+      ServiceWorkerGlobalScope per the HTML spec, verified live, so the
+      planned `index.json` design could not work). Plugins options page:
+      list, per-host toggles, a script's code shown before its toggle
+      unlocks, recipe import (file/paste) with inline error text, per-plugin
+      Test box (name + direct URL for any pasted URL, nothing queued),
+      popup link. Wiring: `name()` enriches the chip's grouping before
+      preview, `resolve()` runs at Send time, unresolved parts keep their
+      URL and are counted in the chip's result line. NO built-in hoster
+      plugins (locked 2026-10-24): site-specific plugins remain user-loadable;
+      the working reference plugin stays local-only for production import.
+      E2E (`research/ext-plugin-e2e.js`, 19 checks, headed):
+      options-page gate/import/test, real-host resolve through the loaded
+      registry + ranged GETs, and a local fixture recipe driving the full
+      chip -> resolve -> one bundle (parts in `<folder>/`) + lone single,
+      hash-verified. Node tests for the pure layer
+      (`ext/test/plugins.test.mjs`, CI-gated).
+- [x] Polish (phase 5): per-part address refresh (`RefreshUrl.part`, CLI
+      `refresh --part N`, the parts table's per-row Refresh button opens the
+      swap dialog in part mode - the bundle pauses for the swap and resumes),
+      "add missing parts" (`AddBundleParts`, CLI `ripdl add-parts`, details
+      dialog "Add parts..." - new links must name parts of that bundle,
+      duplicates skip, completed bundles pick the new part up at once), and
+      the add-plugin tool (`ripdl plugin add/remove/list` + Settings
+      "Install hoster plugin": copies a .js into the extension's
+      `hosts/local/`, regenerates `registry.js` atomically from the files
+      actually present, then reloads the extension; the app-managed folder is
+      the default and `extension_dir` selects a manual copy). Verified live:
+      daemon
+      integration tests (failed-part refresh keeps finished parts, completed
+      bundle + append re-completes, duplicates skip, foreign links refused),
+      `research/gui-parts-e2e.js` (19 checks over CDP: part-mode dialog,
+      prefill, completed-bundle append, duplicate/foreign handling, plain
+      HTTP details unaffected), `ripdl plugin add/list/remove` round-trip.
+- [x] App-managed extension lifecycle (phase 6): GUI/CLI seed
+      `<data_dir>/extension` from the bundled `ext/`, update only
+      when its manifest version advances (debug builds also refresh equal-
+      version sources), preserve user scripts and regenerate the registry.
+      The extension heartbeats its version on service-worker
+      wake; daemon persists last-seen separately from settings. Settings shows
+      loaded/on-disk versions and opens the detected Chromium extensions page
+      for the user's final Load unpacked / Reload action. `extension_dir` is
+      an optional manual-copy override.
+
 ## P5 - ship it
 
 - [x] Packaging: GitHub Release pipeline (portable zip + Inno setup.exe,

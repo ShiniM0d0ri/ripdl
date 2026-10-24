@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ripdl plugins</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172522;
+      --muted: #687772;
+      --line: #d7e2dd;
+      --page: #eff4f1;
+      --surface: #fff;
+      --wash: #f5f8f6;
+      --teal: #0c7669;
+      --teal-dark: #075c53;
+      --blue: #246b85;
+      --green: #216c48;
+      --warn: #a45c10;
+      --bad: #a43b36;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--page); color: var(--ink); font: 13px/1.5 "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; }
+    .page { width: min(760px, 100%); margin: 0 auto; padding: 28px 22px 40px; }
+    .page-head { display: flex; align-items: center; gap: 12px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+    .brand-mark { display: grid; place-items: center; width: 40px; height: 40px; flex: none; border-radius: 10px; background: var(--teal); color: white; font-size: 25px; font-weight: 700; line-height: 1; }
+    .brand-copy { flex: 1; min-width: 0; }
+    h1 { margin: 0; font-size: 20px; line-height: 1.2; font-weight: 700; }
+    .eyebrow { margin-top: 3px; color: var(--muted); font-size: 11px; }
+    #version { margin: 0; padding: 6px 9px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--muted); font-size: 10.5px; line-height: 1.35; }
+    #version.warn { border-color: #e8cfac; background: #fff8ed; color: var(--warn); }
+    p.sub { max-width: 660px; margin: 16px 0 18px; color: #53645e; font-size: 12.5px; }
+    #list { display: grid; gap: 9px; }
+    #list:empty::before { content: "No plugins installed"; color: var(--muted); padding: 16px 2px; }
+    .entry { min-width: 0; padding: 13px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: 0 1px 2px #17392b0a; }
+    .entry > .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .entry > .row:first-child > div:first-child { min-width: 0; }
+    .entry b { font-size: 13px; }
+    .plugin-id { margin-left: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .kind { flex: none; padding: 2px 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--wash); color: #53645e; font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+    .kind.script { border-color: #bfdae2; background: #eef7f9; color: var(--blue); }
+    .kind.recipe { border-color: #c7e1d2; background: #eff8f2; color: var(--green); }
+    .err { margin-top: 7px; color: var(--bad); font-size: 12px; }
+    .hint { margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+    .test-row { justify-content: flex-start !important; margin-top: 10px; }
+    .plugin-controls { justify-content: flex-end !important; margin-top: 8px; }
+    .plugin-controls label { margin-right: 3px; color: #4e6059; font-size: 11px; }
+    .recipe-delete { margin-top: 8px; }
+    .entry input[type="text"] { min-width: 0; height: 36px; padding: 7px 10px; border: 1px solid #c8d5cf; border-radius: 6px; background: white; color: var(--ink); font: inherit; user-select: text; }
+    button { min-height: 34px; padding: 6px 11px; border: 1px solid #c7d5cf; border-radius: 6px; background: white; color: #31423c; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; transition: background-color .12s ease, border-color .12s ease; }
+    button:hover { border-color: #91b8aa; background: #f6faf8; }
+    button:disabled { color: #94a19c; background: #f3f5f4; cursor: not-allowed; }
+    input[type="checkbox"] { accent-color: var(--teal); width: 15px; height: 15px; }
+    details { margin-top: 9px; }
+    details summary { width: fit-content; color: var(--teal-dark); font-size: 11.5px; font-weight: 600; cursor: pointer; }
+    pre { max-height: 280px; margin: 8px 0 0; padding: 10px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: #f6f8f7; color: #263630; font: 11px/1.5 Consolas, "Courier New", monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+    #import { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); }
+    #import h2 { margin: 0 0 10px !important; color: #34463f; font-size: 13px !important; }
+    #import .row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    #file { min-width: 0; max-width: 100%; color: #53645e; font: inherit; font-size: 11.5px; }
+    #reload { margin-left: auto; }
+    #paste { display: block; width: 100%; min-height: 118px; margin: 9px 0; padding: 9px 10px; resize: vertical; border: 1px solid #c8d5cf; border-radius: 6px; background: white; color: var(--ink); font: 11.5px/1.45 Consolas, "Courier New", monospace; user-select: text; }
+    #import-btn { background: var(--teal); border-color: var(--teal); color: white; }
+    #import-btn:hover { background: var(--teal-dark); border-color: var(--teal-dark); }
+    #import-status { margin-left: 8px; font-size: 11.5px; }
+    #import-status.ok { color: var(--green); }
+    #import-status.bad { color: var(--bad); }
+    #import .hint { max-width: 660px; margin-top: 9px; }
+    a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+    @media (max-width: 560px) {
+      .page { padding: 16px 12px 24px; }
+      .page-head { display: grid; grid-template-columns: 40px minmax(0, 1fr); grid-template-areas: "mark copy" "version version"; align-items: center; gap: 8px 10px; }
+      .brand-mark { grid-area: mark; }
+      .brand-copy { grid-area: copy; }
+      #version { grid-area: version; width: fit-content; max-width: 100%; margin: 0; }
+      .entry { padding: 10px; }
+      .entry > .row:first-child { align-items: flex-start; }
+      .plugin-id { display: block; margin: 2px 0 0; }
+      .test-row { align-items: stretch; }
+      .test-row input { flex: 1; }
+      .test-row button { min-width: 64px; }
+      .plugin-controls { padding-top: 2px; }
+      #import .row { align-items: flex-start; }
+      #file { flex: 1 1 100%; }
+      #reload { margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="page-head">
+      <div class="brand-mark" aria-hidden="true">r</div>
+      <div class="brand-copy"><h1>Hoster plugins</h1><div class="eyebrow">ripdl browser extension</div></div>
+      <p id="version" aria-live="polite"></p>
+    </header>
+    <p class="sub">Hoster plugins teach the copy chip links only some pages understand. Recipes are
+     inert data; scripts run with this extension's powers, so they only load from
+     the extension's own <code>hosts/local/</code> folder and their code is shown
+     here before you can enable one.</p>
+
+    <div id="list" aria-live="polite">Loading plugins…</div>
+
+    <section id="import" aria-labelledby="import-title">
+      <h2 id="import-title">Import a recipe</h2>
+      <div class="row">
+        <input type="file" id="file" accept=".json,application/json" aria-label="Choose recipe JSON file">
+        <button id="reload" type="button">Reload extension</button>
+      </div>
+      <textarea id="paste" aria-label="Paste recipe JSON" placeholder="Choose a .json file or paste recipe JSON here"></textarea>
+      <button id="import-btn" type="button">Import recipe</button>
+      <span id="import-status" role="status" aria-live="polite"></span>
+      <div class="hint">Recipes only map URLs to direct downloads; they cannot execute code. To add a script, use Settings > Install hoster plugin or <code>ripdl plugin add &lt;file.js&gt;</code>. The local registry is generated automatically.</div>
+    </section>
+  </main>
+
+  <script src="options.js"></script>
+</body>
+</html>

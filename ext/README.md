@@ -1,6 +1,7 @@
 # ripdl WebExtension
 
-MV3, no content scripts, no telemetry, no cookie harvesting.
+MV3, no telemetry, no cookie harvesting. One resident content script, and it
+only listens for `copy`.
 
 ## Install (development)
 
@@ -32,8 +33,19 @@ MV3, no content scripts, no telemetry, no cookie harvesting.
    `%LOCALAPPDATA%\ripdl\org.ripdl.host.json` pointing at the ripdl binary.
    No admin window.
 
-3. Start the daemon (`ripdl-daemon`) or let the host spawn it automatically
-   on first capture (it looks for `ripdl-daemon` next to the ripdl binary).
+3. Start the GUI. It copies the bundled extension to `<data_dir>/extension`
+  and updates that app-managed folder when a newer bundled version is
+  available.
+4. In Settings > **Browser extension**, click **Open extension settings**.
+  Enable **Developer mode**, choose **Load unpacked**, and select the folder
+  shown there. The browser's final confirmation stays manual.
+5. Start the daemon (`ripdl-daemon`) or let the native host spawn it
+  automatically on first capture.
+
+After an app update, the browser keeps its previously loaded extension until
+you click **Reload** on the extension card in chrome://extensions. Settings
+reports the loaded version and whether a newer copy is waiting. User scripts in
+`hosts/local/` are preserved when the app-managed folder updates.
 
 ### Pinned extension ID
 
@@ -47,10 +59,24 @@ load of *any* ripdl extension build has id
 ## How capture works
 
 - Context menu on a link/page -> the URL is queued to the daemon.
-- Right-click over a text selection -> every link inside the selection is
-  queued; an empty-area menu offers "all page links" (capped at 100). The
-  collector is injected at click time via `chrome.scripting` - there are NO
-  resident content scripts.
+- Right-click over a text selection -> the links inside the selection are
+  grouped the way the copy chip groups them, then queued: parts of one
+  multi-part set become ONE bundle task (one folder), single links stay
+  ordinary downloads. The collector is injected at click time via
+  `chrome.scripting`.
+- **Copy capture** (`capture.js`): when you copy a selection that contains
+  links, a small offer chip appears near it - "Send 3 links to ripdl", the
+  groups the daemon would make ("x - 3 of 3 parts"), and Send / Edit /
+  Dismiss. Nothing is queued until you click Send. The script reads the
+  selection only in response to a copy you made, never touches the
+  clipboard, and the chip lives in a shadow root so page CSS cannot touch
+  it. An anchor's visible text is used as the part filename only when it
+  actually names a file (a page full of "Download" anchors must not rename
+  every part "Download").
+- Grouping is the daemon's job (`preview_bundle`), so the chip, the GUI
+  dialog and the CLI all agree. A daemon that predates bundles is detected
+  through its `config` reply (`bundles` capability flag) and the offer
+  degrades to one ordinary download per link - the chip says so.
 - While the daemon answers, browser-initiated downloads are intercepted in
   `downloads.onDeterminingFilename` and re-queued fast (with their Referer
   and browser User-Agent so protected links still resolve). If the daemon
@@ -61,6 +87,43 @@ load of *any* ripdl extension build has id
   BROWSER ask you; turning it off revokes the permission entirely. Cookies
   travel only to the local daemon, only attached to the downloads you fire.
 - The daemon owns all policy. Nothing is hardcoded here by design.
+
+## Hoster plugins (user-loadable)
+
+The copy chip only knows generic URLs. Hoster plugins teach it links only
+some pages understand - a share link that must be POSTed to the host before
+a direct download URL exists, or a filename hidden in the URL fragment.
+
+**No hoster ships built-in.** The only built-in is `generic` (direct links
+with a known archive/media extension). Everything else is yours:
+
+- **Recipes** (`.json`, inert data - no code, importable from the Plugins
+  page): a declarative match/name/resolve map. `resolve` fills a URL
+  template, sends one GET/POST, and extracts the direct URL from a response
+  header or a JSON dot-path, guarded by an optional prefix. See the Plugins
+  page for the current shape.
+- **Scripts** (`.js`, full API: `id`, `match(url)`, `name(url)`,
+  `resolve(link, ctx)`): run with the extension's powers, so they load ONLY
+  from the selected extension's `hosts/local/` - never from the network. The
+  easy way: `ripdl plugin add <file.js>` or Settings > "Install hoster plugin..."
+  copies the file into the app-managed extension by default and regenerates
+  `hosts/local/registry.js`; use `--ext-dir` or the Settings override for a
+  manually loaded copy. Then reload the extension.
+  By hand: drop the file in `hosts/local/`, add one namespace import + entry
+  to `hosts/local/registry.js` (static imports: the service worker cannot use
+  dynamic `import()` - the HTML spec forbids it on
+  ServiceWorkerGlobalScope), then reload the extension.
+
+The Plugins page (popup -> "Hoster plugins…" or the extension's Details >
+Extension options) lists every plugin, shows a script's full code BEFORE its
+enable toggle unlocks, and has a Test box: paste any URL, see the name it
+would group under and the direct URL it would resolve to. Nothing is queued
+by a test.
+
+Trust rules, by design: no eval, no remote plugin code, no captcha/paywall
+logic, no stored credentials. A plugin's `resolve()` may only talk to the
+host it matches; a failed resolve never drops a link - it queues as-is and
+the chip says how many parts went unresolved.
 
 ## Hunt offers (video popup)
 

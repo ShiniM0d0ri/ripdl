@@ -27,6 +27,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 
 use crate::error::{Error, Result};
+use crate::names::{sanitize_component, suffixed};
 
 /// Default receive port (bound on all interfaces when receiving is on).
 pub const DEFAULT_PORT: u16 = 8463;
@@ -508,49 +509,10 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
     }
 }
 
-/// One file name, no directories, no Windows-reserved characters.
+/// One file name, no directories, no Windows-reserved characters: the shared
+/// helper with the inbox's fallback name.
 fn sanitize_name(raw: &str) -> String {
-    // Split on both separators: a Windows path must not smuggle directories
-    // into a Unix receiver (or the other way round). Only the last component
-    // survives.
-    let base = raw.rsplit(['/', '\\']).next().unwrap_or("").to_string();
-    let mut out = String::with_capacity(base.len());
-    for ch in base.chars() {
-        let bad = matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0')
-            || (ch.is_control());
-        out.push(if bad { '_' } else { ch });
-    }
-    let trimmed = out.trim_end_matches(['.', ' ']).to_string();
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        return "received.bin".to_string();
-    }
-    // Windows device names cannot exist as regular files (CON.txt included).
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
-        "LPT9",
-    ];
-    let stem = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
-    if RESERVED.contains(&stem.as_str()) {
-        return format!("_{trimmed}");
-    }
-    trimmed
-}
-
-/// `name.ext` with an optional ` (n)` suffix.
-fn suffixed(name: &str, n: u32) -> String {
-    if n == 0 {
-        return name.to_string();
-    }
-    let path = Path::new(name);
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "received".into());
-    match path.extension().map(|e| e.to_string_lossy().into_owned()) {
-        Some(ext) => format!("{stem} ({n}).{ext}"),
-        None => format!("{stem} ({n})"),
-    }
+    sanitize_component(raw, "received.bin")
 }
 
 /// Move a finished body to a free name inside `dir`. Claiming the name has

@@ -277,7 +277,7 @@ are a separate subsystem.
 | 3 | Fetch delay | number | Delay between individual feeds. |
 | 4 | Max articles per feed | number | Trims stored items. |
 | 5 | Enable auto-downloading | check | Master switch for RSS rules. |
-| 6 | Download REPACK/PROPER | check | Smart filter accepts re-uploads. |
+| 6 | Download revised uploads | check | Smart filter accepts updated releases. |
 | 7 | Smart episode filters | multiline | Additional episode-filter patterns. |
 
 RSS rules (separate dialog, ~8 fields per rule): must contain / must not
@@ -562,7 +562,7 @@ Notes on deliberate non-parity:
   should adopt qB's limits only where they protect interactive downloads.
 - WebUI/API parity is rejected because ripdl's threat model is a local daemon,
   and its RPC already covers automation.
-- Anonymous mode, search plugins, RSS, and piracy-oriented presets are out of
+- Anonymous mode, search plugins, RSS, and broad discovery presets are out of
   scope; they add surface without serving the core "fast, private downloader"
   goal.
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+﻿use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ripdl_core::rpc::{
-    Command, LanInfo, LanSendInfo, Reply, Request, Response, TaskDetailsSnapshot, TaskInfo,
-    DEFAULT_PORT,
+    BundlePart, Command, ExtensionStatus, LanInfo, LanSendInfo, Reply, Request, Response,
+    TaskDetailsSnapshot, TaskInfo, DEFAULT_PORT,
 };
 use ripdl_core::task::{Progress, TaskKind, TaskState};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
@@ -74,6 +74,13 @@ struct TaskRecord {
     /// Torrent-only: connected peers (last sample).
     #[serde(default)]
     peers: u32,
+    /// Bundle-only: folder name (`<dest>/<name>` root and the row title).
+    #[serde(default)]
+    bundle_name: Option<String>,
+    /// Bundle-only: the parts in part-number order. Each part carries its
+    /// own state/bytes, so a pause keeps every finished part finished.
+    #[serde(default)]
+    parts: Vec<BundlePart>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,7 +99,7 @@ struct TaskRuntime {
 }
 
 /// One active seeding watcher. The generation makes stale watchers harmless:
-/// stop→start can overlap, and only the newest watcher may publish state.
+/// stopâ†’start can overlap, and only the newest watcher may publish state.
 struct SeedWatch {
     token: CancellationToken,
     gen: u64,
@@ -130,7 +137,7 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 /// flap between 0 and peak on every 2 s tick.
 const TORRENT_RATE_WINDOW: Duration = Duration::from_secs(4);
 /// Above this a byte jump in one tick cannot be network traffic (200 MiB/s
-/// per tick ≈ 1.6 Gbps), it is librqbit adopting data already on disk.
+/// per tick â‰ˆ 1.6 Gbps), it is librqbit adopting data already on disk.
 const MAX_PLAUSIBLE_BPS: f64 = 200.0 * 1024.0 * 1024.0;
 /// A stalled task (tool rate ~0) that suddenly gains this much in one tick is
 /// a resume adoption, not a burst.
@@ -200,6 +207,8 @@ struct Daemon {
     queue_path: PathBuf,
     /// Where the settings file lives (kept so SetConfig can persist).
     config_path: PathBuf,
+    extension_status_path: PathBuf,
+    extension_status: Mutex<ExtensionStatus>,
     /// Settings are swapped from SetConfig and only read elsewhere; a
     /// mutex keeps the swap sound under the many Arc aliases.
     config: Mutex<DaemonConfig>,
@@ -271,6 +280,14 @@ type DaemonConfig = ripdl_core::rpc::DaemonSettings;
 impl Daemon {
     fn new(queue_path: PathBuf, config_path: PathBuf, config: DaemonConfig) -> Result<Self> {
         let max_concurrent = config.max_concurrent();
+        let extension_status_path = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("extension-status.json");
+        let extension_status = std::fs::read(&extension_status_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         let records = match std::fs::read(&queue_path) {
             Ok(bytes) => serde_json::from_slice::<QueueFile>(&bytes)
                 .map(|q| q.tasks)
@@ -286,6 +303,8 @@ impl Daemon {
             port: DEFAULT_PORT,
             queue_path,
             config_path,
+            extension_status_path,
+            extension_status: Mutex::new(extension_status),
             config: Mutex::new(config),
             records: Mutex::new(records),
             progress: Mutex::new(HashMap::new()),
@@ -328,6 +347,15 @@ impl Daemon {
                 }
                 if r.upload_bps.take().is_some() {
                     changed = true;
+                }
+                // A bundle part that was mid-flight is re-run by the bundle
+                // coordinator: leaving it "running" would misreport it as
+                // live until the first sample.
+                for part in r.parts.iter_mut() {
+                    if part.state == TaskState::Running {
+                        part.state = TaskState::Queued;
+                        changed = true;
+                    }
                 }
             }
             // Already-clean queue: the on-disk state is identical, skip the
@@ -558,7 +586,7 @@ impl Daemon {
         };
         let (token, generation) = {
             let mut seeders = self.seeders.lock().unwrap();
-            // Replace a winding-down watcher: stop→start can overlap, and the
+            // Replace a winding-down watcher: stopâ†’start can overlap, and the
             // stale one must never clear the new one's state (generation).
             if let Some(old) = seeders.remove(id) {
                 old.token.cancel();
@@ -714,7 +742,7 @@ impl Daemon {
                 }
             }
 
-            // Only the newest watcher may publish the exit state: stop→start
+            // Only the newest watcher may publish the exit state: stopâ†’start
             // can overlap, and a stale watcher must not clear the new one.
             let current = this
                 .seeders
@@ -915,10 +943,20 @@ impl Daemon {
             }
             let resp = match serde_json::from_str::<Request>(&line) {
                 Ok(req) => self.dispatch(req).await,
-                Err(e) => Response {
-                    id: 0,
-                    reply: Reply::Error { message: format!("bad request: {e}") },
-                },
+                Err(e) => {
+                    // Recover the caller's id when the JSON parses as a request
+                    // envelope (an unknown command variant lands here). Without
+                    // it the reply is uncorrelatable and a caller cannot tell
+                    // "unsupported command" from "crossed reply".
+                    let id = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(serde_json::Value::as_u64))
+                        .unwrap_or(0);
+                    Response {
+                        id,
+                        reply: Reply::Error { message: format!("bad request: {e}") },
+                    }
+                }
             };
             let mut out = serde_json::to_string(&resp).context("serialize response")?;
             out.push('\n');
@@ -935,10 +973,17 @@ impl Daemon {
             Command::TorrentPreview { payload } => {
                 self.cmd_torrent_preview(req.id, &payload).await
             }
+            Command::AddBundle { name, dest_dir, parts, start_at } => {
+                self.cmd_add_bundle(req.id, name, dest_dir, parts, start_at)
+            }
+            Command::PreviewBundle { links } => self.cmd_preview_bundle(req.id, links),
             Command::List => self.cmd_list(req.id),
             Command::Details { id } => self.cmd_details(req.id, &id).await,
-            Command::RefreshUrl { id, url, resume } => {
-                self.cmd_refresh_url(req.id, &id, &url, resume).await
+            Command::RefreshUrl { id, url, resume, part } => {
+                self.cmd_refresh_url(req.id, &id, &url, resume, part).await
+            }
+            Command::AddBundleParts { id, parts } => {
+                self.cmd_add_bundle_parts(req.id, &id, parts).await
             }
             Command::UpdateTorrentSelection { id, only_files } => {
                 self.cmd_update_selection(req.id, &id, only_files).await
@@ -954,6 +999,7 @@ impl Daemon {
             }
             Command::GetConfig => self.cmd_get_config(req.id),
             Command::SetConfig { settings } => self.cmd_set_config(req.id, settings).await,
+            Command::ExtensionHello { version } => self.cmd_extension_hello(req.id, version),
             Command::CheckUpdate => self.cmd_check_update(req.id).await,
             Command::UpdateInstall => self.cmd_update_install(req.id, false).await,
             Command::LanInfo => self.cmd_lan_info(req.id).await,
@@ -1253,6 +1299,42 @@ impl Daemon {
                 .iter()
                 .map(|n| format!("{} ({})", n.name, n.addr))
                 .collect(),
+            bundles: true,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            extension: self.extension_status.lock().unwrap().clone(),
+        }
+    }
+
+    fn cmd_extension_hello(&self, req_id: u64, version: String) -> Response {
+        let version = version.trim();
+        if version.is_empty() || version.len() > 64 {
+            return Response {
+                id: req_id,
+                reply: Reply::Error {
+                    message: "extension version must be 1-64 characters".into(),
+                },
+            };
+        }
+        let last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let status = ExtensionStatus {
+            version: version.to_string(),
+            last_seen,
+        };
+        if let Err(e) = atomic_write_json(&self.extension_status_path, &status) {
+            return Response {
+                id: req_id,
+                reply: Reply::Error {
+                    message: format!("saving extension status failed: {e}"),
+                },
+            };
+        }
+        *self.extension_status.lock().unwrap() = status;
+        Response {
+            id: req_id,
+            reply: Reply::Ok,
         }
     }
 
@@ -1855,6 +1937,8 @@ impl Daemon {
             seeding: false,
             seed_paused: false,
             peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
         };
         {
             // One lock scope for the duplicate check AND the push: two
@@ -1889,6 +1973,292 @@ impl Daemon {
         }
         self.spawn_runner(rec);
         Response { id: req_id, reply: Reply::Added { id } }
+    }
+
+    /// Queue one bundle: every link becomes a part of a single task that owns
+    /// `<dest>/<name>/`, the way a torrent owns its root. The caller normally
+    /// groups first (`PreviewBundle`); when it does not, the same grouping
+    /// runs here so a bare RPC call still lands in a sane folder.
+    fn cmd_add_bundle(
+        self: &Arc<Self>,
+        req_id: u64,
+        name: Option<String>,
+        dest_dir: Option<PathBuf>,
+        parts: Vec<BundlePart>,
+        start_at: Option<i64>,
+    ) -> Response {
+        let dest_dir = dest_dir
+            .or_else(|| self.conf().default_download_dir.clone())
+            .or_else(default_download_dir);
+        let links: Vec<ripdl_core::bundle::Link> = parts
+            .iter()
+            .map(|p| ripdl_core::bundle::Link {
+                url: p.url.clone(),
+                filename: p.filename.clone(),
+            })
+            .collect();
+        let group = match name {
+            Some(name) => ripdl_core::bundle::make_group(&name, &links),
+            None => match ripdl_core::bundle::group(&links).into_iter().next() {
+                Some(group) => group,
+                None => {
+                    return Response {
+                        id: req_id,
+                        reply: Reply::Error {
+                            message: "no usable links in the bundle".into(),
+                        },
+                    }
+                }
+            },
+        };
+        if group.parts.is_empty() {
+            return Response {
+                id: req_id,
+                reply: Reply::Error {
+                    message: "no usable links in the bundle".into(),
+                },
+            };
+        }
+        // Headers travel per part; grouping only decides order and names.
+        let headers_of = |url: &str| -> std::collections::HashMap<String, String> {
+            parts
+                .iter()
+                .find(|p| p.url == url)
+                .map(|p| p.headers.clone())
+                .unwrap_or_default()
+        };
+        let record_parts: Vec<BundlePart> = group
+            .parts
+            .iter()
+            .map(|p| BundlePart {
+                url: p.url.clone(),
+                filename: Some(p.filename.clone()),
+                headers: headers_of(&p.url),
+                state: TaskState::Queued,
+                downloaded: 0,
+                total: None,
+                seq: p.seq,
+                error: None,
+            })
+            .collect();
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let rec = TaskRecord {
+            id: id.clone(),
+            // The first part keeps `url` meaningful for the paths that still
+            // read it (refresh, delete sweep, logs).
+            url: record_parts[0].url.clone(),
+            dest_dir,
+            state: TaskState::Queued,
+            error: None,
+            headers: Default::default(),
+            start_at,
+            kind: TaskKind::Bundle,
+            dest_file: None,
+            downloaded: 0,
+            total: None,
+            info_hash: None,
+            torrent_name: None,
+            sequential: false,
+            only_files: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
+            bundle_name: Some(group.name.clone()),
+            parts: record_parts,
+        };
+        let sorted_urls = |parts: &[BundlePart]| -> Vec<String> {
+            let mut urls: Vec<String> = parts.iter().map(|p| p.url.clone()).collect();
+            urls.sort();
+            urls.dedup();
+            urls
+        };
+        let want = sorted_urls(&rec.parts);
+        {
+            let mut records = self.records.lock().unwrap();
+            // Idempotency: the same set of part URLs is the same task.
+            if let Some(existing) = records.iter().find(|r| {
+                r.kind == TaskKind::Bundle && sorted_urls(&r.parts) == want
+            }) {
+                return Response {
+                    id: req_id,
+                    reply: Reply::Added {
+                        id: existing.id.clone(),
+                    },
+                };
+            }
+            records.push(rec.clone());
+            let snapshot = records.clone();
+            drop(records);
+            let _ = self.persist(&snapshot);
+        }
+        self.spawn_runner(rec);
+        Response { id: req_id, reply: Reply::Added { id } }
+    }
+
+    /// Append more links to an existing bundle ("I forgot part 7"). New
+    /// links must group under the bundle's own name and carry a part number;
+    /// URLs already present are skipped. The bundle then restarts (a runner
+    /// holds the parts it was spawned with), which resumes paused, failed
+    /// AND completed bundles - a completed task picks the new part up at
+    /// once, finished parts never re-download.
+    async fn cmd_add_bundle_parts(
+        self: &Arc<Self>,
+        req_id: u64,
+        id: &str,
+        parts: Vec<BundlePart>,
+    ) -> Response {
+        let reply: Result<Reply, String> = async {
+            let bundle_name = {
+                let records = self.records.lock().unwrap();
+                let Some(rec) = records.iter().find(|r| r.id == id) else {
+                    return Err("task not found".into());
+                };
+                if rec.kind != TaskKind::Bundle {
+                    return Err("task is not a bundle".into());
+                }
+                rec.bundle_name
+                    .clone()
+                    .ok_or_else(|| "bundle has no name".to_string())?
+            };
+
+            // Every new link must prove it belongs: its filename groups under
+            // the bundle's name and carries a part number. A stray cover file
+            // or foreign set is refused with the reason, not silently added.
+            let links: Vec<ripdl_core::bundle::Link> = parts
+                .iter()
+                .map(|p| ripdl_core::bundle::Link {
+                    url: p.url.clone(),
+                    filename: p.filename.clone(),
+                })
+                .collect();
+            let group = ripdl_core::bundle::group(&links)
+                .into_iter()
+                .find(|g| g.name == bundle_name)
+                .ok_or_else(|| {
+                    format!(
+                        "none of the links names a part of \"{bundle_name}\" (they group elsewhere or carry no part number)"
+                    )
+                })?;
+            if group.parts.iter().any(|p| p.seq.is_none()) {
+                return Err("a link without a part number cannot join a bundle".into());
+            }
+
+            // Headers travel per part, same as AddBundle.
+            let headers_of = |url: &str| -> std::collections::HashMap<String, String> {
+                parts
+                    .iter()
+                    .find(|p| p.url == url)
+                    .map(|p| p.headers.clone())
+                    .unwrap_or_default()
+            };
+
+            // URLs the bundle already carries are skipped, not errors.
+            let existing: Vec<String> = {
+                let records = self.records.lock().unwrap();
+                records
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.parts.iter().map(|p| p.url.clone()).collect())
+                    .unwrap_or_default()
+            };
+            let fresh: Vec<_> = group
+                .parts
+                .iter()
+                .filter(|p| !existing.iter().any(|old| old == &p.url))
+                .collect();
+            if fresh.is_empty() {
+                return Ok(Reply::BundlePartsAdded { id: id.to_string(), added: 0 });
+            }
+
+            // A runner holds the parts it was spawned with: stop it before
+            // mutating the record, then restart below.
+            let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
+            if let Some(token) = token {
+                token.cancel();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while self.runtime.lock().unwrap().contains_key(id) {
+                    if Instant::now() > deadline {
+                        return Err("the bundle did not pause in time; try again".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            let mut added = 0usize;
+            let snapshot = {
+                let mut records = self.records.lock().unwrap();
+                let Some(r) = records.iter_mut().find(|r| r.id == id) else {
+                    return Err("task was removed meanwhile".into());
+                };
+                for p in &fresh {
+                    if r.parts.iter().any(|old| old.url == p.url) {
+                        continue; // raced in meanwhile: still idempotent
+                    }
+                    added += 1;
+                    r.parts.push(BundlePart {
+                        url: p.url.clone(),
+                        filename: Some(p.filename.clone()),
+                        headers: headers_of(&p.url),
+                        state: TaskState::Queued,
+                        downloaded: 0,
+                        total: None,
+                        seq: p.seq,
+                        error: None,
+                    });
+                }
+                r.parts.sort_by_key(|p| p.seq.unwrap_or(u32::MAX));
+                if added > 0 {
+                    r.state = TaskState::Queued;
+                    r.error = None;
+                }
+                let (downloaded, total) = Self::bundle_totals(&r.parts);
+                r.downloaded = downloaded;
+                r.total = total;
+                records.clone()
+            };
+            let _ = self.persist(&snapshot);
+            self.progress.lock().unwrap().remove(id);
+
+            if added > 0 {
+                self.spawn_runner(
+                    self.records
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r.id == id)
+                        .cloned()
+                        .ok_or_else(|| "task was removed meanwhile".to_string())?,
+                );
+            }
+            Ok(Reply::BundlePartsAdded { id: id.to_string(), added })
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
+    }
+
+    /// Group a selection without writing anything: the extension's offer chip
+    /// and `ripdl bundle preview` show this instead of guessing the rules.
+    fn cmd_preview_bundle(&self, req_id: u64, links: Vec<BundlePart>) -> Response {
+        let links: Vec<ripdl_core::bundle::Link> = links
+            .iter()
+            .map(|p| ripdl_core::bundle::Link {
+                url: p.url.clone(),
+                filename: p.filename.clone(),
+            })
+            .collect();
+        Response {
+            id: req_id,
+            reply: Reply::BundlePreview {
+                groups: ripdl_core::bundle::group(&links),
+            },
+        }
     }
 
     /// Details dispatch: torrents answer with the swarm snapshot, everything
@@ -1938,9 +2308,16 @@ impl Daemon {
                 }
             }
         };
-        let (dest_file, etag, segments) = match find_sidecar(&rec, &self.sidecar_dirs(&rec)) {
-            Some((dest, state)) => (Some(dest), state.etag, state.segments),
-            None => (rec.dest_file.clone(), None, Vec::new()),
+        let is_bundle = rec.kind == TaskKind::Bundle;
+        let (dest_file, etag, segments) = if is_bundle {
+            // Parts have their own sidecars inside the root; the row's file
+            // is the folder itself.
+            (rec.dest_file.clone(), None, Vec::new())
+        } else {
+            match find_sidecar(&rec, &self.sidecar_dirs(&rec)) {
+                Some((dest, state)) => (Some(dest), state.etag, state.segments),
+                None => (rec.dest_file.clone(), None, Vec::new()),
+            }
         };
         let (downloaded, total, percent) = match live {
             Some((d, t, p)) => (d, t, p),
@@ -1961,6 +2338,8 @@ impl Daemon {
                     etag,
                     error: rec.error,
                     segments,
+                    parts: if is_bundle { rec.parts } else { Vec::new() },
+                    bundle_name: rec.bundle_name,
                 },
             },
         }
@@ -1976,7 +2355,11 @@ impl Daemon {
         id: &str,
         url: &str,
         resume: bool,
+        part: Option<u32>,
     ) -> Response {
+        if part.is_some() {
+            return self.cmd_refresh_part(req_id, id, url, resume, part.unwrap()).await;
+        }
         let reply: Result<Reply, String> = async {
             let rec = {
                 let records = self.records.lock().unwrap();
@@ -2059,6 +2442,124 @@ impl Daemon {
                 id: id.to_string(),
                 kept,
                 total,
+                part: None,
+            })
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
+    }
+
+    /// Refresh ONE part of a bundle: swap that part's address while keeping
+    /// its on-disk bytes. The whole bundle pauses for the swap (a runner
+    /// holds the parts it was spawned with) and resumes afterwards; parts
+    /// that already finished stay finished.
+    async fn cmd_refresh_part(
+        self: &Arc<Self>,
+        req_id: u64,
+        id: &str,
+        url: &str,
+        resume: bool,
+        seq: u32,
+    ) -> Response {
+        let reply: Result<Reply, String> = async {
+            let (rec, index) = {
+                let records = self.records.lock().unwrap();
+                let Some(rec) = records.iter().find(|r| r.id == id) else {
+                    return Err("task not found".into());
+                };
+                if rec.kind != TaskKind::Bundle {
+                    return Err("--part only applies to a bundle task".into());
+                }
+                let index = rec
+                    .parts
+                    .iter()
+                    .position(|p| p.seq == Some(seq))
+                    .ok_or_else(|| format!("no part {seq} in this bundle"))?;
+                (rec.clone(), index)
+            };
+            if rec.parts[index].state == TaskState::Completed {
+                return Err(format!("part {seq} already finished; nothing to refresh"));
+            }
+
+            // Stop the bundle's runner so no part is mid-flight during the
+            // swap, then wait for it to land its sidecars.
+            let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
+            if let Some(token) = token {
+                token.cancel();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while self.runtime.lock().unwrap().contains_key(id) {
+                    if Instant::now() > deadline {
+                        return Err("the bundle did not pause in time; try again".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            // A part that never started has no sidecar to validate: the swap
+            // is pure bookkeeping. One that did gets the same compatibility
+            // gate as a whole task (same file name + size, byte ranges).
+            let part = &rec.parts[index];
+            let filename = part
+                .filename
+                .clone()
+                .unwrap_or_else(|| ripdl_core::bundle::Link::new(part.url.as_str()).part_filename());
+            let mut kept = part.downloaded;
+            let mut total = part.total;
+            if let Some(root) = &rec.dest_file {
+                let sidecar = root.join(format!("{filename}.ripdl.json"));
+                if let Some((dest, mut state)) = read_sidecar_for(sidecar, &part.url) {
+                    let engine = Engine::new(self.engine_config(&part.headers, false))
+                        .map_err(|e| e.to_string())?;
+                    let info = engine.plan(url).await.map_err(|e| e.to_string())?;
+                    ripdl_core::refresh::check_compatible(&dest, &state, &info)
+                        .map_err(|e| e.to_string())?;
+                    kept = ripdl_core::refresh::kept_bytes(&state);
+                    total = info.total;
+                    ripdl_core::refresh::retarget(&mut state, url, info.etag, info.total);
+                    ripdl_core::refresh::save(&dest, &state).map_err(|e| e.to_string())?;
+                }
+            }
+
+            let snapshot = {
+                let mut records = self.records.lock().unwrap();
+                let Some(r) = records.iter_mut().find(|r| r.id == id) else {
+                    return Err("task was removed meanwhile".into());
+                };
+                let Some(part) = r.parts.get_mut(index) else {
+                    return Err("part was removed meanwhile".into());
+                };
+                part.url = url.to_string();
+                part.state = TaskState::Paused;
+                part.error = None;
+                part.downloaded = kept;
+                if total.is_some() {
+                    part.total = total;
+                }
+                let (downloaded, total) = Self::bundle_totals(&r.parts);
+                r.downloaded = downloaded;
+                r.total = total;
+                r.state = TaskState::Paused;
+                r.error = None;
+                records.clone()
+            };
+            let _ = self.persist(&snapshot);
+            self.progress.lock().unwrap().remove(id);
+
+            if resume {
+                match self.cmd_resume(req_id, id).reply {
+                    Reply::Ok => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(Reply::Refreshed {
+                id: id.to_string(),
+                kept,
+                total,
+                part: Some(seq),
             })
         }
         .await;
@@ -2184,6 +2685,20 @@ impl Daemon {
                 // URL and planning segments (HTTP/video only - a torrent has
                 // its own metadata state).
                 let probing = live && r.kind != TaskKind::Torrent && !progress.contains_key(&r.id);
+                // Bundle rows: how many parts are done and how many the
+                // numbering proves exist (0 = the selection does not say).
+                let (parts_done, parts_total, parts_missing) = if r.kind == TaskKind::Bundle {
+                    let seqs: Vec<Option<u32>> = r.parts.iter().map(|p| p.seq).collect();
+                    let (_, total, missing) = ripdl_core::bundle::numbering(&seqs);
+                    let done = r
+                        .parts
+                        .iter()
+                        .filter(|p| p.state == TaskState::Completed)
+                        .count() as u32;
+                    (done, total.unwrap_or(0), missing)
+                } else {
+                    (0, 0, Vec::new())
+                };
                  let (downloaded, total, speed_bps, percent, uploaded, upload_bps, verifying) =
                     match progress.get(&r.id) {
                         Some(t) => (
@@ -2227,10 +2742,13 @@ impl Daemon {
                     kind: r.kind,
                     percent,
                     dest_file: r.dest_file.clone(),
-                    name: r.torrent_name.clone(),
+                    name: r.bundle_name.clone().or_else(|| r.torrent_name.clone()),
                     info_hash: r.info_hash.clone(),
                     sequential: r.sequential,
                     only_files: r.only_files.clone(),
+                    parts_done,
+                    parts_total,
+                    parts_missing,
                 }
             })
             .collect();
@@ -2449,6 +2967,251 @@ impl Daemon {
         Response { id: req_id, reply: Reply::Ok }
     }
 
+    /// Drive a bundle: one engine run per part, each taking a slot from the
+    /// daemon-wide pool, all writing into the task's own folder.
+    ///
+    /// `Ok(Some(root))` = every part finished; `Ok(None)` = cancelled (or the
+    /// record went away); `Err` = a part failed - the other parts still ran
+    /// to the end.
+    async fn run_bundle(
+        self: &Arc<Self>,
+        rec: TaskRecord,
+        token: CancellationToken,
+    ) -> std::result::Result<Option<PathBuf>, String> {
+        // Re-check after the scheduled-start wait: paused/removed while queued?
+        {
+            let records = self.records.lock().unwrap();
+            match records.iter().find(|r| r.id == rec.id) {
+                Some(r) if r.state == TaskState::Queued => {}
+                _ => return Ok(None),
+            }
+        }
+        // Root: reuse the folder recorded on an earlier run (a resume must keep
+        // writing into the same one), else claim a free name now.
+        let root = match rec.dest_file.clone() {
+            Some(root) => root,
+            None => {
+                let dir = rec.dest_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let name = rec.bundle_name.clone().unwrap_or_else(|| "bundle".into());
+                let root = ripdl_core::bundle::free_dir(&dir, &name);
+                // Persist the root before the first byte: delete_files and the
+                // row's "Save to" must work on a partial bundle too.
+                let snapshot = {
+                    let mut records = self.records.lock().unwrap();
+                    match records.iter_mut().find(|r| r.id == rec.id) {
+                        Some(r) => r.dest_file = Some(root.clone()),
+                        None => return Ok(None),
+                    }
+                    records.clone()
+                };
+                let _ = self.persist(&snapshot);
+                root
+            }
+        };
+        std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+        self.set_state(&rec.id, TaskState::Running, None);
+
+        let mut workers = tokio::task::JoinSet::new();
+        for index in 0..rec.parts.len() {
+            let this = Arc::clone(self);
+            let part_token = token.child_token();
+            let root = root.clone();
+            let id = rec.id.clone();
+            workers.spawn(async move { this.run_bundle_part(&id, index, &root, part_token).await });
+        }
+        let mut failure: Option<String> = None;
+        while let Some(joined) = workers.join_next().await {
+            let outcome = match joined {
+                Ok(outcome) => outcome,
+                Err(e) => Err(format!("part worker stopped: {e}")),
+            };
+            if let Err(e) = outcome {
+                if failure.is_none() {
+                    failure = Some(e);
+                }
+            }
+        }
+        // Cancellation wins over a part error: a paused bundle is not failed.
+        if token.is_cancelled() {
+            return Ok(None);
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(Some(root)),
+        }
+    }
+
+    /// One part of a bundle: take a normal download slot, run the engine with
+    /// this part's own name and headers, publish its state.
+    async fn run_bundle_part(
+        self: &Arc<Self>,
+        id: &str,
+        index: usize,
+        root: &std::path::Path,
+        token: CancellationToken,
+    ) -> std::result::Result<(), String> {
+        let (url, filename, headers, already) = {
+            let records = self.records.lock().unwrap();
+            let Some(rec) = records.iter().find(|r| r.id == id) else {
+                return Ok(());
+            };
+            let Some(part) = rec.parts.get(index) else {
+                return Ok(());
+            };
+            (
+                part.url.clone(),
+                part.filename.clone().unwrap_or_default(),
+                part.headers.clone(),
+                part.state == TaskState::Completed,
+            )
+        };
+        // Finished parts stay finished across a resume (their sidecar keeps
+        // the bytes either way).
+        if already {
+            return Ok(());
+        }
+        let filename = if filename.is_empty() {
+            ripdl_core::bundle::Link::new(url.as_str()).part_filename()
+        } else {
+            filename
+        };
+
+        // The slot comes from the same semaphore as every other transfer.
+        let permit = tokio::select! {
+            _ = token.cancelled() => {
+                self.set_part_state(id, index, TaskState::Paused, None, None);
+                return Ok(());
+            }
+            p = self.sem.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => return Ok(()),
+            },
+        };
+        if token.is_cancelled() {
+            drop(permit);
+            self.set_part_state(id, index, TaskState::Paused, None, None);
+            return Ok(());
+        }
+
+        self.set_part_state(id, index, TaskState::Running, None, None);
+        let engine = match Engine::new(self.engine_config(&headers, true)) {
+            Ok(engine) => engine,
+            Err(e) => {
+                let msg = e.to_string();
+                self.set_part_state(id, index, TaskState::Failed, Some(msg.clone()), None);
+                return Err(format!("{filename}: {msg}"));
+            }
+        };
+        let this = Arc::clone(self);
+        let task_id = id.to_string();
+        let on_progress = move |p: Progress| this.on_part_progress(&task_id, index, p);
+        let result = engine
+            .download_named(
+                &url,
+                Some(root.to_path_buf()),
+                Some(filename.clone()),
+                token.clone(),
+                on_progress,
+            )
+            .await;
+        drop(permit);
+        match result {
+            Ok(path) => {
+                // The file itself is the authority on a finished part: the
+                // engine's progress reporter is detached and can deliver an
+                // early (0-byte) or late sample after this point.
+                let bytes = std::fs::metadata(&path).map(|m| m.len()).ok();
+                self.set_part_state(id, index, TaskState::Completed, None, bytes);
+                Ok(())
+            }
+            Err(Error::Cancelled) => {
+                self.set_part_state(id, index, TaskState::Paused, None, None);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.set_part_state(id, index, TaskState::Failed, Some(msg.clone()), None);
+                Err(format!("{filename}: {msg}"))
+            }
+        }
+    }
+
+    /// Fold one part's sample into the record and publish the bundle's
+    /// aggregate, so the row shows one rate and one percent for the whole set.
+    fn on_part_progress(&self, id: &str, index: usize, p: Progress) {
+        let aggregate = {
+            let mut records = self.records.lock().unwrap();
+            let Some(rec) = records.iter_mut().find(|r| r.id == id) else {
+                return;
+            };
+            let Some(part) = rec.parts.get_mut(index) else {
+                return;
+            };
+            // Only a part that is still running may move: a settled part owns
+            // its final byte count, and the detached reporter can deliver an
+            // early 0-byte sample or a late final one.
+            if part.state != TaskState::Running {
+                return;
+            }
+            // Nothing known yet (URL still being probed): publishing a 0-byte
+            // sample would retire the row's "connecting" state early and leave
+            // it reading "running 0 B" through the probe.
+            if p.downloaded == 0 && p.total.is_none() {
+                return;
+            }
+            part.downloaded = p.downloaded;
+            if p.total.is_some() {
+                part.total = p.total;
+            }
+            let (downloaded, total) = Self::bundle_totals(&rec.parts);
+            rec.downloaded = downloaded;
+            rec.total = total;
+            Progress {
+                id: id.to_string(),
+                downloaded,
+                total,
+                dest_file: rec.dest_file.clone(),
+                ..Progress::default()
+            }
+        };
+        self.on_progress(id, aggregate);
+    }
+
+    /// Per-part state change, persisted: a paused bundle must come back with
+    /// the parts it already finished. `bytes` is the finished size of a
+    /// completed part (None leaves the sampled byte count alone).
+    fn set_part_state(
+        &self,
+        id: &str,
+        index: usize,
+        state: TaskState,
+        error: Option<String>,
+        bytes: Option<u64>,
+    ) {
+        let snapshot = {
+            let mut records = self.records.lock().unwrap();
+            let Some(rec) = records.iter_mut().find(|r| r.id == id) else {
+                return;
+            };
+            let Some(part) = rec.parts.get_mut(index) else {
+                return;
+            };
+            part.state = state;
+            part.error = error;
+            if let Some(bytes) = bytes {
+                part.downloaded = bytes;
+                part.total = Some(bytes);
+            }
+            // Keep the task's own counters in step with its parts.
+            let (downloaded, total) = Self::bundle_totals(&rec.parts);
+            rec.downloaded = downloaded;
+            rec.total = total;
+            records.clone()
+        };
+        let _ = self.persist(&snapshot);
+    }
+
     /// Spawn the async worker that drives one task from queued to a terminal
     /// state. The engine's cancellation token doubles as the pause switch:
     /// canceling it persists a Paused sidecar, and resume replays it.
@@ -2482,6 +3245,21 @@ impl Daemon {
                     }
                 }
                 None => {}
+            }
+
+            // A bundle owns no slot of its own: its parts each take one, so
+            // `max_concurrent` keeps meaning "transfers in flight".
+            if rec.kind == TaskKind::Bundle {
+                let result = this.run_bundle(rec.clone(), token.clone()).await;
+                detach_runtime();
+                match result {
+                    Ok(Some(root)) => this.set_completed(&rec.id, Some(root)),
+                    // Cancelled while queued or running: land on Paused the
+                    // same way the single-task path does.
+                    Ok(None) => this.set_state(&rec.id, TaskState::Paused, None),
+                    Err(e) => this.set_state(&rec.id, TaskState::Failed, Some(e)),
+                }
+                return;
             }
 
             // Wait for a concurrency slot; pause/remove while queued bails here.
@@ -2523,6 +3301,9 @@ impl Daemon {
             // same progress stream and the same pause/cancel semantics; all
             // hand back the produced file/folder (for "open"/"delete").
             let result = match rec.kind {
+                // Bundles are driven by `run_bundle` before this point: their
+                // parts take the slots, not the task.
+                TaskKind::Bundle => unreachable!("bundle handled by run_bundle"),
                 TaskKind::Video => {
                     let cfg = ripdl_core::hunt::HuntConfig {
                         id: rec.id.clone(),
@@ -2663,11 +3444,26 @@ impl Daemon {
         }
     }
 
-    /// Terminal success with the produced file, remembered for the
-    /// "open file" / "delete files" flows (and byte counters for the UI).
+    /// The bundle's own byte counters: the sum of its parts, and a total only
+    /// once every part knows its size (a half-known sum paints a percentage
+    /// that drops as the rest are probed).
+    fn bundle_totals(parts: &[BundlePart]) -> (u64, Option<u64>) {
+        let downloaded = parts.iter().map(|p| p.downloaded).sum();
+        let total = parts
+            .iter()
+            .all(|p| p.total.is_some())
+            .then(|| parts.iter().filter_map(|p| p.total).sum());
+        (downloaded, total)
+    }
+
     /// Size of a path on disk: files measure directly, directories sum
     /// their contents recursively. None for absent paths (multi-file torrent
     /// roots are folders, where plain `metadata.len()` would report 0).
+    ///
+    /// Resume sidecars (`.ripdl.json`) are skipped: they are bookkeeping, not
+    /// payload, and an in-flight buffered write can land one *after* a
+    /// finished part removed its own - counting it would make a bundle's
+    /// reported size depend on that race.
     fn disk_size(p: &std::path::Path) -> Option<u64> {
         let meta = std::fs::metadata(p).ok()?;
         if !meta.is_dir() {
@@ -2678,6 +3474,10 @@ impl Daemon {
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().ends_with(".ripdl.json") {
+                    continue;
+                }
                 match std::fs::metadata(entry.path()) {
                     Ok(m) if m.is_dir() => stack.push(entry.path()),
                     Ok(m) => total += m.len(),
@@ -2688,6 +3488,8 @@ impl Daemon {
         Some(total)
     }
 
+    /// Terminal success with the produced file, remembered for the
+    /// "open file" / "delete files" flows (and byte counters for the UI).
     fn set_completed(&self, id: &str, file: Option<PathBuf>) {
         // The produced path is a parameter, so the (possibly huge) torrent
         // tree walk runs BEFORE any lock is taken - a few-thousand-file
@@ -2713,7 +3515,15 @@ impl Daemon {
                     if let Some((_, _, uploaded)) = fallback {
                         r.uploaded = r.uploaded.max(uploaded);
                     }
-                    if r.dest_file.is_some() {
+                    if r.kind == TaskKind::Bundle {
+                        // Part records own the durable payload byte counts.
+                        // Walking the bundle directory here can race a late
+                        // sidecar write and count bookkeeping as downloaded
+                        // payload.
+                        let (downloaded, total) = Self::bundle_totals(&r.parts);
+                        r.downloaded = downloaded;
+                        r.total = total;
+                    } else if r.dest_file.is_some() {
                         match disk {
                             Some(n) => {
                                 r.downloaded = n;
@@ -3000,6 +3810,8 @@ mod tests {
             seeding: false,
             seed_paused: false,
             peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
         }
     }
 
@@ -3066,6 +3878,42 @@ mod tests {
     }
 
     #[test]
+    fn extension_hello_persists_and_is_reported_after_restart() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ripdl-extension-status-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let queue = tmp.join("queue.json");
+        let config = tmp.join("config.json");
+        let daemon = Arc::new(
+            Daemon::new(queue.clone(), config.clone(), DaemonConfig::default()).unwrap(),
+        );
+        let response = daemon.cmd_extension_hello(1, "0.5.0".into());
+        assert!(matches!(response.reply, Reply::Ok));
+        match daemon.config_reply() {
+            Reply::Config { extension, .. } => {
+                assert_eq!(extension.version, "0.5.0");
+                assert!(extension.last_seen > 0);
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        let restored = Arc::new(
+            Daemon::new(queue, config, DaemonConfig::default()).unwrap(),
+        );
+        match restored.config_reply() {
+            Reply::Config { extension, .. } => {
+                assert_eq!(extension.version, "0.5.0");
+                assert!(extension.last_seen > 0);
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn config_save_roundtrip_and_zero_speed_meaning() {
         let tmp = std::env::temp_dir().join(format!("ripdl-cfgtest-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -3126,6 +3974,8 @@ mod tests {
             seeding: false,
             seed_paused: false,
             peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
         };
         let deleted = delete_artifacts(&rec);
 
@@ -3164,6 +4014,8 @@ mod tests {
             seeding: false,
             seed_paused: false,
             peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
         };
         assert!(delete_artifacts(&rec).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3215,6 +4067,462 @@ mod tests {
         rec.url = "https://x/f.bin?token=2".into();
         assert!(find_sidecar(&rec, &[dir.clone()]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Offline HTTP fixture for the bundle tests: `/f<N>` serves 64 KiB with a
+    /// real 206 for Range requests, `/missing` always answers 404, `/flaky`
+    /// answers 404 until the test flips its flag. Per-path GET counts prove a
+    /// finished part is never fetched twice.
+    struct Fixture {
+        base: String,
+        flaky_ok: Arc<std::sync::atomic::AtomicBool>,
+        gets: Arc<Mutex<HashMap<String, usize>>>,
+    }
+
+    async fn spawn_fixture() -> Fixture {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+
+        const SIZE: usize = 64 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let flaky_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gets: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        let (flag, counts) = (Arc::clone(&flaky_ok), Arc::clone(&gets));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (flag, counts) = (Arc::clone(&flag), Arc::clone(&counts));
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let mut lines = head.lines();
+                    let request = lines.next().unwrap_or_default().to_string();
+                    let mut words = request.split_whitespace();
+                    let method = words.next().unwrap_or("GET").to_string();
+                    let path = words.next().unwrap_or("/").to_string();
+                    let range = lines.find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("range:")
+                            .map(|v| v.trim().to_string())
+                    });
+
+                    if method == "GET" {
+                        *counts.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
+                    }
+                    let blocked = path.contains("missing")
+                        || (path.contains("flaky")
+                            && !flag.load(std::sync::atomic::Ordering::SeqCst));
+                    if blocked {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+
+                    let body: Vec<u8> = if path.starts_with("/f") {
+                        (0..SIZE).map(|i| (i % 251) as u8).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let (status, start, end) = match range.as_deref() {
+                        Some(r) => {
+                            let spec = r.trim_start_matches("bytes=");
+                            let (a, b) = spec.split_once('-').unwrap_or(("0", ""));
+                            let start: usize = a.trim().parse().unwrap_or(0);
+                            let end: usize = if b.trim().is_empty() {
+                                SIZE.saturating_sub(1)
+                            } else {
+                                b.trim().parse().unwrap_or(SIZE - 1)
+                            };
+                            ("206 Partial Content", start.min(SIZE), end.min(SIZE.saturating_sub(1)))
+                        }
+                        None => ("200 OK", 0, SIZE.saturating_sub(1)),
+                    };
+                    let slice = if body.is_empty() {
+                        &body[..]
+                    } else {
+                        &body[start..=end]
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{SIZE}\r\nConnection: close\r\n\r\n",
+                        slice.len()
+                    );
+                    let _ = sock.write_all(headers.as_bytes()).await;
+                    if method != "HEAD" {
+                        let _ = sock.write_all(slice).await;
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        Fixture {
+            base: format!("http://{addr}"),
+            flaky_ok,
+            gets,
+        }
+    }
+
+    fn bundle_parts(base: &str, names: &[&str]) -> Vec<BundlePart> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| BundlePart {
+                url: format!("{base}/f{}", i + 1),
+                filename: Some((*name).to_string()),
+                headers: Default::default(),
+                state: TaskState::Queued,
+                downloaded: 0,
+                total: None,
+                seq: None,
+                error: None,
+            })
+            .collect()
+    }
+
+    /// Poll the queue until the task reaches `want` (or panic after `timeout`).
+    async fn wait_state(daemon: &Daemon, id: &str, want: TaskState) -> TaskRecord {
+        for _ in 0..500 {
+            {
+                let records = daemon.records.lock().unwrap();
+                if let Some(rec) = records.iter().find(|r| r.id == id) {
+                    if rec.state == want {
+                        return rec.clone();
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let records = daemon.records.lock().unwrap();
+        let seen = records
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| format!("{:?} ({:?})", r.state, r.error))
+            .unwrap_or_else(|| "missing".into());
+        panic!("timed out waiting for {want:?}, saw {seen}");
+    }
+
+    fn temp_bundle_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ripdl-bundle-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bundle_parts_share_one_folder_and_finish_together() {
+        let fx = spawn_fixture().await;
+        let tmp = temp_bundle_dir("ok");
+        let dest = tmp.join("dest");
+        let daemon = Arc::new(
+            Daemon::new(
+                tmp.join("queue.json"),
+                tmp.join("config.json"),
+                DaemonConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let parts = bundle_parts(
+            &fx.base,
+            &["x.part01.rar", "x.part02.rar", "x.part03.rar"],
+        );
+        let id = match daemon.cmd_add_bundle(1, None, Some(dest.clone()), parts, None).reply {
+            Reply::Added { id } => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let rec = wait_state(&daemon, &id, TaskState::Completed).await;
+        assert_eq!(rec.bundle_name.as_deref(), Some("x"));
+        assert_eq!(rec.parts.len(), 3);
+        assert!(rec.parts.iter().all(|p| p.state == TaskState::Completed));
+        // One folder, the part names the page gave, not the server's.
+        let root = dest.join("x");
+        assert!(root.is_dir(), "bundle root missing: {}", root.display());
+        let listing: Vec<(String, u64)> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| {
+                let entry = e.ok()?;
+                let len = entry.metadata().ok()?.len();
+                Some((entry.file_name().to_string_lossy().into_owned(), len))
+            })
+            .collect();
+        let parts_seen: Vec<_> = rec
+            .parts
+            .iter()
+            .map(|p| (p.filename.clone(), p.downloaded, p.total, p.state))
+            .collect();
+        assert_eq!(
+            rec.downloaded,
+            3 * 64 * 1024,
+            "parts={parts_seen:?} listing={listing:?}"
+        );
+        assert_eq!(rec.total, Some(3 * 64 * 1024));
+        for name in ["x.part01.rar", "x.part02.rar", "x.part03.rar"] {
+            let bytes = std::fs::read(root.join(name)).expect("part on disk");
+            assert_eq!(bytes.len(), 64 * 1024);
+        }
+        // Nothing but the parts (a resume sidecar may linger: the engine's
+        // reporter writes one from a detached task and can land it after a
+        // finished part removed its own - it is bookkeeping, never payload).
+        let payload: Vec<&String> = listing
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| !name.ends_with(".ripdl.json"))
+            .collect();
+        assert_eq!(payload.len(), 3, "no extra payload files: {payload:?}");
+
+        // The row and the details dialog carry the same facts.
+        match daemon.cmd_list(2).reply {
+            Reply::Tasks { tasks } => {
+                let info = tasks.iter().find(|t| t.id == id).expect("row");
+                assert_eq!(info.kind, TaskKind::Bundle);
+                assert_eq!(info.parts_done, 3);
+                assert_eq!(info.parts_total, 3);
+                assert!(info.parts_missing.is_empty());
+                assert_eq!(info.name.as_deref(), Some("x"));
+                assert_eq!(info.dest_file.as_deref(), Some(root.as_path()));
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        match daemon.cmd_task_details(3, &id).reply {
+            Reply::TaskDetails { details } => {
+                assert_eq!(details.parts.len(), 3);
+                assert_eq!(details.bundle_name.as_deref(), Some("x"));
+                assert_eq!(details.dest_file.as_deref(), Some(root.as_path()));
+                assert!(details.parts.iter().all(|p| p.total == Some(64 * 1024)));
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_part_fails_the_bundle_and_resume_only_refetches_it() {
+        let fx = spawn_fixture().await;
+        let tmp = temp_bundle_dir("resume");
+        let dest = tmp.join("dest");
+        let daemon = Arc::new(
+            Daemon::new(
+                tmp.join("queue.json"),
+                tmp.join("config.json"),
+                DaemonConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let part = |url: String, name: &str| BundlePart {
+            url,
+            filename: Some(name.to_string()),
+            headers: Default::default(),
+            state: TaskState::Queued,
+            downloaded: 0,
+            total: None,
+            seq: None,
+            error: None,
+        };
+        let parts = vec![
+            part(format!("{}/f1", fx.base), "x.part01.rar"),
+            part(format!("{}/flaky", fx.base), "x.part02.rar"),
+            part(format!("{}/f3", fx.base), "x.part03.rar"),
+        ];
+        let id = match daemon.cmd_add_bundle(1, None, Some(dest.clone()), parts, None).reply {
+            Reply::Added { id } => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+
+        let rec = wait_state(&daemon, &id, TaskState::Failed).await;
+        assert_eq!(rec.parts[1].state, TaskState::Failed);
+        assert_eq!(rec.parts[0].state, TaskState::Completed);
+        assert_eq!(rec.parts[2].state, TaskState::Completed);
+        let root = dest.join("x");
+        assert!(root.join("x.part01.rar").exists());
+        assert!(root.join("x.part03.rar").exists());
+        assert!(!root.join("x.part02.rar").exists());
+
+        // The two good parts were fetched exactly once.
+        assert_eq!(fx.gets.lock().unwrap().get("/f1").copied(), Some(1));
+        assert_eq!(fx.gets.lock().unwrap().get("/f3").copied(), Some(1));
+
+        fx.flaky_ok.store(true, std::sync::atomic::Ordering::SeqCst);
+        match daemon.cmd_resume(4, &id).reply {
+            Reply::Ok => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let rec = wait_state(&daemon, &id, TaskState::Completed).await;
+        assert!(rec.parts.iter().all(|p| p.state == TaskState::Completed));
+        assert!(root.join("x.part02.rar").exists());
+        // Resume only fetched what was missing: no part was downloaded twice.
+        assert_eq!(fx.gets.lock().unwrap().get("/f1").copied(), Some(1));
+        assert_eq!(fx.gets.lock().unwrap().get("/f3").copied(), Some(1));
+        assert_eq!(fx.gets.lock().unwrap().get("/flaky").copied(), Some(2));
+        assert_eq!(rec.downloaded, 3 * 64 * 1024);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_one_part_swaps_only_that_address() {
+        let fx = spawn_fixture().await;
+        let tmp = temp_bundle_dir("refresh-part");
+        let dest = tmp.join("dest");
+        let daemon = Arc::new(
+            Daemon::new(
+                tmp.join("queue.json"),
+                tmp.join("config.json"),
+                DaemonConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let part = |url: String, name: &str| BundlePart {
+            url,
+            filename: Some(name.to_string()),
+            headers: Default::default(),
+            state: TaskState::Queued,
+            downloaded: 0,
+            total: None,
+            seq: None,
+            error: None,
+        };
+        let parts = vec![
+            part(format!("{}/f1", fx.base), "x.part01.rar"),
+            part(format!("{}/flaky", fx.base), "x.part02.rar"),
+            part(format!("{}/f3", fx.base), "x.part03.rar"),
+        ];
+        let id = match daemon.cmd_add_bundle(1, None, Some(dest.clone()), parts, None).reply {
+            Reply::Added { id } => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        wait_state(&daemon, &id, TaskState::Failed).await;
+
+        // An expired link for part 2 only: the fixture serves the same bytes
+        // at every /fN, so /f9 is the "fresh" address of the same file.
+        match daemon
+            .cmd_refresh_url(2, &id, &format!("{}/f9", fx.base), true, Some(2))
+            .await
+            .reply
+        {
+            Reply::Refreshed { part: Some(2), .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let rec = wait_state(&daemon, &id, TaskState::Completed).await;
+        assert_eq!(rec.parts[1].url, format!("{}/f9", fx.base), "only part 2 moved");
+        assert_eq!(rec.parts[0].url, format!("{}/f1", fx.base));
+        assert!(rec.parts.iter().all(|p| p.state == TaskState::Completed));
+        let root = dest.join("x");
+        assert!(root.join("x.part02.rar").exists());
+        // The flaky address never delivered: the fresh one fetched exactly once.
+        assert_eq!(fx.gets.lock().unwrap().get("/f9").copied(), Some(1));
+        assert_eq!(rec.downloaded, 3 * 64 * 1024);
+
+        // A finished part refuses a refresh: its bytes are final.
+        match daemon
+            .cmd_refresh_url(3, &id, &format!("{}/f8", fx.base), false, Some(1))
+            .await
+            .reply
+        {
+            Reply::Error { message } => assert!(message.contains("already finished"), "{message}"),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        // So does an unknown part number.
+        match daemon
+            .cmd_refresh_url(4, &id, &format!("{}/f8", fx.base), false, Some(9))
+            .await
+            .reply
+        {
+            Reply::Error { message } => assert!(message.contains("no part 9"), "{message}"),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn add_parts_fills_a_completed_bundle_and_skips_duplicates() {
+        let fx = spawn_fixture().await;
+        let tmp = temp_bundle_dir("add-parts");
+        let dest = tmp.join("dest");
+        let daemon = Arc::new(
+            Daemon::new(
+                tmp.join("queue.json"),
+                tmp.join("config.json"),
+                DaemonConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let part = |url: String, name: &str| BundlePart {
+            url,
+            filename: Some(name.to_string()),
+            headers: Default::default(),
+            state: TaskState::Queued,
+            downloaded: 0,
+            total: None,
+            seq: None,
+            error: None,
+        };
+        let parts = vec![
+            part(format!("{}/f1", fx.base), "x.part01.rar"),
+            part(format!("{}/f2", fx.base), "x.part02.rar"),
+        ];
+        let id = match daemon.cmd_add_bundle(1, None, Some(dest.clone()), parts, None).reply {
+            Reply::Added { id } => id,
+            other => panic!("unexpected reply: {other:?}"),
+        };
+        wait_state(&daemon, &id, TaskState::Completed).await;
+        let root = dest.join("x");
+        assert!(root.join("x.part01.rar").exists());
+
+        // The forgotten part 3 joins and the completed bundle picks it up.
+        let more = vec![part(format!("{}/f3", fx.base), "x.part03.rar")];
+        match daemon.cmd_add_bundle_parts(2, &id, more).await.reply {
+            Reply::BundlePartsAdded { added: 1, .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let rec = wait_state(&daemon, &id, TaskState::Completed).await;
+        assert_eq!(rec.parts.len(), 3);
+        assert!(rec.parts.iter().all(|p| p.state == TaskState::Completed));
+        // Parts stay in part-number order for the details table.
+        let seqs: Vec<Option<u32>> = rec.parts.iter().map(|p| p.seq).collect();
+        assert_eq!(seqs, vec![Some(1), Some(2), Some(3)]);
+        assert!(root.join("x.part03.rar").exists());
+        assert_eq!(rec.downloaded, 3 * 64 * 1024);
+
+        // The same link again is a no-op that leaves the state alone.
+        let dup = vec![part(format!("{}/f1", fx.base), "x.part01.rar")];
+        match daemon.cmd_add_bundle_parts(3, &id, dup).await.reply {
+            Reply::BundlePartsAdded { added: 0, .. } => {}
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let rec = {
+            let records = daemon.records.lock().unwrap();
+            records.iter().find(|r| r.id == id).cloned().unwrap()
+        };
+        assert_eq!(rec.state, TaskState::Completed, "duplicate add must not restart");
+        assert_eq!(rec.parts.len(), 3);
+
+        // A link from a different set is refused with the reason.
+        let foreign = vec![part(format!("{}/f4", fx.base), "y.part01.rar")];
+        match daemon.cmd_add_bundle_parts(4, &id, foreign).await.reply {
+            Reply::Error { message } => assert!(message.contains('y'), "{message}"),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // Boot restore is what makes completed torrents survive a daemon
@@ -3295,6 +4603,8 @@ mod tests {
             seeding: false,
             seed_paused: false,
             peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
         });
 
         daemon.boot_restore_torrents().await;
@@ -3452,9 +4762,8 @@ mod tests {
 async fn real_main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let data_dir = dirs::data_local_dir()
-        .context("cannot resolve local data directory")?
-        .join("ripdl");
+    let data_dir = ripdl_core::transport::app_data_dir()
+        .context("cannot resolve local data directory")?;
     std::fs::create_dir_all(&data_dir).context("create data directory")?;
     let queue_path = data_dir.join("queue.json");
     // Stale installers (kept a week as rollback) and half downloads.

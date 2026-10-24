@@ -236,12 +236,15 @@ Run `ripdl --help` for the full list, and `ripdl <command> --help` for flags.
 ## Browser extension (optional)
 
 The extension hands downloads to ripdl instead of the browser's own downloader
-— right-click a link → **Download link with ripdl**. Load it once:
+— right-click a link → **Download link with ripdl**. Set it up once:
 
 1. Run `ripdl register-host` (the Windows installer already does this).
-2. Open `chrome://extensions`, enable **Developer mode**, click
-   **Load unpacked** and pick the `ext` folder inside the install directory.
-3. Right-click any link → **Download link with ripdl**.
+2. In ripdl Settings, open **Browser extension**. Click **Open extension
+  settings**, enable **Developer mode**, and choose **Load unpacked**.
+3. Select the app-managed folder shown in Settings. ripdl creates it under
+  its per-user data directory and updates it with the app.
+4. Right-click any link → **Download link with ripdl**. After an app update,
+  reload the extension when Settings reports that the browser copy is behind.
 
 It only acts when you click, and it never reads pages in the background.
 

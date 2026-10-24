@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Lifecycle of a single download task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
+    #[default]
     Queued,
     Running,
     Paused,
@@ -25,6 +26,8 @@ pub enum TaskKind {
     Video,
     /// BitTorrent payload (magnet / .torrent) via the torrent engine.
     Torrent,
+    /// Multi-part direct links that own one folder (`<dest>/<name>/`).
+    Bundle,
 }
 
 /// Persisted progress for one byte-range segment.

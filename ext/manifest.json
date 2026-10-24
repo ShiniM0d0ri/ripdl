@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ripdl",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Send downloads to ripdl - the free, ad-free download manager.",
   "minimum_chrome_version": "88",
   // Pinned RSA public key: unpacked-extension IDs are otherwise derived from
@@ -25,8 +25,22 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  // The copy chip. One listener, top frame only: the selection is read when
+  // the user copies, and nothing is queued until they click Send.
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["capture.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
   "action": {
     "default_title": "ripdl",
     "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }

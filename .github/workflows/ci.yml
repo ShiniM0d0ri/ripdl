@@ -35,3 +35,7 @@ jobs:
 
       - name: Test (fully offline)
         run: cargo test --workspace
+
+      # Extension plugin layer: recipe engine + script shape + built-ins.
+      - name: Extension plugin tests
+        run: node ext/test/plugins.test.mjs

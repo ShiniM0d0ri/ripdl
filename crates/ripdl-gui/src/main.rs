@@ -9,8 +9,10 @@
 use ripdl_core::bridge;
 use ripdl_core::categories::categorize;
 use ripdl_core::engine::percent_decode_lossy;
-use ripdl_core::rpc::{Command, DaemonSettings, Reply, Request, Response, TaskInfo};
-use ripdl_core::task::TaskKind;
+use ripdl_core::rpc::{
+    BundlePart, Command, DaemonSettings, ExtensionStatus, Reply, Request, Response, TaskInfo,
+};
+use ripdl_core::task::{TaskKind, TaskState};
 use ripdl_core::transport;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -182,6 +184,107 @@ async fn add_video_task(url: String, dest_dir: Option<String>) -> Result<String,
     }
 }
 
+/// Queue several direct links as **one** bundle task that owns a folder
+/// (`<dest>/<name>/<parts...>`). The dialog sends one URL per line; grouping
+/// and the folder name are the daemon's call unless the user typed a name.
+#[tauri::command]
+async fn add_bundle(
+    urls: Vec<String>,
+    name: Option<String>,
+    dest_dir: Option<String>,
+) -> Result<String, String> {
+    let dest = match dest_dir {
+        Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
+        _ => download_root(),
+    };
+    let _ = tokio::fs::create_dir_all(&dest).await;
+    let parts: Vec<BundlePart> = urls
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .map(|url| BundlePart {
+            url,
+            filename: None,
+            headers: Default::default(),
+            state: TaskState::Queued,
+            downloaded: 0,
+            total: None,
+            seq: None,
+            error: None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return Err("no links given".into());
+    }
+    let name = name.filter(|n| !n.trim().is_empty());
+    match rpc(Command::AddBundle {
+        name,
+        dest_dir: Some(dest),
+        parts,
+        start_at: None,
+    })
+    .await?
+    {
+        Reply::Added { id } => Ok(id),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+/// Append links to an existing bundle ("I forgot part 7"). New links must
+/// name parts of that bundle; URLs already in it are skipped. Returns how
+/// many parts actually joined.
+#[tauri::command]
+async fn add_bundle_parts(id: String, urls: Vec<String>) -> Result<usize, String> {
+    let parts: Vec<BundlePart> = urls
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .map(|url| BundlePart {
+            url,
+            filename: None,
+            headers: Default::default(),
+            state: TaskState::Queued,
+            downloaded: 0,
+            total: None,
+            seq: None,
+            error: None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return Err("no links given".into());
+    }
+    match rpc(Command::AddBundleParts { id, parts }).await? {
+        Reply::BundlePartsAdded { added, .. } => Ok(added),
+        Reply::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
+/// Group a selection without queueing anything: the Add-bundle dialog shows
+/// what the links would become, so "12 links" is never a leap of faith.
+#[tauri::command]
+async fn preview_bundle(urls: Vec<String>) -> Result<Vec<ripdl_core::bundle::Group>, String> {
+    let links: Vec<BundlePart> = urls
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .map(|url| BundlePart {
+            url,
+            filename: None,
+            headers: Default::default(),
+            state: TaskState::Queued,
+            downloaded: 0,
+            total: None,
+            seq: None,
+            error: None,
+        })
+        .collect();
+    match rpc(Command::PreviewBundle { links }).await? {
+        Reply::BundlePreview { groups } => Ok(groups),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
 #[tauri::command]
 async fn pause_task(id: String) -> Result<(), String> {
     expect_ok(rpc(Command::Pause { id }).await?)
@@ -248,6 +351,171 @@ fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+fn managed_extension_dir() -> Result<std::path::PathBuf, String> {
+    Ok(transport::app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("extension"))
+}
+
+fn bundled_extension_dir() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let start = exe.parent().ok_or("GUI executable has no parent folder")?;
+    for dir in start.ancestors().take(5) {
+        let candidate = dir.join("ext");
+        if candidate.join("manifest.json").is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("cannot find bundled ext folder beside {}", exe.display()))
+}
+
+fn sync_managed_extension() -> Result<ripdl_core::extplug::ManagedCopy, String> {
+    ripdl_core::extplug::sync_managed(&bundled_extension_dir()?, &managed_extension_dir()?)
+}
+
+#[derive(serde::Serialize)]
+struct BrowserExtensionInfo {
+    folder: String,
+    folder_version: Option<String>,
+    bundled_version: String,
+    loaded: ExtensionStatus,
+    browser: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ChromiumBrowser {
+    name: &'static str,
+    extensions_url: &'static str,
+}
+
+#[cfg(windows)]
+fn default_chromium_browser() -> Option<ChromiumBrowser> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+            "/v",
+            "ProgId",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let prog_id = text.split_whitespace().last()?.to_ascii_lowercase();
+    if prog_id.starts_with("chromehtml") {
+        Some(ChromiumBrowser { name: "Chrome", extensions_url: "chrome://extensions" })
+    } else if prog_id.starts_with("msedgehtm") {
+        Some(ChromiumBrowser { name: "Edge", extensions_url: "edge://extensions" })
+    } else if prog_id.starts_with("bravehtml") {
+        Some(ChromiumBrowser { name: "Brave", extensions_url: "brave://extensions" })
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn default_chromium_browser() -> Option<ChromiumBrowser> {
+    let output = std::process::Command::new("xdg-settings")
+        .args(["get", "default-web-browser"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let desktop_id = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    if desktop_id.contains("microsoft-edge") || desktop_id.contains("msedge") {
+        Some(ChromiumBrowser { name: "Edge", extensions_url: "edge://extensions" })
+    } else if desktop_id.contains("brave") {
+        Some(ChromiumBrowser { name: "Brave", extensions_url: "brave://extensions" })
+    } else if desktop_id.contains("chrome") || desktop_id.contains("chromium") {
+        Some(ChromiumBrowser { name: "Chrome", extensions_url: "chrome://extensions" })
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_chromium_browser() -> Option<ChromiumBrowser> {
+    None
+}
+
+#[tauri::command]
+async fn browser_extension_info(dir: String) -> Result<BrowserExtensionInfo, String> {
+    let managed = managed_extension_dir()?;
+    let bundled_version = ripdl_core::extplug::folder_version(&bundled_extension_dir()?)
+        .ok_or("bundled extension has no readable manifest version")?;
+    let loaded = match rpc(Command::GetConfig).await? {
+        Reply::Config { extension, .. } => extension,
+        other => return Err(format!("unexpected daemon reply: {other:?}")),
+    };
+    let folder = if dir.trim().is_empty() {
+        managed
+    } else {
+        std::path::PathBuf::from(dir.trim())
+    };
+    Ok(BrowserExtensionInfo {
+        folder_version: ripdl_core::extplug::folder_version(&folder),
+        folder: folder.to_string_lossy().into_owned(),
+        bundled_version,
+        loaded,
+        browser: default_chromium_browser().map(|b| b.name.to_string()),
+    })
+}
+
+#[tauri::command]
+async fn open_browser_extensions(dir: String) -> Result<String, String> {
+    let _ = tauri::async_runtime::spawn_blocking(sync_managed_extension)
+        .await
+        .map_err(|e| e.to_string())??;
+    let browser = default_chromium_browser()
+        .ok_or("could not detect Chrome, Edge, or Brave as the default HTTPS browser")?;
+    let folder = if dir.trim().is_empty() {
+        managed_extension_dir()?
+    } else {
+        std::path::PathBuf::from(dir.trim())
+    };
+    let version = ripdl_core::extplug::folder_version(&folder)
+        .ok_or_else(|| format!("{} has no readable extension manifest", folder.display()))?;
+    open_with_default(browser.extensions_url).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Opened {}. Extension folder: {} (v{}).",
+        browser.name,
+        folder.display(),
+        version
+    ))
+}
+
+/// Settings line: the extension folder's manifest version beside this app's.
+#[derive(serde::Serialize)]
+struct ExtFolder {
+    /// `None` when the folder has no readable `manifest.json`.
+    version: Option<String>,
+    app: String,
+    /// `same`, `older` (the folder predates this app) or `newer`; `None` without a version.
+    skew: Option<&'static str>,
+}
+
+#[tauri::command]
+fn extension_folder(dir: String) -> ExtFolder {
+    let dir = dir.trim();
+    let version = if dir.is_empty() {
+        None
+    } else {
+        ripdl_core::extplug::folder_version(std::path::Path::new(dir))
+    };
+    let app = app_version();
+    let skew = version
+        .as_deref()
+        .map(|v| match ripdl_core::update::compare_versions(v, &app) {
+            std::cmp::Ordering::Equal => "same",
+            std::cmp::Ordering::Less => "older",
+            std::cmp::Ordering::Greater => "newer",
+        });
+    ExtFolder { version, app, skew }
+}
+
 /// Open a URL in the user's browser (update banner, Help menu).
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
@@ -304,6 +572,43 @@ async fn pick_file() -> Result<Option<String>, String> {
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Native file picker for the Settings "Install hoster plugin" flow.
+#[tauri::command]
+async fn pick_js_file() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Choose hoster plugin script")
+            .add_filter("Script plugins", &["js"])
+            .pick_file()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Copy a user script into the selected extension's `hosts/local/` folder.
+/// The app-managed copy is the default; `extension_dir` selects a manual copy.
+#[tauri::command]
+async fn install_plugin(path: String) -> Result<String, String> {
+    let managed = managed_extension_dir()?;
+    let override_dir = match rpc(Command::GetConfig).await? {
+        Reply::Config { settings, .. } => settings.extension_dir,
+        other => return Err(format!("unexpected daemon reply: {other:?}")),
+    };
+    let extension_dir = override_dir.unwrap_or_else(|| managed.clone());
+    if extension_dir == managed {
+        tauri::async_runtime::spawn_blocking(sync_managed_extension)
+            .await
+            .map_err(|e| e.to_string())??;
+    }
+    let content = std::fs::read(&path).map_err(|e| format!("{}: {e}", path))?;
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    ripdl_core::extplug::install(std::path::Path::new(&extension_dir), &name, &content)
 }
 
 /// Native file picker for a LAN send (any file).
@@ -433,13 +738,15 @@ struct RefreshOutcome {
 }
 
 /// Point a paused/failed download at a fresh URL (expired signed link) and
-/// resume it: the daemon keeps the bytes already downloaded.
+/// resume it: the daemon keeps the bytes already downloaded. `part` targets
+/// one part of a bundle (by its part number) instead of the whole task.
 #[tauri::command]
-async fn refresh_url(id: String, url: String) -> Result<RefreshOutcome, String> {
+async fn refresh_url(id: String, url: String, part: Option<u32>) -> Result<RefreshOutcome, String> {
     match rpc(Command::RefreshUrl {
         id,
         url,
         resume: true,
+        part,
     })
     .await?
     {
@@ -708,13 +1015,18 @@ fn main() {
             add_task,
             torrent_preview,
             add_video_task,
+            add_bundle,
+            add_bundle_parts,
+            preview_bundle,
             pause_task,
             resume_task,
             update_selection,
             remove_task,
             pick_dir,
             pick_file,
+            pick_js_file,
             pick_any_file,
+            install_plugin,
             lan_info,
             lan_peers,
             lan_send,
@@ -735,11 +1047,18 @@ fn main() {
             check_update,
             install_update,
             app_version,
+            extension_folder,
+            browser_extension_info,
+            open_browser_extensions,
             open_url,
             exit_app
         ])
         .setup(move |app| {
             use tauri::Manager;
+
+            if let Err(e) = sync_managed_extension() {
+                eprintln!("ripdl: cannot sync browser extension: {e}");
+            }
 
             // Serve "show" requests from later launches.
             if let Some(guard) = guard {

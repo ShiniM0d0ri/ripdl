@@ -60,6 +60,8 @@ Name: "{autodesktop}\ripdl"; Filename: "{app}\ripdl-gui.exe"; Tasks: desktopicon
 [InstallDelete]
 ; A new release may rename or drop files under ext/; recopying over the old
 ; tree would leave stale scripts behind. Wipe it, then recopy, every time.
+; The user's own scripts (ext\hosts\local\*.js) are copied aside in [Code]
+; before this runs and restored afterwards, so the wipe does not lose them.
 Type: filesandordirs; Name: "{app}\ext"
 
 [Run]
@@ -81,6 +83,11 @@ Filename: "{app}\ripdl-gui.exe"; Description: "Launch ripdl"; Flags: postinstall
 ; foreign keys stay untouched; nothing else runs on uninstall.
 
 [Code]
+// Number of user scripts copied aside before the upgrade (BackupUserPlugins).
+// Zero means there is nothing to put back.
+var
+  PluginsBackedUp: Integer;
+
 // taskkill one image name; a no-op when it is not running.
 procedure KillOne(const Image: String);
 var
@@ -152,10 +159,85 @@ begin
   end;
 end;
 
+// The user's scripts live in {app}\ext\hosts\local, which the upgrade's
+// [InstallDelete] wipes, and the shipped registry.js lists only the defaults.
+// Copy the scripts aside before anything is deleted (PrepareToInstall runs
+// before any file operation), put them back once the new files are in place,
+// and let the installed ripdl regenerate registry.js from the folder. The
+// backup lives in Setup's {tmp} folder, which Setup removes on exit.
+function PluginBackupDir(): String;
+begin
+  Result := ExpandConstant('{tmp}\hosts-local');
+end;
+
+function PluginLocalDir(): String;
+begin
+  Result := ExpandConstant('{app}\ext\hosts\local');
+end;
+
+procedure BackupUserPlugins;
+var
+  FindRec: TFindRec;
+begin
+  PluginsBackedUp := 0;
+  if not FindFirst(PluginLocalDir() + '\*.js', FindRec) then
+    Exit;
+  ForceDirectories(PluginBackupDir());
+  try
+    repeat
+      { registry.js is generated; the new install ships its own. }
+      if CompareText(FindRec.Name, 'registry.js') <> 0 then
+      begin
+        if FileCopy(PluginLocalDir() + '\' + FindRec.Name, PluginBackupDir() + '\' + FindRec.Name, False) then
+          PluginsBackedUp := PluginsBackedUp + 1
+        else
+          Log('could not back up plugin ' + FindRec.Name);
+      end;
+    until not FindNext(FindRec);
+  finally
+    FindClose(FindRec);
+  end;
+end;
+
+procedure RestoreUserPlugins;
+var
+  FindRec: TFindRec;
+  ResultCode: Integer;
+begin
+  ForceDirectories(PluginLocalDir());
+  if FindFirst(PluginBackupDir() + '\*.js', FindRec) then
+  begin
+    try
+      repeat
+        if not FileCopy(PluginBackupDir() + '\' + FindRec.Name, PluginLocalDir() + '\' + FindRec.Name, False) then
+          Log('could not restore plugin ' + FindRec.Name);
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  // The freshly installed CLI relists everything now in the folder. A failure
+  // here leaves the extension working with the default scripts only.
+  if not Exec(ExpandConstant('{app}\ripdl.exe'),
+              'plugin sync --ext-dir "' + ExpandConstant('{app}\ext') + '"',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Log('could not run ripdl plugin sync')
+  else if ResultCode <> 0 then
+    Log('ripdl plugin sync exited with ' + IntToStr(ResultCode));
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   // Runs right before files are copied: stop the daemon/GUI so an in-place
   // upgrade never trips over a locked exe.
   KillRipdlProcesses;
+  // Save the user's scripts before [InstallDelete] wipes ext\.
+  BackupUserPlugins;
   Result := ''; // no error = keep going
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if (CurStep = ssPostInstall) and (PluginsBackedUp > 0) then
+    RestoreUserPlugins;
 end;

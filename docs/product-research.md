@@ -85,7 +85,7 @@ post-download hooks, history, queue priorities, bandwidth scheduling.
    differentiator; nobody else combines this with a fast native engine and no
    ads/telemetry.
 2. **Hoster resolution + session reuse + browser handoff** (P6, planned) —
-   makes the FitGirl-style flow usable without bot farms.
+  supports multi-part file-host workflows through normal browser handoff.
 3. **Categories + per-category folder/queue/speed policy** (small, expected;
    also gives the scheduler a queue dimension).
 4. **Proxy + per-host concurrency + priority ordering** (IDM/Gopeed parity;
@@ -154,6 +154,6 @@ post-download hooks, history, queue priorities, bandwidth scheduling.
 - IDM Grabber documentation (recursive site crawl with page/file filters,
   project templates, saved projects, scheduling).
 - Community reports: JD2 adware-installer complaints; Malwarebytes (2026-05)
-  on the JDownloader site being compromised to serve malware; r/FitGirlRepack
-  thread claiming "copy all links → paste into JD2/IDM downloads without
-  Cloudflare blocks" (unverified; treat as "usually works, may challenge").
+  on the JDownloader site being compromised to serve malware; an unverified
+  report describes handing a copied link list to JD2/IDM when a file host
+  presents a Cloudflare challenge (not a guaranteed workflow).

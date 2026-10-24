@@ -22,6 +22,7 @@ const CAT_LABEL = {
     unfinished: "Unfinished",
     completed: "Completed",
     torrents: "Torrents",
+    bundles: "Bundles",
     video: "Videos",
     music: "Music",
     images: "Images",
@@ -29,7 +30,7 @@ const CAT_LABEL = {
     archives: "Archives",
     programs: "Programs",
 };
-const CATALOG = ["all", "unfinished", "completed", "torrents", "video", "music", "images", "documents", "archives", "programs"];
+const CATALOG = ["all", "unfinished", "completed", "torrents", "bundles", "video", "music", "images", "documents", "archives", "programs"];
 
 let tasks = [];
 // The last category survives a restart; anything unknown falls back to "all".
@@ -123,7 +124,9 @@ function errorHint(e) {
 // token (GitHub release assets: .../12e29558-517b-...?rscd=...filename=X), so
 // the on-disk name recorded by the engine wins as soon as there is one.
 function rowName(t) {
-    if (t.kind === "torrent" && t.name) return t.name;
+    // Torrent and bundle rows carry the display name the user/daemon chose
+    // (a bundle's is its folder name).
+    if ((t.kind === "torrent" || t.kind === "bundle") && t.name) return t.name;
     if (t.dest_file) {
         const base = baseName(t.dest_file);
         if (base) return base;
@@ -138,6 +141,11 @@ function detailsTitle(t) {
     lines.push(`${k.label}: ${t.url || ""}`);
     if (t.dest_dir) lines.push("Location: " + t.dest_dir);
     if (t.info_hash) lines.push("Info-hash: " + t.info_hash);
+    if (t.kind === "bundle" && t.parts_total) {
+        let line = `Parts: ${t.parts_done || 0} of ${t.parts_total}`;
+        if (t.parts_missing && t.parts_missing.length) line += ` (missing ${t.parts_missing.join(", ")})`;
+        lines.push(line);
+    }
     if (t.kind === "torrent" && (t.uploaded > 0 || t.seeding)) {
         const ratio = t.downloaded > 0 ? (t.uploaded / t.downloaded).toFixed(2) : "0.00";
         lines.push(`Uploaded: ${humans(t.uploaded)} (ratio ${ratio}) \u00b7 ${t.peers || 0} peers`);
@@ -222,6 +230,13 @@ function sizeText(t) {
     return t.total ? `${humans(t.downloaded)} / ${humans(t.total)}` : humans(t.downloaded);
 }
 
+// Bundle rows carry how many parts are done next to the percent: one task,
+// many files, and "3/7 parts" is what makes the aggregate legible.
+function partsText(t) {
+    if (t.kind !== "bundle" || !t.parts_total) return "";
+    return `${t.parts_done || 0}/${t.parts_total} parts`;
+}
+
 function etaOf(t) {
     if (!t.total || !t.speed_bps || t.speed_bps <= 0) return null;
     const left = (t.total - t.downloaded) / t.speed_bps;
@@ -238,6 +253,7 @@ function ico(name, cls = "") {
 // One icon per sidebar category, reused for the row's file-type glyph.
 const CAT_ICON = {
     all: "inbox", unfinished: "clock", completed: "check", torrents: "tfile",
+    bundles: "layers",
     video: "film", music: "music", images: "image", documents: "doc",
     archives: "box", programs: "app", other: "file",
 };
@@ -246,6 +262,7 @@ const CAT_ICON = {
 // HTTP download at a glance (and hints that torrent rows have a details view).
 const KIND = {
     torrent: { icon: "tfile", cls: "green", label: "BitTorrent", hint: "double-click for files, peers and trackers" },
+    bundle: { icon: "layers", cls: "amber", label: "Bundle", hint: "multi-part download in one folder - double-click for the parts" },
     http: { icon: "download", cls: "blue", label: "HTTP", hint: "multi-segment download - double-click for segments" },
     video: { icon: "film", cls: "violet", label: "Video", hint: "stream page handled by yt-dlp - double-click for details" },
 };
@@ -258,7 +275,7 @@ function kindOf(t) {
 // without an extension are multi-file folders, so they get the box icon.
 function fileIcon(t) {
     let cat = categoryOf(rowName(t));
-    if (cat === "other" && t.kind === "torrent") cat = "archives";
+    if (cat === "other" && (t.kind === "torrent" || t.kind === "bundle")) cat = "archives";
     return ico(CAT_ICON[cat] || "file", "cat-" + cat);
 }
 
@@ -290,6 +307,7 @@ function inCurrentView(t) {
     if (currentCategory === "unfinished") return t.state !== "completed";
     if (currentCategory === "completed") return t.state === "completed";
     if (currentCategory === "torrents") return t.kind === "torrent";
+    if (currentCategory === "bundles") return t.kind === "bundle";
     return categoryOf(rowName(t)) === currentCategory;
 }
 
@@ -321,6 +339,7 @@ function refreshVolatile(t) {
     set(".size-cell", sizeText(t));
     set(".eta-cell", etaOf(t) || "-");
     set(".speed-cell", speedText(t));
+    set(".parts", partsText(t));
     const peers = peersText(t);
     if (peers != null) set(".peers-cell", peers);
     const pct = percentOf(t);
@@ -463,7 +482,7 @@ const STATE_RANK = {
     running: 0, hunt: 1, verifying: 2, connecting: 2, metadata: 3, queued: 4, timed: 5,
     seeding: 6, paused: 7, failed: 8, completed: 9, cancelled: 10,
 };
-const KIND_RANK = { torrent: 0, http: 1, video: 2 };
+const KIND_RANK = { torrent: 0, bundle: 1, http: 2, video: 3 };
 
 // Seconds left, for sorting only (the cell keeps its own formatting).
 function etaSeconds(t) {
@@ -713,11 +732,12 @@ function render() {
     // Category counts (also shown in the sidebar). Counts only change with
     // the task set / state label / name extension - all structural - so the
     // sidebar is repainted here and never by the volatile path.
-    const counts = { all: tasks.length, unfinished: 0, completed: 0, torrents: 0 };
+    const counts = { all: tasks.length, unfinished: 0, completed: 0, torrents: 0, bundles: 0 };
     for (const cat of ["video", "music", "images", "documents", "archives", "programs"]) counts[cat] = 0;
     for (const t of tasks) {
         if (t.state === "completed") counts.completed++; else counts.unfinished++;
         if (t.kind === "torrent") counts.torrents++;
+        if (t.kind === "bundle") counts.bundles++;
         const cat = categoryOf(rowName(t));
         if (cat in counts) counts[cat]++;
     }
@@ -731,9 +751,11 @@ function render() {
         const state = stateLabel(t);
         const pct = percentOf(t);
         const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "timed"].includes(state) ? "paused" : "");
+        const parts = partsText(t);
+        const partsSpan = parts ? `<span class="parts">${parts}</span>` : "";
         const prog = pct == null
-            ? `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:0%"></div></div>`
-            : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${pctText(pct, state)}%</span>`;
+            ? `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:0%"></div></div>${partsSpan}`
+            : `<div class="prog-track"><div class="prog-fill ${barClass}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div><span class="pct">${pctText(pct, state)}%</span>${partsSpan}`;
         const size = sizeText(t);
         const eta = etaOf(t) || "-";
         const speed = speedText(t);
@@ -847,7 +869,7 @@ function actionButtons(t) {
         ${ico(intent === "pause" ? "pause" : "play")}
       </button>` : "";
     const openFile = t.state === "completed" ? `
-      <button class="row-btn" ${idAttr} data-act="openFile" title="Open file">${ico("file")}</button>` : "";
+      <button class="row-btn" ${idAttr} data-act="openFile" title="${t.kind === "bundle" ? "Open bundle folder" : "Open file"}">${ico("file")}</button>` : "";
     const open = `
       <button class="row-btn" ${idAttr} data-act="openFolder" title="Open download folder">${ico("folder")}</button>`;
     const rm = `
@@ -884,13 +906,15 @@ function showCtx(x, y) {
     for (const act of ["details", "refresh", "openFile", "openFolder", "copyAddress"]) {
         $("#ctx [data-act=" + act + "]").classList.toggle("hidden", many || !t);
     }
-    $("#ctx-details-lbl").textContent = t && t.kind === "torrent" ? "Torrent details…" : "Details…";
+    $("#ctx-details-lbl").textContent = t && t.kind === "torrent" ? "Torrent details…"
+        : t && t.kind === "bundle" ? "Bundle details…" : "Details…";
     $("#ctx [data-act=refresh]").classList.toggle(
         "hidden",
         many || !t || t.kind !== "http" || t.state === "completed"
     );
     // Nothing on disk to open until the task produced a file.
     $("#ctx [data-act=openFile]").classList.toggle("hidden", many || !t || !t.dest_file);
+    $("#ctx-open-lbl").textContent = t && t.kind === "bundle" ? "Open bundle folder" : "Open file";
     $("#ctx [data-act=copyAddress]").classList.toggle("hidden", many || !t || !t.url);
     $("#ctx-remove-lbl").textContent = many ? `Remove ${group.length} from list` : "Remove from list";
     $("#ctx-delete-lbl").textContent = many ? `Remove ${group.length} & delete files` : "Remove & delete files";
@@ -1201,6 +1225,7 @@ const MENUS = {
     file: () => [
         { label: "Add URL", hint: "Ctrl+N", act: () => openAddDialog() },
         { label: "Add .torrent File", hint: "Ctrl+T", act: () => pickTorrent() },
+        { label: "Add Multi-part Links", hint: "Ctrl+B", act: () => openBundleDialog() },
         null,
         { label: "Send / Receive on Network", act: () => openLan() },
         null,
@@ -1269,6 +1294,7 @@ $("#menudrop").onclick = (ev) => ev.stopPropagation();
 
 $("#btn-add").onclick = () => openAddDialog();
 $("#btn-add-torrent").onclick = pickTorrent;
+$("#btn-add-bundle").onclick = () => openBundleDialog();
 $("#btn-resume-all").onclick = resumeAll;
 $("#btn-stop-all").onclick = stopAll;
 $("#btn-clear-done").onclick = clearDone;
@@ -1433,8 +1459,140 @@ $("#dlg-backdrop").onclick = (ev) => {
     }
 };
 
+/* Multi-part (bundle) dialog: paste direct links, get one task per group.
+ * Grouping is the daemon's (`PreviewBundle` -> pure `ripdl_core::bundle`), so
+ * the dialog only shows what the links would become and never guesses. */
+let bundleDestTouched = false;
+let bundlePreviewTimer = null;
+
+function openBundleDialog(presetUrls) {
+    $("#bdlg-urls").value = presetUrls || "";
+    $("#bdlg-name").value = "";
+    $("#bdlg-dest").value = "";
+    bundleDestTouched = false;
+    $("#bdlg-err").classList.add("hidden");
+    $("#bdlg-err").textContent = "";
+    $("#bdlg-preview").textContent = "";
+    $("#bdlg-backdrop").classList.remove("hidden");
+    $("#bdlg-urls").focus();
+    scheduleBundlePreview();
+}
+
+function closeBundleDialog() {
+    clearTimeout(bundlePreviewTimer);
+    $("#bdlg-backdrop").classList.add("hidden");
+}
+
+function bundleLines() {
+    return $("#bdlg-urls").value
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
+// One wording for the group count, mirroring `Group::parts_summary`.
+function groupSummary(g) {
+    const n = g.parts.length;
+    const count = n === 1 ? "1 part"
+        : g.total ? `${n} of ${g.total} parts`
+        : `${n} parts from ${g.first}`;
+    return `${g.name} \u2014 ${count}`;
+}
+
+function scheduleBundlePreview() {
+    clearTimeout(bundlePreviewTimer);
+    bundlePreviewTimer = setTimeout(refreshBundlePreview, 250);
+}
+
+async function refreshBundlePreview() {
+    const urls = bundleLines();
+    const el = $("#bdlg-preview");
+    if (!urls.length) { el.textContent = ""; return; }
+    try {
+        const groups = await invokeSafe("preview_bundle", { urls });
+        el.textContent = groups.length
+            ? `Will queue: ${groups.map(groupSummary).join(" \u00b7 ")}`
+            : "No usable http(s) links.";
+    } catch (e) {
+        el.textContent = "";
+    }
+}
+
+function bundleError(msg) {
+    const el = $("#bdlg-err");
+    el.textContent = msg;
+    el.classList.remove("hidden");
+}
+
+async function submitBundle() {
+    const urls = bundleLines();
+    if (!urls.length) { bundleError("Paste at least one link first."); return; }
+    const btn = $("#bdlg-ok");
+    btn.disabled = true;
+    try {
+        const groups = await invokeSafe("preview_bundle", { urls });
+        if (!groups.length) throw new Error("no usable http(s) links");
+        const dest = $("#bdlg-dest").value.trim();
+        const name = $("#bdlg-name").value.trim();
+        let bundles = 0;
+        let singles = 0;
+        for (const g of groups) {
+            // A group of one is an ordinary download (same rule as the
+            // extension offer): a folder around a single file helps nobody.
+            if (g.parts.length === 1 && !name) {
+                await invokeSafe("add_task", {
+                    url: g.parts[0].url,
+                    category: "auto",
+                    destDir: dest || null,
+                    sequential: false,
+                    onlyFiles: null,
+                });
+                singles++;
+            } else {
+                await invokeSafe("add_bundle", {
+                    urls: g.parts.map((p) => p.url),
+                    name: name || g.name,
+                    destDir: dest || null,
+                });
+                bundles++;
+            }
+        }
+        closeBundleDialog();
+        const bits = [];
+        if (bundles) bits.push(`${bundles} bundle${bundles === 1 ? "" : "s"}`);
+        if (singles) bits.push(`${singles} download${singles === 1 ? "" : "s"}`);
+        flashStatus(`queued ${bits.join(" + ")}`);
+        await poll();
+    } catch (e) {
+        bundleError(String(e).replace(/^.*error: /, ""));
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+$("#bdlg-urls").oninput = scheduleBundlePreview;
+$("#bdlg-dest").oninput = () => { bundleDestTouched = true; };
+$("#bdlg-browse").onclick = async () => {
+    try {
+        const picked = await invokeSafe("pick_dir");
+        if (picked) {
+            $("#bdlg-dest").value = picked;
+            bundleDestTouched = true;
+        }
+    } catch (e) {
+        flashErr(String(e));
+    }
+};
+$("#bdlg-cancel").onclick = closeBundleDialog;
+$("#bdlg-ok").onclick = submitBundle;
+$("#bdlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeBundleDialog(); };
+$("#bdlg-urls").onkeydown = (ev) => {
+    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); submitBundle(); }
+};
+
 /* Settings dialog (daemon-wide config) */
-const SET_INPUTS = ["#set-conc", "#set-segs", "#set-minseg", "#set-speed", "#set-dir", "#set-ytdlp"];
+const SET_INPUTS = ["#set-conc", "#set-segs", "#set-minseg", "#set-speed", "#set-dir", "#set-ytdlp", "#set-ext"];
+let extensionStatusTimer = null;
 
 function flashStatus(msg, color) {
     const st = ST_COUNTS;
@@ -1466,6 +1624,12 @@ function bytesForEdit(v) {
     return v == null ? "" : humans(v);
 }
 
+function setPathField(selector, value) {
+    const input = $(selector);
+    input.value = value ?? "";
+    input.title = input.value;
+}
+
 async function openSettings() {
     const err = $("#set-err");    err.classList.add("hidden");
     SET_INPUTS.forEach((sel) => { $(sel).value = ""; });
@@ -1482,8 +1646,9 @@ async function openSettings() {
         $("#set-segs").value = s.max_segments ?? "";
         $("#set-minseg").value = bytesForEdit(s.min_segment_size);
         $("#set-speed").value = bytesForEdit(s.max_speed_bytes);
-        $("#set-dir").value = s.default_download_dir ?? "";
-        $("#set-ytdlp").value = s.ytdlp_path ?? "";
+        setPathField("#set-dir", s.default_download_dir);
+        setPathField("#set-ytdlp", s.ytdlp_path);
+        setPathField("#set-ext", s.extension_dir);
         $("#set-tray").checked = s.hide_to_tray ?? true;
         $("#set-bond").checked = s.bond_interfaces ?? false;
         bondAtOpen = s.bond_interfaces ?? false;
@@ -1494,6 +1659,13 @@ async function openSettings() {
         $("#set-ratio").value = s.seed_ratio ?? "1";
         $("#set-seedtime").value = s.seed_time_min ?? "0";
         renderBondNics();
+        renderExtInfo();
+        renderBrowserExtension();
+        if (extensionStatusTimer === null) {
+            extensionStatusTimer = setInterval(() => {
+                if (!$("#set-backdrop").classList.contains("hidden")) renderBrowserExtension();
+            }, 15000);
+        }
         $("#set-backdrop").classList.remove("hidden");
         $("#set-conc").focus();
     } catch (e) {
@@ -1504,6 +1676,10 @@ async function openSettings() {
 
 function closeSettings() {
     $("#set-backdrop").classList.add("hidden");
+    if (extensionStatusTimer !== null) {
+        clearInterval(extensionStatusTimer);
+        extensionStatusTimer = null;
+    }
 }
 
 // Bonding value when the dialog opened: changing it only affects the
@@ -1548,6 +1724,92 @@ async function renderBondNics() {
     }
 }
 
+// The Extension folder's manifest version against this app. Only the folder
+// is checked here; the browser's own loaded copy is shown on the popup and
+// Plugins pages, which is where a pending Reload is visible.
+async function renderExtInfo() {
+    const el = $("#set-ext-info");
+    const dir = $("#set-ext").value.trim();
+    if (!dir) {
+        el.textContent = "Using the app-managed extension folder.";
+        el.className = "set-hint ok";
+        return;
+    }
+    try {
+        const info = await invokeSafe("extension_folder", { dir });
+        if ($("#set-ext").value.trim() !== dir) return; // typed on while we asked
+        if (info.skew === "same") {
+            el.textContent = `Extension folder is ${info.version} - matches this app.`;
+            el.className = "set-hint ok";
+        } else if (info.skew === "older") {
+            el.textContent = `Extension folder is ${info.version}, this app is ${info.app} - the folder predates this app.`;
+            el.className = "set-hint warn";
+        } else if (info.skew === "newer") {
+            el.textContent = `Extension folder is ${info.version}, this app is ${info.app} - this app is older than the folder; update ripdl.`;
+            el.className = "set-hint warn";
+        } else {
+            el.textContent = "No manifest.json in this folder - point it at the unpacked extension.";
+            el.className = "set-hint warn";
+        }
+    } catch (e) {
+        el.textContent = "";
+    }
+}
+
+function compareExtensionVersions(a, b) {
+    const left = String(a).split("-")[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+    const right = String(b).split("-")[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(left.length, right.length); i++) {
+        const delta = (left[i] || 0) - (right[i] || 0);
+        if (delta) return Math.sign(delta);
+    }
+    return 0;
+}
+
+function ageText(unixSeconds) {
+    const minutes = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds) / 60);
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${Math.floor(minutes)} min ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return `${hours} hr ago`;
+    return `${Math.floor(hours / 24)} days ago`;
+}
+
+async function renderBrowserExtension() {
+    const el = $("#set-browser-info");
+    const dir = $("#set-ext").value.trim();
+    try {
+        const info = await invokeSafe("browser_extension_info", { dir });
+        if ($("#set-ext").value.trim() !== dir) return;
+        const loaded = info.loaded;
+        const browser = info.browser || "a Chromium browser";
+        if (!info.folder_version) {
+            el.textContent = `No manifest.json at ${info.folder}. The bundled app copy is v${info.bundled_version}.`;
+            el.className = "set-hint warn";
+            return;
+        }
+        if (!loaded.last_seen) {
+            el.textContent = `Never seen by the daemon. Load unpacked in ${browser} from ${info.folder} (v${info.folder_version}).`;
+            el.className = "set-hint warn";
+            return;
+        }
+        const seen = `Browser reported extension v${loaded.version} ${ageText(loaded.last_seen)}; folder v${info.folder_version}.`;
+        if (compareExtensionVersions(loaded.version, info.folder_version) < 0) {
+            el.textContent = `${seen} Reload the extension in the browser.`;
+            el.className = "set-hint warn";
+        } else if (compareExtensionVersions(loaded.version, info.folder_version) > 0) {
+            el.textContent = `${seen} The loaded extension is newer than the selected folder.`;
+            el.className = "set-hint warn";
+        } else {
+            el.textContent = `${seen} The loaded extension matches the folder.`;
+            el.className = "set-hint ok";
+        }
+    } catch (e) {
+        el.textContent = String(e).replace(/^.*error: /, "");
+        el.className = "set-hint warn";
+    }
+}
+
 async function saveSettings() {
     const err = $("#set-err");
     err.classList.add("hidden");
@@ -1580,6 +1842,7 @@ async function saveSettings() {
         max_speed_bytes: speed,
         default_download_dir: dir === "" ? undefined : dir,
         ytdlp_path: $("#set-ytdlp").value.trim() || undefined,
+        extension_dir: $("#set-ext").value.trim() || undefined,
         hide_to_tray: $("#set-tray").checked,
         bond_interfaces: $("#set-bond").checked,
         update_check: $("#set-update").checked,
@@ -1616,8 +1879,40 @@ $("#set-dir-browse").onclick = async () => {
     try {
         const picked = await invokeSafe("pick_dir");
         if (picked) $("#set-dir").value = picked;
+        if (picked) $("#set-dir").title = picked;
     } catch (e) {
         flashErr(String(e));
+    }
+};
+$("#set-ext-browse").onclick = async () => {
+    try {
+        const picked = await invokeSafe("pick_dir");
+        if (picked) {
+            $("#set-ext").value = picked;
+            $("#set-ext").title = picked;
+            renderExtInfo();
+            renderBrowserExtension();
+        }
+    } catch (e) {
+        flashErr(String(e));
+    }
+};
+$("#set-ext-open").onclick = async () => {
+    try {
+        flashStatus(await invokeSafe("open_browser_extensions", { dir: $("#set-ext").value.trim() }));
+        renderBrowserExtension();
+    } catch (e) {
+        flashErr(String(e).replace(/^.*error: /, ""));
+    }
+};
+$("#set-plugbtn").onclick = async () => {
+    try {
+        const picked = await invokeSafe("pick_js_file");
+        if (!picked) return;
+        const msg = await invokeSafe("install_plugin", { path: picked });
+        flashStatus(`${msg} - now: chrome://extensions -> Reload, enable it on the Plugins page`);
+    } catch (e) {
+        flashErr(String(e).replace(/^.*error: /, ""));
     }
 };
 $("#set-restart").onclick = async () => {
@@ -1634,11 +1929,19 @@ $("#set-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) close
 $("#set-backdrop").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 $("#set-ytdlp").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 $("#set-dir").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
+$("#set-ytdlp").oninput = () => { $("#set-ytdlp").title = $("#set-ytdlp").value; };
+$("#set-dir").oninput = () => { $("#set-dir").title = $("#set-dir").value; };
+$("#set-ext").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
+$("#set-ext").oninput = () => {
+    $("#set-ext").title = $("#set-ext").value;
+    renderExtInfo();
+    renderBrowserExtension();
+};
 
 // True while any dialog is open: global accelerators shouldn't fire into
 // them (Ctrl+N while typing in the Add dialog would wipe the typed URL).
 function dialogOpen() {
-    return ["#dlg-backdrop", "#set-backdrop", "#tdg-backdrop", "#hdt-backdrop", "#rdlg-backdrop", "#abt-backdrop", "#lan-backdrop"]
+    return ["#dlg-backdrop", "#bdlg-backdrop", "#set-backdrop", "#tdg-backdrop", "#hdt-backdrop", "#rdlg-backdrop", "#abt-backdrop", "#lan-backdrop", "#apdlg-backdrop"]
         .some((s) => !$(s).classList.contains("hidden"));
 }
 
@@ -1885,6 +2188,7 @@ document.addEventListener("keydown", (ev) => {
         $("#ctx").classList.add("hidden");
         $("#dlg-backdrop").classList.add("hidden");
         torrentPick = null;
+        closeBundleDialog();
         closeDetails();
         closeHttpDetails();
         closeRefreshDialog();
@@ -1901,6 +2205,10 @@ document.addEventListener("keydown", (ev) => {
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "t") {
         ev.preventDefault();
         pickTorrent();
+    }
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "b") {
+        ev.preventDefault();
+        openBundleDialog();
     }
     // Task-list keyboard: move the selection, inspect, remove. Only when no
     // text field has focus, so typing in the toolbar/filter still works.
@@ -2216,6 +2524,9 @@ $("#tdg-apply").onclick = async () => {
 let httpDetailsId = null;
 let httpDetailsTimer = null;
 let httpDetailsBusy = false;
+// Last task_details snapshot, so per-part actions (refresh) can prefill the
+// part's current address without a second round-trip.
+let httpDetailsData = null;
 // JS cannot represent u64::MAX exactly; no real byte-range end comes close.
 const UNBOUNDED_END = Number.MAX_SAFE_INTEGER;
 
@@ -2224,6 +2535,7 @@ async function openHttpDetails(id) {
     if (!t) return;
     closeDetails(); // the torrent dialog and this one never stack
     httpDetailsId = id;
+    partsRenderKey = "";
     $("#hdt-name").textContent = rowName(t);
     $("#hdt-body").innerHTML = "";
     $("#hdt-summary").textContent = "";
@@ -2239,6 +2551,7 @@ async function openHttpDetails(id) {
 
 function closeHttpDetails() {
     httpDetailsId = null;
+    httpDetailsData = null;
     clearInterval(httpDetailsTimer);
     $("#hdt-backdrop").classList.add("hidden");
 }
@@ -2248,6 +2561,7 @@ async function refreshHttpDetails() {
     httpDetailsBusy = true;
     try {
         const d = await invokeSafe("task_details", { id: httpDetailsId });
+        httpDetailsData = d;
         renderHttpDetails(d);
     } catch (e) {
         $("#hdt-body").innerHTML = `<div class="trk-off">${escapeHtml(String(e).replace(/^.*error: /, ""))}</div>`;
@@ -2263,7 +2577,7 @@ function renderHttpDetails(d) {
     const t = findTask(d.id);
     $("#hdt-name").textContent = t ? rowName(t) : urlName(d.url);
     const pct = d.percent != null ? d.percent : (d.total ? (d.downloaded / d.total) * 100 : null);
-    const kind = d.kind === "video" ? "yt-dlp stream" : "HTTP ranges";
+    const kind = d.kind === "video" ? "yt-dlp stream" : d.kind === "bundle" ? "multi-part bundle" : "HTTP ranges";
     $("#hdt-summary").textContent =
         `${kind} \u00b7 ${t ? stateLabel(t) : d.state}` +
         `\n${humans(d.downloaded)}${d.total ? " / " + humans(d.total) : ""}` +
@@ -2285,11 +2599,21 @@ function renderHttpDetails(d) {
     }
     let html = `<table>${meta.join("")}</table>`;
 
+    // Bundle parts: the row is an aggregate, this is the itemized view, with
+    // the part numbers the selection's own numbering proved (gaps included).
+    // The table lives in its own container and re-renders only when a part's
+    // structure changes; volatile cells (bar, percent, bytes) are patched in
+    // place, so the per-part Refresh buttons never race the 1 s rebuild the
+    // way a full innerHTML swap would (same trap as the Files-tab checkboxes).
+    const parts = d.parts || [];
+    html += `<div id="hdt-parts"></div>`;
+
     const segs = d.segments || [];
+    let segHtml = "";
     if (segs.length) {
         const finished = segs.filter((s) => s.end > UNBOUNDED_END || s.done >= s.end - s.start + 1).length;
-        html += `<div class="hdt-segs-title">${segs.length} segment${segs.length === 1 ? "" : "s"} \u00b7 ${finished} finished</div>`;
-        html += `<table><tr><th>#</th><th>Byte range</th><th>Progress</th><th class="r">Durable</th></tr>`;
+        segHtml += `<div class="hdt-segs-title">${segs.length} segment${segs.length === 1 ? "" : "s"} \u00b7 ${finished} finished</div>`;
+        segHtml += `<table><tr><th>#</th><th>Byte range</th><th>Progress</th><th class="r">Durable</th></tr>`;
         for (const s of segs) {
             const open = s.end > UNBOUNDED_END;
             const span = open ? 0 : s.end - s.start + 1;
@@ -2299,30 +2623,98 @@ function renderHttpDetails(d) {
                 ? `<span class="trk-off">single stream</span>`
                 : `<div class="hdt-bar"><i class="${p >= 100 ? "full" : ""}" style="width:${p.toFixed(1)}%"></i></div>` +
                   `<span class="hdt-pct">${p.toFixed(0)}%</span>`;
-            html += `<tr>
+            segHtml += `<tr>
               <td>${s.index}</td>
               <td class="hdt-range">${range}</td>
               <td>${bar}</td>
               <td class="r">${humans(s.done)}${open || !span ? "" : " / " + humans(span)}</td>
             </tr>`;
         }
-        html += `</table>`;
+        segHtml += `</table>`;
     } else if (d.kind === "http") {
-        html += d.state === "completed"
+        segHtml += d.state === "completed"
             ? `<div class="trk-off">Finished - the resume sidecar is removed once a download completes.</div>`
             : `<div class="trk-off">No byte-range plan yet - the engine writes it once the download starts.</div>`;
     }
+    html += `<div id="hdt-segs">${segHtml}</div>`;
     $("#hdt-body").innerHTML = html;
+    renderPartsTable(parts, d.id);
 
     $("#hdt-refresh").classList.toggle("hidden", d.kind !== "http" || d.state === "completed");
+    $("#hdt-addparts").classList.toggle("hidden", d.kind !== "bundle");
+    // A bundle's dest_file is its folder, so "Open file" gives way to
+    // "Open folder" (which reveals the folder itself).
+    $("#hdt-open").classList.toggle("hidden", d.kind === "bundle");
     // A partial file is not worth launching; reveal it in Explorer instead.
     $("#hdt-open").disabled = d.state !== "completed" || !d.dest_file;
     $("#hdt-folder").disabled = !(d.dest_file || (t && t.dest_dir));
 }
 
+// The itemized bundle-parts view: full render on structure change (part set,
+// states, errors), byte-level patching otherwise. `head` rides in the key so
+// the "missing parts" line tracks the daemon's numbering without a repaint.
+let partsRenderKey = "";
+
+function renderPartsTable(parts, id) {
+    const host = $("#hdt-parts");
+    if (!host) return;
+    if (!parts.length) { partsRenderKey = ""; host.innerHTML = ""; return; }
+    const done = parts.filter((p) => p.state === "completed").length;
+    const t0 = findTask(id);
+    // The daemon's numbering is the authority on the total (a selection
+    // starting at part 5 proves no denominator, so it stays 0 = unknown).
+    const total = t0 && t0.parts_total ? t0.parts_total : parts.length;
+    let head = `${done} of ${total} part${total === 1 ? "" : "s"}`;
+    if (t0 && t0.parts_missing && t0.parts_missing.length) {
+        head += ` \u00b7 missing ${t0.parts_missing.join(", ")}`;
+    }
+    const key = head + "|" + parts.map((p) => `${p.seq}:${p.state}:${p.error ? 1 : 0}:${p.filename || ""}`).join(",");
+    if (key !== partsRenderKey || !host.querySelector("table")) {
+        partsRenderKey = key;
+        let html = `<div class="hdt-segs-title">${head}</div>`;
+        html += `<table><tr><th class="r">#</th><th>Part</th><th>Progress</th><th class="r">Bytes</th><th></th></tr>`;
+        for (const p of parts) {
+            // Finished parts own their bytes; every other part can swap its
+            // address for a fresh link without losing what is on disk.
+            const refresh = p.state !== "completed" && p.seq != null
+                ? `<button class="hdt-part-refresh" data-seq="${p.seq}" title="Refresh this part's address (expired link, same file)"><svg class="ico"><use href="#i-globe"/></svg></button>`
+                : "";
+            const err = p.error ? `<div class="trk-off">${escapeHtml(p.error)}</div>` : "";
+            html += `<tr data-seq="${p.seq != null ? p.seq : ""}">
+              <td class="r">${p.seq != null ? p.seq : ""}</td>
+              <td class="hdt-range" title="${escapeHtml(p.url || "")}">${escapeHtml(p.filename || urlName(p.url))}${err}</td>
+              <td class="hdt-part-prog"></td>
+              <td class="r hdt-part-bytes"></td>
+              <td class="hdt-part-act">${refresh}</td>
+            </tr>`;
+        }
+        html += `</table>`;
+        host.innerHTML = html;
+    }
+    for (const p of parts) {
+        const row = host.querySelector(`tr[data-seq="${p.seq}"]`);
+        if (!row) continue;
+        const partPct = p.total ? Math.min(100, (p.downloaded / p.total) * 100) : null;
+        const bar = partPct == null
+            ? `<span class="trk-off">${escapeHtml(p.state || "queued")}</span>`
+            : `<div class="hdt-bar"><i class="${partPct >= 100 ? "full" : ""}" style="width:${partPct.toFixed(1)}%"></i></div>` +
+              `<span class="hdt-pct">${partPct.toFixed(0)}%</span>`;
+        row.querySelector(".hdt-part-prog").innerHTML = bar;
+        row.querySelector(".hdt-part-bytes").textContent =
+            `${humans(p.downloaded)}${p.total ? " / " + humans(p.total) : ""}`;
+    }
+}
+
 $("#hdt-close").onclick = closeHttpDetails;
 $("#hdt-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeHttpDetails(); };
 $("#hdt-refresh").onclick = () => { if (httpDetailsId) openRefreshDialog(httpDetailsId); };
+$("#hdt-addparts").onclick = () => { if (httpDetailsId) openAddPartsDialog(); };
+// Per-part refresh buttons live inside a table that is patched in place, so
+// the listener is delegated and survives re-renders.
+$("#hdt-body").addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".hdt-part-refresh");
+    if (btn && httpDetailsId) openRefreshDialog(httpDetailsId, Number(btn.dataset.seq));
+});
 $("#hdt-copy").onclick = async () => {
     try {
         const d = await invokeSafe("task_details", { id: httpDetailsId });
@@ -2356,18 +2748,28 @@ $("#hdt-folder").onclick = async () => {
     }
 };
 
-/* Refresh download address (expired signed links, same file) */
+/* Refresh download address (expired signed links, same file).
+ * For bundles the dialog targets ONE part: the bundle pauses for the swap
+ * and resumes, finished parts stay finished. */
 let refreshTargetId = null;
+let refreshPartSeq = null;
 
-function openRefreshDialog(id) {
+function openRefreshDialog(id, seq = null) {
     const t = findTask(id);
     if (!t) return;
-    if (t.kind !== "http") { flashErr("Only HTTP downloads can refresh their address."); return; }
-    if (t.state === "completed") { flashErr("This download already finished."); return; }
+    if (seq == null) {
+        if (t.kind !== "http") { flashErr("Only HTTP downloads can refresh their address."); return; }
+        if (t.state === "completed") { flashErr("This download already finished."); return; }
+    }
     refreshTargetId = id;
-    $("#rdlg-url").value = t.url || "";
+    refreshPartSeq = seq;
+    $("#rdlg-title").textContent = seq != null ? `Refresh part ${seq}` : "Refresh download address";
+    const prefill = seq != null ? partUrl(id, seq) : null;
+    $("#rdlg-url").value = prefill != null ? prefill : (t.url || "");
     $("#rdlg-hint").textContent =
-        "Paste a fresh link for the same file (signed URLs expire). ripdl keeps the bytes already on disk and continues from there; the new link must serve the same file name and size and support byte ranges." +
+        (seq != null
+            ? "Paste a fresh link for this part's file. The bundle pauses for the swap and resumes; parts that already finished stay finished."
+            : "Paste a fresh link for the same file (signed URLs expire). ripdl keeps the bytes already on disk and continues from there; the new link must serve the same file name and size and support byte ranges.") +
         (["running", "queued"].includes(t.state) ? " The download is paused first." : "");
     $("#rdlg-err").classList.add("hidden");
     $("#rdlg-err").textContent = "";
@@ -2377,8 +2779,18 @@ function openRefreshDialog(id) {
     field.setSelectionRange(field.value.length, field.value.length);
 }
 
+// The part's current address, from the details the dialog is showing.
+function partUrl(id, seq) {
+    if (httpDetailsId === id && httpDetailsData) {
+        const p = (httpDetailsData.parts || []).find((p) => p.seq === seq);
+        if (p && p.url) return p.url;
+    }
+    return null;
+}
+
 function closeRefreshDialog() {
     refreshTargetId = null;
+    refreshPartSeq = null;
     $("#rdlg-backdrop").classList.add("hidden");
 }
 
@@ -2396,12 +2808,17 @@ async function submitRefresh() {
     const btn = $("#rdlg-ok");
     btn.disabled = true;
     try {
-        const out = await invokeSafe("refresh_url", { id, url });
+        const args = { id, url };
+        if (refreshPartSeq != null) args.part = refreshPartSeq;
+        const out = await invokeSafe("refresh_url", args);
         const kept = out && out.kept != null
             ? ` (kept ${humans(out.kept)}${out.total ? " of " + humans(out.total) : ""})`
             : "";
+        const seq = refreshPartSeq;
         closeRefreshDialog();
-        flashStatus(`address refreshed${kept} - resuming`);
+        flashStatus(seq != null
+            ? `part ${seq} address refreshed${kept} - resuming`
+            : `address refreshed${kept} - resuming`);
         await poll();
         if (httpDetailsId === id) await refreshHttpDetails();
     } catch (e) {
@@ -2417,6 +2834,53 @@ $("#rdlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) clos
 $("#rdlg-url").onkeydown = (ev) => {
     // A URL has no newlines: Enter submits, Shift+Enter still breaks the line.
     if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); submitRefresh(); }
+};
+
+/* Add missing parts to an open bundle ("I forgot part 7"). */
+function openAddPartsDialog() {
+    if (!httpDetailsId) return;
+    $("#apdlg-urls").value = "";
+    $("#apdlg-err").classList.add("hidden");
+    $("#apdlg-err").textContent = "";
+    $("#apdlg-backdrop").classList.remove("hidden");
+    $("#apdlg-urls").focus();
+}
+
+function closeAddPartsDialog() {
+    $("#apdlg-backdrop").classList.add("hidden");
+}
+
+function addPartsError(msg) {
+    const el = $("#apdlg-err");
+    el.textContent = msg;
+    el.classList.remove("hidden");
+}
+
+async function submitAddParts() {
+    if (!httpDetailsId) return;
+    const id = httpDetailsId;
+    const urls = $("#apdlg-urls").value.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (!urls.length) { addPartsError("Paste the missing part links first."); return; }
+    const btn = $("#apdlg-ok");
+    btn.disabled = true;
+    try {
+        const added = await invokeSafe("add_bundle_parts", { id, urls });
+        closeAddPartsDialog();
+        flashStatus(added > 0 ? `added ${added} part${added === 1 ? "" : "s"} - bundle restarting` : "nothing to add: the bundle already carries those links");
+        await poll();
+        if (httpDetailsId === id) await refreshHttpDetails();
+    } catch (e) {
+        addPartsError(String(e).replace(/^.*error: /, ""));
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+$("#apdlg-cancel").onclick = closeAddPartsDialog;
+$("#apdlg-ok").onclick = submitAddParts;
+$("#apdlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeAddPartsDialog(); };
+$("#apdlg-urls").onkeydown = (ev) => {
+    if (ev.key === "Enter" && ev.ctrlKey) { ev.preventDefault(); submitAddParts(); }
 };
 
 setConn(false);

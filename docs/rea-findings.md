@@ -289,7 +289,7 @@ magic bytes validate/disambiguate):
   (single `-p` only), CRC pre-check (`7z t`), permission restore, or
   delete-after cleanup.
 
-### Pastes, plugins, and a real FitGirl payload
+### Pastes, plugins, and a multipart archive example
 
 - `AbstractPastebinCrawler.decryptIt` = fetch page → extract plaintext field →
   `HTMLParser.getHttpLinks(text)` → one link per URL; package name = paste
@@ -300,8 +300,8 @@ magic bytes validate/disambiguate):
   (empty, len<2, `<span`/`<td` fragments, anything ending in a file extension).
   Hits are attached to every extracted link
   (`DownloadLink.setSourcePluginPasswordList`) and feed the extractor.
-- The user's FitGirl paste is a **PrivateBin 1.6.22** page. Decrypted with its
-  open client format: JSON `{"paste":"##Download links\n- https://fuckingfast.co/<id>#<Name>.part01.rar\n…"}` —
+- A supplied test paste is a **PrivateBin 1.6.22** page. Decrypted with its
+  open client format: JSON `{"paste":"##Download links\n- https://files.example/<id>#<Name>.part01.rar\n…"}` —
   9 links, filenames carried in the **URL fragment**, forming a 9-part RAR set,
   no password line.
 - PrivateBin format (from the shipped `privatebin.js`, reimplemented in
@@ -310,11 +310,9 @@ magic bytes validate/disambiguate):
   `adata` array; ciphertext base64 with 16-byte tag appended; raw-deflate
   payload (`zlib` label); API `GET /?<id>` + `X-Requested-With:
   JSONHttpRequest`.
-- `jd.plugins.hoster.FuckingfastCo` shows why this is not a plain-HTTP job:
-  filename from the URL fragment, size/title from the page, then
-  `handleFree` needs a **Cloudflare Turnstile** token
-  (`CaptchaHelperHostPluginCloudflareTurnstile`) before it can follow
-  `Hx-Redirect` to the real file URL; `hasCaptcha()` = true.
+- A share-link hoster can require more than plain HTTP: the filename may be in
+  the URL fragment, size/title on the page, and a browser challenge may need
+  the user to complete it before a direct file URL is available.
 
 ### Grabber / link collection
 
@@ -487,8 +485,8 @@ Adopt:
 
 Reject:
 1. Per-site hoster plugins (~1200 classes) and their captcha-solver coupling.
-2. Turnstile/anti-bot bypass: for hosts like `fuckingfast.co`, route through
-   our own browser extension capture (user solves the challenge) instead.
+2. Challenge bypass: route through our browser extension capture when a host
+  requires a user interaction; do not automate the challenge.
 3. `ASK_FOR_EACH_FILE`-style interactive defaults in a headless daemon.
 4. `FinalizeArchive`'s lack of canonical path containment for entries.
 5. Its update/launcher and account ("MyJDownloader") surface — irrelevant and
@@ -530,7 +528,14 @@ Reject:
 - Top gaps for ripdl after the 2026-10-19 seeding pass: per-torrent/global
   bandwidth limits, queue policy beyond `max_concurrent`, integrity actions,
   add-dialog defaults. Not planned: WebUI/API parity, RSS engine, search
-  plugins, anonymous mode, piracy presets.
+  plugins, or anonymous mode.
+
+## Local-only hoster plugin
+
+The working hoster plugin and endpoint-level research stay in gitignored
+local files for production import. Tracked tests use synthetic fixture hosts;
+no site-specific names, URLs, request flows, or challenge details are included
+in the shared documentation.
 
 ## Template for entries
 

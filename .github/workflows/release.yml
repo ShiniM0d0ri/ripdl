@@ -40,6 +40,12 @@ jobs:
             echo "tag $TAG does not match workspace version $V - aborting"
             exit 1
           fi
+          # ext/manifest.json is JSONC (// comment lines), which jq rejects: strip them, then parse.
+          EXT=$(node -e 'const fs = require("fs"); const src = fs.readFileSync("ext/manifest.json", "utf8").replace(/^\s*\/\/.*$/gm, ""); process.stdout.write(JSON.parse(src).version)')
+          if [ "$EXT" != "$V" ]; then
+            echo "ext/manifest.json is $EXT but the workspace is $V - bump both (the browser shows the manifest version)"
+            exit 1
+          fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
@@ -100,6 +106,12 @@ jobs:
               | jq -r '.packages[] | select(.name == "ripdl-core") | .version')
           if [ "${{ github.event_name }}" = "push" ] && [ "$V" != "${TAG#v}" ]; then
             echo "tag $TAG does not match workspace version $V - aborting"
+            exit 1
+          fi
+          # ext/manifest.json is JSONC (// comment lines), which jq rejects: strip them, then parse.
+          EXT=$(node -e 'const fs = require("fs"); const src = fs.readFileSync("ext/manifest.json", "utf8").replace(/^\s*\/\/.*$/gm, ""); process.stdout.write(JSON.parse(src).version)')
+          if [ "$EXT" != "$V" ]; then
+            echo "ext/manifest.json is $EXT but the workspace is $V - bump both (the browser shows the manifest version)"
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
