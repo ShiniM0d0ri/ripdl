@@ -50,24 +50,18 @@ impl Bond {
 
 /// One-line state of torrent NIC bonding, for `ripdl config` and the GUI.
 ///
-/// Torrents share a single librqbit session whose `bind_ips` is fixed when it
-/// is created, so the config value alone can lie: toggling `bond_interfaces`
-/// afterwards only applies after a daemon restart. `session` says whether the
-/// shared session exists yet and `bind` which addresses it actually bound, so
-/// the text can call out the stale cases instead of repeating the config.
+/// The daemon swaps the shared session's bind list when settings change, so no
+/// restart is needed. `session` says whether that session exists yet and `bind`
+/// which addresses it actually uses.
 pub fn describe_torrent_bond(configured: bool, session: bool, bind: &[IpAddr]) -> String {
     if !configured {
-        return if session && !bind.is_empty() {
-            "off, but the running session is still bonded - restart the daemon".to_string()
-        } else {
-            "off".to_string()
-        };
+        return "off".to_string();
     }
     if !session {
-        return "enabled - applies when the torrent session starts".to_string();
+        return "enabled, applies when the next torrent starts".to_string();
     }
     if bind.is_empty() {
-        return "enabled - no uplink bound yet, it follows the network".to_string();
+        return "enabled, no uplink bound yet; it follows the network".to_string();
     }
     let nics = bonded_nics();
     let names: Vec<String> = bind
@@ -895,14 +889,12 @@ mod tests {
     }
 
     #[test]
-    fn torrent_bond_description_flags_a_stale_session() {
+    fn torrent_bond_description_states() {
         let one = [IpAddr::from([10, 0, 0, 2])];
         assert_eq!(describe_torrent_bond(false, false, &[]), "off");
         assert_eq!(describe_torrent_bond(false, true, &[]), "off");
-        assert!(describe_torrent_bond(false, true, &one).contains("still bonded"));
-        assert!(describe_torrent_bond(true, false, &[]).contains("when the torrent session starts"));
-        // Bonding is hot-swappable now, so "enabled but nothing bound" is the
-        // transient "no uplink yet" state, not a restart prompt.
+        assert_eq!(describe_torrent_bond(false, true, &one), "off");
+        assert!(describe_torrent_bond(true, false, &[]).contains("when the next torrent starts"));
         assert!(describe_torrent_bond(true, true, &[]).contains("follows the network"));
         assert!(describe_torrent_bond(true, true, &one).starts_with("active on"));
     }
