@@ -1632,6 +1632,7 @@ function setPathField(selector, value) {
 
 async function openSettings() {
     const err = $("#set-err");    err.classList.add("hidden");
+    selectSettingsTab($("#set-tab-general"));
     SET_INPUTS.forEach((sel) => { $(sel).value = ""; });
     $("#set-tray").checked = true;
     $("#set-bond").checked = false;
@@ -1702,8 +1703,8 @@ async function renderBondNics() {
                 .map((n) => `${n.name} (${n.addr}${n.default ? ", default route" : ""})`)
                 .join(" \u00b7 ");
             el.textContent = nics.length === 1
-                ? `1 uplink: ${list} \u2014 combining cannot add bandwidth.`
-                : `${nics.length} uplinks: ${list}`;
+                ? `Only one uplink found: ${list}. Bonding needs at least two.`
+                : `${nics.length} uplinks found: ${list}.`;
         }
     } catch (e) {
         el.textContent = "";
@@ -1714,11 +1715,7 @@ async function renderBondNics() {
     try {
         const st = await invokeSafe("bond_state");
         live.textContent = `Torrents: ${st.text}`;
-        live.className = st.text.includes("restart")
-            ? "set-hint warn"
-            : st.active
-              ? "set-hint ok"
-              : "set-hint";
+        live.className = st.active ? "set-hint ok" : "set-hint";
     } catch (e) {
         live.textContent = "";
     }
@@ -1731,7 +1728,7 @@ async function renderExtInfo() {
     const el = $("#set-ext-info");
     const dir = $("#set-ext").value.trim();
     if (!dir) {
-        el.textContent = "Using the app-managed extension folder.";
+        el.textContent = "Using the built-in extension copy.";
         el.className = "set-hint ok";
         return;
     }
@@ -1739,16 +1736,16 @@ async function renderExtInfo() {
         const info = await invokeSafe("extension_folder", { dir });
         if ($("#set-ext").value.trim() !== dir) return; // typed on while we asked
         if (info.skew === "same") {
-            el.textContent = `Extension folder is ${info.version} - matches this app.`;
+            el.textContent = `Folder is v${info.version}. It matches this app.`;
             el.className = "set-hint ok";
         } else if (info.skew === "older") {
-            el.textContent = `Extension folder is ${info.version}, this app is ${info.app} - the folder predates this app.`;
+            el.textContent = `Folder is v${info.version}, but this app is v${info.app}. The folder predates this app.`;
             el.className = "set-hint warn";
         } else if (info.skew === "newer") {
-            el.textContent = `Extension folder is ${info.version}, this app is ${info.app} - this app is older than the folder; update ripdl.`;
+            el.textContent = `Folder is v${info.version}, newer than this app (v${info.app}). Update ripdl.`;
             el.className = "set-hint warn";
         } else {
-            el.textContent = "No manifest.json in this folder - point it at the unpacked extension.";
+            el.textContent = "No manifest.json in this folder. Choose the unpacked extension folder.";
             el.className = "set-hint warn";
         }
     } catch (e) {
@@ -1775,36 +1772,51 @@ function ageText(unixSeconds) {
     return `${Math.floor(hours / 24)} days ago`;
 }
 
+function setExtBadge(text, tone) {
+    const badge = $("#set-ext-badge");
+    badge.textContent = text;
+    badge.className = tone ? `set-badge ${tone}` : "set-badge";
+}
+
 async function renderBrowserExtension() {
     const el = $("#set-browser-info");
     const dir = $("#set-ext").value.trim();
     try {
         const info = await invokeSafe("browser_extension_info", { dir });
         if ($("#set-ext").value.trim() !== dir) return;
+        $("#set-ext-path").textContent = info.folder;
         const loaded = info.loaded;
-        const browser = info.browser || "a Chromium browser";
+        const who = info.browser || "The browser";
+        const inBrowser = info.browser || "your browser";
         if (!info.folder_version) {
-            el.textContent = `No manifest.json at ${info.folder}. The bundled app copy is v${info.bundled_version}.`;
+            setExtBadge("Folder not valid", "warn");
+            el.textContent = `No manifest.json in this folder. The built-in copy is v${info.bundled_version}.`;
             el.className = "set-hint warn";
             return;
         }
         if (!loaded.last_seen) {
-            el.textContent = `Never seen by the daemon. Load unpacked in ${browser} from ${info.folder} (v${info.folder_version}).`;
-            el.className = "set-hint warn";
+            setExtBadge("Not loaded", "warn");
+            el.textContent = `Folder is v${info.folder_version}. Load it in ${inBrowser} using the steps below.`;
+            el.className = "set-hint";
             return;
         }
-        const seen = `Browser reported extension v${loaded.version} ${ageText(loaded.last_seen)}; folder v${info.folder_version}.`;
-        if (compareExtensionVersions(loaded.version, info.folder_version) < 0) {
-            el.textContent = `${seen} Reload the extension in the browser.`;
+        const seen = `Last seen ${ageText(loaded.last_seen)}.`;
+        const order = compareExtensionVersions(loaded.version, info.folder_version);
+        if (order < 0) {
+            setExtBadge("Reload needed", "warn");
+            el.textContent = `${who} has v${loaded.version} loaded, but the folder is v${info.folder_version}. Click Reload on the ripdl card. ${seen}`;
             el.className = "set-hint warn";
-        } else if (compareExtensionVersions(loaded.version, info.folder_version) > 0) {
-            el.textContent = `${seen} The loaded extension is newer than the selected folder.`;
+        } else if (order > 0) {
+            setExtBadge("Folder is older", "warn");
+            el.textContent = `${who} has v${loaded.version} loaded, newer than this folder (v${info.folder_version}). ${seen}`;
             el.className = "set-hint warn";
         } else {
-            el.textContent = `${seen} The loaded extension matches the folder.`;
+            setExtBadge("Connected", "ok");
+            el.textContent = `v${info.folder_version} is loaded in ${inBrowser}. ${seen}`;
             el.className = "set-hint ok";
         }
     } catch (e) {
+        setExtBadge("Unavailable", "warn");
         el.textContent = String(e).replace(/^.*error: /, "");
         el.className = "set-hint warn";
     }
@@ -1824,16 +1836,16 @@ async function saveSettings() {
     const segs = num($("#set-segs"));
     const minseg = parseBytesLoose($("#set-minseg").value);
     const speed = parseBytesLoose($("#set-speed").value);
-    if (Number.isNaN(conc) || Number.isNaN(segs)) return reject("concurrency / segments need numbers");
-    if (Number.isNaN(minseg) || Number.isNaN(speed)) return reject("segment size / speed need bytes (e.g. 4MiB) or zero/empty");
-    if (conc !== undefined && conc < 1) return reject("concurrent downloads must be at least 1");
-    if (segs !== undefined && segs < 1) return reject("max segments must be at least 1");
-    if (minseg !== undefined && minseg < 1) return reject("min segment size must be at least 1");
+    if (Number.isNaN(conc) || Number.isNaN(segs)) return reject("Downloads at once and connections per download must be numbers.");
+    if (Number.isNaN(minseg) || Number.isNaN(speed)) return reject("Chunk size and speed limit need a size such as 4MiB, or must be empty.");
+    if (conc !== undefined && conc < 1) return reject("Downloads at once must be at least 1.");
+    if (segs !== undefined && segs < 1) return reject("Connections per download must be at least 1.");
+    if (minseg !== undefined && minseg < 1) return reject("Minimum chunk size must be at least 1 byte.");
     const dir = $("#set-dir").value.trim();
     const ratio = num($("#set-ratio"));
     const seedTime = num($("#set-seedtime"));
-    if (Number.isNaN(ratio) || ratio < 0) return reject("seed ratio must be 0 (no limit) or positive");
-    if (Number.isNaN(seedTime) || seedTime < 0) return reject("seed time must be 0 (never) or positive minutes");
+    if (Number.isNaN(ratio) || ratio < 0) return reject("Seed ratio must be 0 (no limit) or a positive number.");
+    if (Number.isNaN(seedTime) || seedTime < 0) return reject("Seed time must be 0 (no limit) or a positive number of minutes.");
     // Full-replace semantics: cleared fields become absent -> daemon defaults.
     const payload = {
         max_concurrent: conc,
@@ -1875,6 +1887,27 @@ $("#btn-settings").onclick = openSettings;
 $("#set-cancel").onclick = closeSettings;
 $("#set-close").onclick = closeSettings;
 $("#set-ok").onclick = saveSettings;
+
+const setTabs = [...document.querySelectorAll(".set-tab")];
+function selectSettingsTab(tab) {
+    setTabs.forEach((t) => {
+        const on = t === tab;
+        t.setAttribute("aria-selected", String(on));
+        t.tabIndex = on ? 0 : -1;
+        document.getElementById(t.getAttribute("aria-controls")).classList.toggle("hidden", !on);
+    });
+    $("#set-body").scrollTop = 0;
+}
+setTabs.forEach((t, i) => {
+    t.onclick = () => selectSettingsTab(t);
+    t.onkeydown = (ev) => {
+        if (ev.key !== "ArrowRight" && ev.key !== "ArrowLeft") return;
+        ev.preventDefault();
+        const next = setTabs[(i + (ev.key === "ArrowRight" ? 1 : setTabs.length - 1)) % setTabs.length];
+        next.focus();
+        selectSettingsTab(next);
+    };
+});
 $("#set-dir-browse").onclick = async () => {
     try {
         const picked = await invokeSafe("pick_dir");
@@ -1897,12 +1930,37 @@ $("#set-ext-browse").onclick = async () => {
         flashErr(String(e));
     }
 };
-$("#set-ext-open").onclick = async () => {
+let copyLabelTimer = null;
+$("#set-ext-copy").onclick = async () => {
+    const label = $("#set-ext-copy-label");
+    const path = $("#set-ext-path").textContent;
+    if (!path) return;
     try {
-        flashStatus(await invokeSafe("open_browser_extensions", { dir: $("#set-ext").value.trim() }));
-        renderBrowserExtension();
+        await copyText(path);
+        label.textContent = "Copied";
     } catch (e) {
-        flashErr(String(e).replace(/^.*error: /, ""));
+        label.textContent = "Copy failed";
+    }
+    clearTimeout(copyLabelTimer);
+    copyLabelTimer = setTimeout(() => { label.textContent = "Copy path"; }, 1500);
+};
+$("#set-ext-open").onclick = async () => {
+    const button = $("#set-ext-open");
+    const error = $("#set-err");
+    error.classList.add("hidden");
+    button.disabled = true;
+    try {
+        const result = await invokeSafe("open_browser_extensions", {
+            dir: $("#set-ext").value.trim(),
+            browser: $("#set-ext-browser").value,
+        });
+        $("#set-browser-info").textContent = result;
+        $("#set-browser-info").className = "set-hint ok";
+    } catch (e) {
+        error.textContent = String(e).replace(/^.*error: /, "");
+        error.classList.remove("hidden");
+    } finally {
+        button.disabled = false;
     }
 };
 $("#set-plugbtn").onclick = async () => {
@@ -1916,22 +1974,20 @@ $("#set-plugbtn").onclick = async () => {
     }
 };
 $("#set-restart").onclick = async () => {
-    if (!confirm("Restart the daemon?\nActive transfers pause and resume automatically; torrent sessions are rebuilt.")) return;
+    if (!confirm("Restart the background service?\nActive transfers pause and resume automatically; torrent sessions are rebuilt.")) return;
     try {
         await invokeSafe("restart_daemon");
-        flashStatus("daemon restarted");
+        flashStatus("background service restarted");
         await poll();
     } catch (e) {
         flashErr(String(e));
     }
 };
 $("#set-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeSettings(); };
-$("#set-backdrop").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
-$("#set-ytdlp").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
-$("#set-dir").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
+// Enter saves from a field only; on a button it keeps its click meaning.
+$("#set-backdrop").onkeydown = (ev) => { if (ev.key === "Enter" && ev.target.tagName === "INPUT") saveSettings(); };
 $("#set-ytdlp").oninput = () => { $("#set-ytdlp").title = $("#set-ytdlp").value; };
 $("#set-dir").oninput = () => { $("#set-dir").title = $("#set-dir").value; };
-$("#set-ext").onkeydown = (ev) => { if (ev.key === "Enter") saveSettings(); };
 $("#set-ext").oninput = () => {
     $("#set-ext").title = $("#set-ext").value;
     renderExtInfo();

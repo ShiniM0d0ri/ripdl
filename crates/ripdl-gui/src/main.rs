@@ -465,12 +465,18 @@ async fn browser_extension_info(dir: String) -> Result<BrowserExtensionInfo, Str
 }
 
 #[tauri::command]
-async fn open_browser_extensions(dir: String) -> Result<String, String> {
+async fn open_browser_extensions(dir: String, browser: Option<String>) -> Result<String, String> {
     let _ = tauri::async_runtime::spawn_blocking(sync_managed_extension)
         .await
         .map_err(|e| e.to_string())??;
-    let browser = default_chromium_browser()
-        .ok_or("could not detect Chrome, Edge, or Brave as the default HTTPS browser")?;
+    let browser = match browser.as_deref().unwrap_or("") {
+        "" => default_chromium_browser()
+            .ok_or("could not detect a supported default browser; select Chrome, Edge, or Brave")?,
+        "chrome" => ChromiumBrowser { name: "Chrome", extensions_url: "chrome://extensions" },
+        "edge" => ChromiumBrowser { name: "Edge", extensions_url: "edge://extensions" },
+        "brave" => ChromiumBrowser { name: "Brave", extensions_url: "brave://extensions" },
+        _ => return Err("unsupported browser selection".into()),
+    };
     let folder = if dir.trim().is_empty() {
         managed_extension_dir()?
     } else {
@@ -478,13 +484,72 @@ async fn open_browser_extensions(dir: String) -> Result<String, String> {
     };
     let version = ripdl_core::extplug::folder_version(&folder)
         .ok_or_else(|| format!("{} has no readable extension manifest", folder.display()))?;
-    open_with_default(browser.extensions_url).map_err(|e| e.to_string())?;
+    open_extensions_page(browser).map_err(|e| format!("could not open {} extensions: {e}", browser.name))?;
     Ok(format!(
         "Opened {}. Extension folder: {} (v{}).",
         browser.name,
         folder.display(),
         version
     ))
+}
+
+#[cfg(windows)]
+fn open_extensions_page(browser: ChromiumBrowser) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    let relative = match browser.name {
+        "Chrome" => "Google/Chrome/Application/chrome.exe",
+        "Edge" => "Microsoft/Edge/Application/msedge.exe",
+        "Brave" => "BraveSoftware/Brave-Browser/Application/brave.exe",
+        _ => return Err(std::io::Error::other("unsupported browser")),
+    };
+    let executable_name = relative.rsplit('/').next().unwrap_or_default();
+    let mut candidates = Vec::new();
+    for hive in ["HKCU", "HKLM"] {
+        let key = format!(r"{hive}\Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}");
+        if let Ok(output) = std::process::Command::new("reg")
+            .args(["query", &key, "/ve"])
+            .creation_flags(0x0800_0000)
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if let Some(value) = text.lines().find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim().trim_matches('"'))) {
+                    candidates.push(std::path::PathBuf::from(value));
+                }
+            }
+        }
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Some(root) = std::env::var_os(variable) {
+            candidates.push(std::path::PathBuf::from(root).join(relative));
+        }
+    }
+    let executable = candidates.into_iter().find(|path| path.is_file())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} executable not found; open {} manually", browser.name, browser.extensions_url)))?;
+    std::process::Command::new(executable)
+        .arg(browser.extensions_url)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn open_extensions_page(browser: ChromiumBrowser) -> std::io::Result<()> {
+    let programs: &[&str] = match browser.name {
+        "Chrome" => &["google-chrome", "chromium", "chromium-browser"],
+        "Edge" => &["microsoft-edge", "microsoft-edge-stable"],
+        "Brave" => &["brave-browser", "brave"],
+        _ => return Err(std::io::Error::other("unsupported browser")),
+    };
+    for program in programs {
+        match std::process::Command::new(program).arg(browser.extensions_url).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} executable not found; open {} manually", browser.name, browser.extensions_url)))
 }
 
 /// Settings line: the extension folder's manifest version beside this app's.

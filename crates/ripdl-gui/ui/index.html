@@ -336,58 +336,198 @@
 
   <!-- Settings dialog -->
   <div id="set-backdrop" class="hidden">
-    <div id="set">
-      <div class="set-title">Settings<em> daemon-wide (config.json)</em><button id="set-close">&times;</button></div>
+    <div id="set" role="dialog" aria-modal="true" aria-labelledby="set-title">
+      <div class="set-title"><span id="set-title">Settings</span><button id="set-close" aria-label="Close">&times;</button></div>
+      <div class="set-tabs" role="tablist" aria-label="Settings sections">
+        <button type="button" class="set-tab" role="tab" id="set-tab-general" aria-controls="set-panel-general" aria-selected="true">General</button>
+        <button type="button" class="set-tab" role="tab" id="set-tab-network" aria-controls="set-panel-network" aria-selected="false" tabindex="-1">Network</button>
+        <button type="button" class="set-tab" role="tab" id="set-tab-torrents" aria-controls="set-panel-torrents" aria-selected="false" tabindex="-1">Torrents</button>
+        <button type="button" class="set-tab" role="tab" id="set-tab-browser" aria-controls="set-panel-browser" aria-selected="false" tabindex="-1">Browser</button>
+        <button type="button" class="set-tab" role="tab" id="set-tab-updates" aria-controls="set-panel-updates" aria-selected="false" tabindex="-1">Updates</button>
+        <button type="button" class="set-tab" role="tab" id="set-tab-advanced" aria-controls="set-panel-advanced" aria-selected="false" tabindex="-1">Advanced</button>
+      </div>
       <div id="set-body">
-        <div class="set-row"><label for="set-conc">Concurrent downloads</label><input id="set-conc" type="number" min="1" max="64" /></div>
-        <div class="set-row"><label for="set-segs">Max segments per download</label><input id="set-segs" type="number" min="1" max="64" /></div>
-        <div class="set-row"><label for="set-minseg">Min segment size</label><input id="set-minseg" type="text" placeholder="e.g. 4MiB (1048576)" /></div>
-        <div class="set-row"><label for="set-speed">Speed cap (shared)</label><input id="set-speed" type="text" placeholder="e.g. 2MiB, empty = unlimited" /></div>
-        <div class="set-row"><label for="set-dir">Default download folder</label>
-          <input id="set-dir" type="text" placeholder="(user Downloads)" />
-          <button id="set-dir-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
-        </div>
-        <div class="set-row"><label for="set-ytdlp">yt-dlp path</label><input id="set-ytdlp" type="text" placeholder="yt-dlp (on PATH)" /></div>
-        <div class="set-sec">Browser extension</div>
-        <ol class="set-setup" aria-label="Browser extension setup">
-          <li>Open your browser's Extensions page and turn on Developer mode.</li>
-          <li>Choose Load unpacked and select the extension folder shown below.</li>
-          <li>After an update or script install, click Reload on the ripdl extension.</li>
-        </ol>
-        <div class="set-hint">Brave: <strong>brave://extensions</strong>. Chrome: <strong>chrome://extensions</strong>. Edge: <strong>edge://extensions</strong>.</div>
-        <div class="set-row"><label>Browser setup</label>
-          <button id="set-ext-open" title="Open the detected browser's extensions page. Load the unpacked extension from the folder shown below.">Open extension settings</button>
-        </div>
-        <div id="set-browser-info" class="set-hint" aria-live="polite"></div>
-        <div class="set-row"><label for="set-ext" title="Optional path to an unpacked extension you loaded manually. User scripts install into its hosts/local folder.">Manual extension folder override</label>
-          <input id="set-ext" type="text" placeholder="(app-managed extension by default)" />
-          <button id="set-ext-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
-        </div>
-        <div id="set-ext-info" class="set-hint"></div>
-        <div class="set-hint">Already loaded a GitHub download? Select that exact unpacked folder above before installing scripts. Recipe .json files import from the browser's Hoster plugins page; .js scripts install here.</div>
-        <div class="set-row"><label>Install hoster plugin</label>
-          <button id="set-plugbtn" title="Copy a .js script into the extension's hosts/local folder and regenerate its registry; finish with the Reload click in chrome://extensions, then enable it on the Plugins page."><svg class="ico"><use href="#i-layers"/></svg>Pick .js file&hellip;</button>
-        </div>
-        <div class="set-row"><label for="set-tray">Minimize to tray on close</label><input id="set-tray" type="checkbox" class="chk-box" /></div>
-        <div class="set-row"><label for="set-bond">Combine network connections (bond all NICs)</label><input id="set-bond" type="checkbox" class="chk-box" /></div>
-        <div id="set-bond-info" class="set-hint"></div>
-        <div id="set-bond-state" class="set-hint"></div>
-
-        <div class="set-sec">Torrents</div>
-        <div class="set-row"><label for="set-seed" title="Finished torrents stay in the swarm and upload to peers (files/peers stay visible in Details).">Seed finished torrents</label><input id="set-seed" type="checkbox" class="chk-box" /></div>
-        <div class="set-row"><label for="set-ratio" title="Stop seeding once uploaded/downloaded reaches this value. 0 = no ratio limit.">Stop seeding at ratio</label><input id="set-ratio" type="number" min="0" step="0.1" /></div>
-        <div class="set-row"><label for="set-seedtime" title="Stop seeding after this many minutes. 0 = never stop on time.">Stop seeding after (minutes)</label><input id="set-seedtime" type="number" min="0" step="1" /></div>
-
-        <div class="set-row"><label for="set-update">Check for updates at startup</label><input id="set-update" type="checkbox" class="chk-box" /></div>
-
-        <div class="set-row"><label for="set-auto" title="When a startup check finds a newer release: download the SHA256-verified installer and run it unattended (only the UAC prompt shows)">Download &amp; install updates automatically</label><input id="set-auto" type="checkbox" class="chk-box" /></div>
+        <section class="set-panel" id="set-panel-general" role="tabpanel" aria-labelledby="set-tab-general">
+          <div class="set-row stack">
+            <div class="set-text">
+              <label for="set-dir">Default download folder</label>
+              <p class="set-desc">New downloads are saved here unless you choose another folder.</p>
+            </div>
+            <div class="set-control">
+              <input id="set-dir" type="text" placeholder="Your Downloads folder" />
+              <button id="set-dir-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-conc">Downloads at once</label>
+              <p class="set-desc">Others wait in the queue until a slot is free.</p>
+            </div>
+            <div class="set-control"><input id="set-conc" type="number" min="1" max="64" /></div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-segs">Connections per download</label>
+              <p class="set-desc">Parallel connections used for one file. Lower it if a server rejects them.</p>
+            </div>
+            <div class="set-control"><input id="set-segs" type="number" min="1" max="64" /></div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-minseg">Minimum chunk size</label>
+              <p class="set-desc">A file is never split into pieces smaller than this. Example: 4MiB.</p>
+            </div>
+            <div class="set-control"><input id="set-minseg" type="text" placeholder="4MiB" /></div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-tray">Hide to tray when the window closes</label>
+              <p class="set-desc">When off, closing the window quits the app.</p>
+            </div>
+            <div class="set-control"><input id="set-tray" type="checkbox" /></div>
+          </div>
+        </section>
+        <section class="set-panel hidden" id="set-panel-network" role="tabpanel" aria-labelledby="set-tab-network">
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-speed">Total speed limit</label>
+              <p class="set-desc">Caps all downloads together. Examples: 2MiB, 500KiB. Empty means no limit.</p>
+            </div>
+            <div class="set-control"><input id="set-speed" type="text" placeholder="No limit" /></div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-bond">Use all network connections</label>
+              <p class="set-desc">Spreads downloads and torrent traffic across every working connection, such as Wi-Fi and a phone tether.</p>
+            </div>
+            <div class="set-control"><input id="set-bond" type="checkbox" /></div>
+          </div>
+          <div class="set-status">
+            <p id="set-bond-info" class="set-hint"></p>
+            <p id="set-bond-state" class="set-hint"></p>
+          </div>
+        </section>
+        <section class="set-panel hidden" id="set-panel-torrents" role="tabpanel" aria-labelledby="set-tab-torrents">
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-seed">Keep seeding finished torrents</label>
+              <p class="set-desc">Finished torrents keep uploading to other peers. Their details stay visible.</p>
+            </div>
+            <div class="set-control"><input id="set-seed" type="checkbox" /></div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-ratio">Stop seeding at ratio</label>
+              <p class="set-desc">Stops once uploaded data reaches this multiple of the downloaded size. 0 means no limit.</p>
+            </div>
+            <div class="set-control"><input id="set-ratio" type="number" min="0" step="0.1" /></div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-seedtime">Stop seeding after (minutes)</label>
+              <p class="set-desc">0 means seeding has no time limit.</p>
+            </div>
+            <div class="set-control"><input id="set-seedtime" type="number" min="0" step="1" /></div>
+          </div>
+        </section>
+        <section class="set-panel hidden" id="set-panel-browser" role="tabpanel" aria-labelledby="set-tab-browser">
+          <p class="set-intro">The extension is built into ripdl. Load it once in your browser; no download needed.</p>
+          <div class="set-card">
+            <span id="set-ext-badge" class="set-badge">Checking&hellip;</span>
+            <p id="set-browser-info" class="set-hint" aria-live="polite"></p>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-ext-browser">Browser</label>
+              <p class="set-desc">Used by the Open button. Default uses your system browser.</p>
+            </div>
+            <div class="set-control">
+              <select id="set-ext-browser">
+                <option value="">Default browser</option>
+                <option value="brave">Brave</option>
+                <option value="chrome">Chrome</option>
+                <option value="edge">Edge</option>
+              </select>
+              <button id="set-ext-open"><svg class="ico"><use href="#i-external"/></svg>Open</button>
+            </div>
+          </div>
+          <div class="set-row stack">
+            <div class="set-text">
+              <span class="set-name">Extension folder</span>
+              <p class="set-desc">Pick this folder when the browser asks for an unpacked extension.</p>
+            </div>
+            <div class="set-control">
+              <span id="set-ext-path" class="set-path"></span>
+              <button id="set-ext-copy"><svg class="ico"><use href="#i-copy"/></svg><span id="set-ext-copy-label">Copy path</span></button>
+            </div>
+          </div>
+          <div class="set-sec">Load it in your browser</div>
+          <ol class="set-steps">
+            <li>Click Open above. It opens the extensions page of the selected browser.</li>
+            <li>Turn on Developer mode, then click Load unpacked.</li>
+            <li>Select the extension folder shown above.</li>
+          </ol>
+          <p class="set-desc">After each ripdl update, click Reload on the ripdl card in the browser.</p>
+        </section>
+        <section class="set-panel hidden" id="set-panel-updates" role="tabpanel" aria-labelledby="set-tab-updates">
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-update">Check for updates when ripdl starts</label>
+              <p class="set-desc">Looks for a newer release on GitHub.</p>
+            </div>
+            <div class="set-control"><input id="set-update" type="checkbox" /></div>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <label for="set-auto">Install updates automatically</label>
+              <p class="set-desc">Downloads the new installer, verifies its checksum, and installs it silently. Windows still asks for permission.</p>
+            </div>
+            <div class="set-control"><input id="set-auto" type="checkbox" /></div>
+          </div>
+        </section>
+        <section class="set-panel hidden" id="set-panel-advanced" role="tabpanel" aria-labelledby="set-tab-advanced">
+          <div class="set-sec">Browser extension</div>
+          <div class="set-row stack">
+            <div class="set-text">
+              <label for="set-ext">Custom extension folder</label>
+              <p class="set-desc">Only if you loaded the extension from another folder, such as an extracted GitHub ZIP.</p>
+            </div>
+            <div class="set-control">
+              <input id="set-ext" type="text" placeholder="Built-in copy" />
+              <button id="set-ext-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
+            </div>
+          </div>
+          <p id="set-ext-info" class="set-hint"></p>
+          <div class="set-row">
+            <div class="set-text">
+              <span class="set-name">Hoster plugin</span>
+              <p class="set-desc">Copies a .js plugin into the extension. Enable it on the Plugins page.</p>
+            </div>
+            <div class="set-control"><button id="set-plugbtn"><svg class="ico"><use href="#i-layers"/></svg>Choose .js file&hellip;</button></div>
+          </div>
+          <div class="set-sec">Tools</div>
+          <div class="set-row stack">
+            <div class="set-text">
+              <label for="set-ytdlp">Video tool path (yt-dlp)</label>
+              <p class="set-desc">Used for video and stream downloads. Empty uses yt-dlp from PATH.</p>
+            </div>
+            <div class="set-control"><input id="set-ytdlp" type="text" placeholder="yt-dlp (on PATH)" /></div>
+          </div>
+          <div class="set-sec">Background service</div>
+          <div class="set-row">
+            <div class="set-text">
+              <span class="set-name">Restart background service</span>
+              <p class="set-desc">Stops and starts the service. Downloads resume; torrents recheck first.</p>
+            </div>
+            <div class="set-control"><button id="set-restart">Restart</button></div>
+          </div>
+        </section>
       </div>
       <div class="set-actions">
-        <button id="set-restart" title="Stop the daemon and start a fresh one. Active transfers resume; torrents re-attach to the new session and re-check existing data first (needed after changing NIC bonding).">Restart daemon</button>
+        <span id="set-err" class="hidden"></span>
         <button id="set-cancel">Cancel</button>
         <button id="set-ok" class="primary">Save</button>
       </div>
-      <div id="set-err" class="hidden"></div>
     </div>
   </div>
 

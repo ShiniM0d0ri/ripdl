@@ -324,6 +324,13 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       registry, show actionable recipe import errors, and expose the browser
       setup checklist in Settings. Verified JSON file/paste import and reload
       persistence in a clean temporary browser profile.
+- [x] Settings browser tab (v0.4.4): Settings split into General, Network,
+      Torrents, Browser, Updates and Advanced tabs. The Browser tab picks
+      Chrome, Edge or Brave for Open (launches that browser's extensions page
+      directly, no Windows app chooser), copies the extension folder path and
+      shows a live status badge. Torrent bonding state no longer asks for a
+      restart, and "Restart daemon" is "Restart background service". Verified
+      in the debug GUI over CDP.
 
 ## P5 - ship it
 
