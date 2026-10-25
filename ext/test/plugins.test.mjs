@@ -2,6 +2,8 @@
 // Pure node (no browser, no network): node ext/test/plugins.test.mjs
 "use strict";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import vm from "node:vm";
 
 import generic from "../hosts/generic.js";
 import { BUILTINS } from "../hosts/index.js";
@@ -17,6 +19,9 @@ const resp = (status, headers, body) => ({
 });
 
 /* ---------------- built-ins ---------------- */
+
+assert.ok(existsSync(new URL("../hosts/local/registry.js", import.meta.url)), "shipping extension must include its static script registry");
+ok("package: static local registry exists");
 
 assert.equal(BUILTINS.length, 1, "only generic ships built-in");
 assert.ok(BUILTINS.includes(generic));
@@ -146,5 +151,30 @@ const queryRecipe = recipeToPlugin(validateRecipe({
 }), async () => { throw new Error("none"); });
 assert.equal(queryRecipe.name("https://q.host/abc?f=part2.rar"), "part2.rar");
 ok("recipe name kinds: tail and query");
+
+const elements = new Map();
+const element = (id) => {
+    if (!elements.has(id)) elements.set(id, { textContent: "", value: "", className: "", addEventListener() {} });
+    return elements.get(id);
+};
+const context = vm.createContext({
+    document: { getElementById: element },
+    chrome: {
+        runtime: {
+            getManifest: () => ({ version: "0.4.2" }),
+            sendMessage: async () => { throw new Error("Receiving end does not exist."); },
+        },
+    },
+});
+vm.runInContext(readFileSync(new URL("../options.js", import.meta.url), "utf8"), context);
+await vm.runInContext('importText(\'\')', context);
+assert.match(element("import-status").textContent, /paste its JSON/);
+await vm.runInContext('importText(\'export default {}\')', context);
+assert.match(element("import-status").textContent, /JavaScript plugins/);
+await vm.runInContext('importText(\'{"id":"fixture"}\')', context);
+assert.match(element("import-status").textContent, /Cannot reach the plugin service/);
+assert.equal(element("import-status").className, "bad");
+assert.match(element("list").textContent, /Plugin service unavailable/);
+ok("options: invalid input and disconnected worker show actionable errors");
 
 console.log(`\n${pass} checks passed`);

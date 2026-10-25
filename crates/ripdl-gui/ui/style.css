@@ -589,6 +589,8 @@ body.drop-target::after {
 .set-sec { margin-top: 7px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--teal-dark); }
 .set-hint { font-size: 11.5px; line-height: 1.45; color: var(--muted); margin-top: -3px; }
 #set-browser-info { overflow-wrap: anywhere; }
+.set-setup { padding-left: 20px; font-size: 12px; line-height: 1.5; color: var(--ink); }
+.set-setup li + li { margin-top: 4px; }
 .set-hint.ok { color: var(--green); }
 .set-hint.warn { color: var(--amber); }
 .set-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }

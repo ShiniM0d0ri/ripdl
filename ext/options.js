@@ -118,11 +118,16 @@ function entryDiv(e) {
 }
 
 async function refresh() {
-    const resp = await chrome.runtime.sendMessage({ type: "ripdl_plugins_list" });
     const list = $("list");
-    list.textContent = "";
-    for (const e of resp?.plugins || []) list.append(entryDiv(e));
-    if (!resp?.plugins?.length) list.textContent = "no plugins found";
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: "ripdl_plugins_list" });
+        if (!resp || !Array.isArray(resp.plugins)) throw new Error("Plugin service did not respond.");
+        list.textContent = "";
+        for (const e of resp.plugins) list.append(entryDiv(e));
+        if (!resp.plugins.length) list.textContent = "No plugins found.";
+    } catch {
+        list.textContent = "Plugin service unavailable. Reload ripdl in your browser's Extensions page. If it still fails, check the extension's Errors panel for missing files.";
+    }
 }
 
 async function loadVersion() {
@@ -148,8 +153,17 @@ async function loadVersion() {
 $("file").addEventListener("change", async () => {
     const f = $("file").files[0];
     if (!f) return;
-    await importText(await f.text());
-    $("file").value = "";
+    try {
+        if (!f.name.toLowerCase().endsWith(".json")) {
+            throw new Error("Choose a .json recipe. Install .js scripts from ripdl Settings into the folder loaded in your browser, then reload the extension.");
+        }
+        await importText(await f.text());
+    } catch (error) {
+        $("import-status").className = "bad";
+        $("import-status").textContent = String(error.message || error);
+    } finally {
+        $("file").value = "";
+    }
 });
 
 $("import-btn").addEventListener("click", () => importText($("paste").value));
@@ -157,16 +171,28 @@ $("import-btn").addEventListener("click", () => importText($("paste").value));
 async function importText(text) {
     const st = $("import-status");
     st.className = "";
-    st.textContent = "importing...";
-    const resp = await chrome.runtime.sendMessage({ type: "ripdl_recipe_import", text });
-    if (resp?.ok) {
+    st.textContent = "Importing...";
+    try {
+        if (!text.trim()) throw new Error("Choose a .json recipe file or paste its JSON first.");
+        try {
+            JSON.parse(text);
+        } catch {
+            throw new Error("This is not valid recipe JSON. JavaScript plugins must be installed from ripdl Settings.");
+        }
+        let resp;
+        try {
+            resp = await chrome.runtime.sendMessage({ type: "ripdl_recipe_import", text });
+        } catch {
+            throw new Error("Cannot reach the plugin service. Reload the extension in your browser's Extensions page and try again.");
+        }
+        if (!resp?.ok) throw new Error(resp?.error || "Plugin service did not respond. Check the extension's Errors panel.");
         st.className = "ok";
-        st.textContent = `imported ${resp.id}`;
+        st.textContent = `Imported ${resp.id}`;
         $("paste").value = "";
         await refresh();
-    } else {
+    } catch (error) {
         st.className = "bad";
-        st.textContent = resp?.error || "failed";
+        st.textContent = String(error.message || error);
     }
 }
 

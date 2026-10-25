@@ -349,6 +349,12 @@
         </div>
         <div class="set-row"><label for="set-ytdlp">yt-dlp path</label><input id="set-ytdlp" type="text" placeholder="yt-dlp (on PATH)" /></div>
         <div class="set-sec">Browser extension</div>
+        <ol class="set-setup" aria-label="Browser extension setup">
+          <li>Open your browser's Extensions page and turn on Developer mode.</li>
+          <li>Choose Load unpacked and select the extension folder shown below.</li>
+          <li>After an update or script install, click Reload on the ripdl extension.</li>
+        </ol>
+        <div class="set-hint">Brave: <strong>brave://extensions</strong>. Chrome: <strong>chrome://extensions</strong>. Edge: <strong>edge://extensions</strong>.</div>
         <div class="set-row"><label>Browser setup</label>
           <button id="set-ext-open" title="Open the detected browser's extensions page. Load the unpacked extension from the folder shown below.">Open extension settings</button>
         </div>
@@ -358,6 +364,7 @@
           <button id="set-ext-browse"><svg class="ico"><use href="#i-folder"/></svg>Browse&hellip;</button>
         </div>
         <div id="set-ext-info" class="set-hint"></div>
+        <div class="set-hint">Already loaded a GitHub download? Select that exact unpacked folder above before installing scripts. Recipe .json files import from the browser's Hoster plugins page; .js scripts install here.</div>
         <div class="set-row"><label>Install hoster plugin</label>
           <button id="set-plugbtn" title="Copy a .js script into the extension's hosts/local folder and regenerate its registry; finish with the Reload click in chrome://extensions, then enable it on the Plugins page."><svg class="ico"><use href="#i-layers"/></svg>Pick .js file&hellip;</button>
         </div>

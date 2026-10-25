@@ -320,6 +320,10 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       loaded/on-disk versions and opens the detected Chromium extensions page
       for the user's final Load unpacked / Reload action. `extension_dir` is
       an optional manual-copy override.
+- [x] Extension first-run repair (v0.4.3): ship the empty static script
+      registry, show actionable recipe import errors, and expose the browser
+      setup checklist in Settings. Verified JSON file/paste import and reload
+      persistence in a clean temporary browser profile.
 
 ## P5 - ship it
 
