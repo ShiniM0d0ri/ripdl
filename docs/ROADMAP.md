@@ -101,9 +101,12 @@ Guiding rules:
       (`webview_mem.rs` - controller visible flag, `TrySuspend`, Low memory
       target; `reveal()` resumes before showing), and the webview runs
       software-composited (`--disable-gpu` + wry's default
-      `msWebOOUI,msPdfOOUI,msSmartScreenProtection` off): idle private went
-      192 -> ~101 MB, resident 418 -> 316 MB shown and ~34 MB after a minute
-      in the tray, hidden CPU ~0 (the JS poll is frozen)
+      `msWebOOUI,msPdfOOUI,msSmartScreenProtection` off). Approximate A/B
+      (2026-10-26, dev builds, 2 runs per side, GUI + WebView2 combined,
+      baseline = HEAD without these two changes): hidden 30-90 s working set
+      53-60 MB vs 341-369 MB; hidden private commit ~106 MB vs ~178 MB; hidden
+      CPU ~0 % vs ~2.5 %; visible private commit ~110 MB vs ~171 MB; after a
+      reveal ~155 MB vs ~330 MB. Measure late: the trim takes 30-90 s.
 
 ## P3 - torrent support (via librqbit, Apache-2.0 — never a GPL client)
 
@@ -245,6 +248,24 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       scripts, no new standing permissions) and offers "download page
       as video" for known stream sites (activeTab, granted only while
       the popup is open)
+- [x] Browser handoff: each browser download gets one decision. `new`
+      queues the link in the daemon and cancels the browser's copy;
+      `duplicate` cancels it and reports the existing task; `refused`, a
+      daemon that is down, or no answer within 3 s leaves the browser's copy
+      alone. The daemon probes the address with the browser's headers and
+      queues it only when the answer matches what the browser saw (size, when
+      known). If the browser will not let go after a `new`, `abandon` drops
+      only the task that proposal queued. `ext/handoff.js`: 15 node checks
+      (`ext/test/handoff.test.mjs`, CI-gated).
+- [x] Duplicate downloads: `Add` takes `on_duplicate`. `share` (default)
+      answers with the existing task's id, as before; `report` queues nothing
+      and returns the existing task so the caller can ask; `copy` downloads
+      again under the next free name (torrents never copy). The extension's
+      duplicate window names the file and offers Open file, Show in folder,
+      Download again and Let the browser download (web links), plus Resume for
+      paused and Retry for failed tasks. Model tests:
+      `ext/test/duplicate-model.test.mjs`, 17 checks, local only; the gate's
+      B-phase covers finished, paused and captured duplicates.
 
 ### Multi-part bundles + hoster plugins (plan: `docs/plan-bundles-and-plugins.md`)
 
@@ -368,11 +389,17 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       version via the new `app_version` command, licence, links). v0.3.7
       installs with `/SILENT` (UAC only, no wizard, app relaunches itself)
       and hides a stale update banner when a check reports "current".
+- [x] End-to-end gate: `ext/test/e2e/run.mjs` runs the CLI, a private
+      daemon, the extension in headless Edge, and the GUI (single-instance
+      hand-off, Settings, Add URL) in one isolated pass, and checks that the
+      installed daemon, its queue and the user's Downloads stay untouched.
+      The GUI phase runs in the desktop session via
+      `ext/test/e2e/run-in-session.ps1`. Last full pass: 101/101 checks, all
+      phases (2026-10-26). Not in CI.
 - [ ] Packaging: winget / scoop / Homebrew, AUR
-- [x] README showcase: first-timer walkthrough with real screenshots
-      (`docs/screenshots/`: main window, Add URL, torrent details,
-      Send & Receive, settings), a plain-language feature list and an honest
-      vs-IDM/FDM/aria2 table. Website still pending.
+- [x] README showcase: first-timer walkthrough with redacted screenshots
+      (`docs/screenshots/`: main window, Add URL, Settings), a plain-language
+      feature list and an honest vs-IDM/FDM/aria2 table. Website still pending.
 - [ ] Website
 - [ ] i18n
 
@@ -381,7 +408,7 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
 - [x] NIC bonding: combine bandwidth of every uplink interface (Wi-Fi +
       Ethernet + tethering) by binding segments per interface
       (`bond_interfaces` in config.json / `ripdl download --bond` / GUI
-      settings; per-IP server caps bypassed, VPN tunnels excluded)
+      settings; uplinks you own add up on your side, not a way around per-IP or per-account server limits; VPN tunnels excluded)
 - [x] Uplink transparency: Settings shows exactly which uplinks bonding
       would use (name, address, default route) and warns when only one is up
       ("combining cannot add bandwidth"); `ripdl config` prints the same

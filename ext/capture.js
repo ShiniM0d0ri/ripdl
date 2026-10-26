@@ -21,6 +21,7 @@
 
     const MAX_LINKS = 100;
     const AUTO_DISMISS_MS = 30000;
+    const SLOW_MS = 200; // a reply slower than this shows a progress line
     const URL_RE = /https?:\/\/[^\s<>"'`]+/gi;
     /** Anchor text that names a file, never a command ("Download", "here"). */
     const FILENAME_RE = /^[^\\/:*?"<>|\r\n]{1,120}\.[A-Za-z0-9]{1,8}$/;
@@ -32,6 +33,8 @@
     let editing = false;
     let anchor = null; // where the selection was, in viewport coords
     let timer = 0;
+    let offerSeq = 0; // a newer copy or status supersedes pending replies
+    let loading = false; // the chip is showing "Reading links" right now
 
     document.addEventListener("copy", onCopy, true);
 
@@ -47,46 +50,62 @@
         const links = collect(field ? null : sel, text);
         if (!links.length) return;
         rememberAnchor(field, sel);
+        const seq = ++offerSeq;
+        // "Reading" appears only when the answer is slow; most copies are instant.
+        const slow = setTimeout(() => {
+            if (seq !== offerSeq) return;
+            loading = true;
+            showStatus(`Reading ${links.length} link${links.length === 1 ? "" : "s"}\u2026`, "", false);
+        }, SLOW_MS);
         chrome.runtime.sendMessage({ type: "ripdl_offer", links, page: location.href }, (resp) => {
+            clearTimeout(slow);
+            if (seq !== offerSeq) return;
             // No daemon, no chip: silence beats an error bubble on a page.
-            if (chrome.runtime.lastError || !resp || !resp.groups || !resp.groups.length) return;
+            if (chrome.runtime.lastError || !resp || !resp.groups || !resp.groups.length) {
+                if (loading) dismiss();
+                return;
+            }
             offer = resp;
             editing = false;
             picks = null;
+            loading = false;
             render();
             arm();
         });
     }
 
-    /** Anchors inside the selection, then bare URLs from the selected text.
-     *
-     * An anchor only counts when its link text names a file ("x.part01.rar")
-     * or when the selection itself carries http(s) URLs - which is what tells
-     * "a list of parts" apart from prose that happens to contain a link. A
-     * page full of "Download" anchors must not turn every link into a part
-     * called "Download". */
+    /** Links from a copied selection, strongest first (a URL keeps its best tier):
+     *   1. anchors whose text names a file, and every anchor when the selected
+     *      text itself carries http(s) URLs (a pasted list of parts);
+     *   2. bare URLs in the copied text;
+     *   3. other anchors, marked weak. The service worker keeps a weak link only
+     *      when a plugin or the file-type list claims its URL, so a "Download"
+     *      button for a part is offered and a prose link is not. */
     function collect(sel, text) {
         const out = [];
         const seen = new Set();
-        const push = (raw, name) => {
+        const push = (raw, name, weak) => {
             const url = httpUrl(raw);
             if (!url || seen.has(url) || out.length >= MAX_LINKS) return;
             seen.add(url);
-            out.push({ url, name: name || "" });
+            out.push({ url, name: name || "", weak });
         };
         const textHasUrl = /https?:\/\//i.test(text);
+        const anchors = [];
         if (sel && sel.rangeCount) {
             const scratch = document.createElement("div");
             for (let i = 0; i < sel.rangeCount; i++) {
                 scratch.appendChild(sel.getRangeAt(i).cloneContents());
             }
-            scratch.querySelectorAll("a[href]").forEach((a) => {
-                const label = (a.textContent || "").trim();
-                const named = FILENAME_RE.test(label);
-                if (named || textHasUrl) push(a.href, named ? label : "");
-            });
+            anchors.push(...scratch.querySelectorAll("a[href]"));
         }
-        for (const m of text.matchAll(URL_RE)) push(trimPunctuation(m[0]), "");
+        for (const a of anchors) {
+            const label = (a.textContent || "").trim();
+            const named = FILENAME_RE.test(label);
+            if (named || textHasUrl) push(a.href, named ? label : "", false);
+        }
+        for (const m of text.matchAll(URL_RE)) push(trimPunctuation(m[0]), "", false);
+        for (const a of anchors) push(a.href, "", true);
         return out;
     }
 
@@ -131,6 +150,7 @@
     const ROW = "display: flex; align-items: center; gap: 6px; color: #3c4854;";
     const NOTE = "color: #8a6a2f; font-size: 11px;";
     const ERR = "color: #b02a2a; font-size: 11px;";
+    const QUIET = "color: #5b6772; font-size: 11px;";
     const ACTIONS = "display: flex; justify-content: flex-end; gap: 6px; margin-top: 2px;";
     const BTN = "flex: none; padding: 4px 10px; border: 1px solid #c3c9cf; border-radius: 4px; " +
         "background: #f1f3f5; cursor: pointer; " +
@@ -312,44 +332,47 @@
     function doSend() {
         const groups = payload();
         if (!groups.length) {
-            setStatus("nothing selected", true);
+            showStatus("nothing selected", "Nothing was queued.", true);
             return;
         }
-        setStatus("sending\u2026", false);
+        showStatus("sending\u2026", "", false);
         chrome.runtime.sendMessage({ type: "ripdl_offer_send", groups, page: location.href }, (resp) => {
             if (chrome.runtime.lastError || !resp || !resp.ok) {
-                setStatus("daemon unreachable", true);
+                showStatus("daemon unreachable", "Nothing was queued.", true);
                 return;
             }
-            const bits = [];
-            if (resp.bundles) bits.push(`${resp.bundles} bundle${resp.bundles === 1 ? "" : "s"}`);
-            if (resp.singles) bits.push(`${resp.singles} download${resp.singles === 1 ? "" : "s"}`);
-            if (resp.failed) bits.push(`${resp.failed} refused`);
-            if (resp.unresolved) bits.push(`${resp.unresolved} unresolved`);
-            setStatus(`queued ${bits.join(" + ") || "nothing"}`, !!resp.failed);
-            if (!resp.failed) setTimeout(dismiss, 1600);
+            // Links ripdl already had open their own window: the chip points there
+            // and stays until closed.
+            const queued = (resp.bundles || 0) + (resp.singles || 0);
+            const dupes = resp.duplicates || 0;
+            const note = resp.failed
+                ? "Some links were not queued."
+                : dupes ? "Choose what to do in the ripdl window." : "Look for the new row in ripdl.";
+            showStatus(queued ? `queued ${resp.summary}` : resp.summary, note, !!resp.failed);
+            if (!resp.failed && !dupes) setTimeout(dismiss, 1600);
         });
     }
 
-    function setStatus(text, bad) {
-        const box = root.querySelector("div");
-        if (!box) return;
-        box.textContent = "";
-        box.append(el("div", HEAD, text));
-        const note = el("div", bad ? ERR : "color: #5b6772; font-size: 11px;",
-            bad ? "Nothing was queued." : "Look for the new row in ripdl.");
+    /** One message in the chip: progress, a result, or an error. */
+    function showStatus(title, note, bad, ms) {
+        ensureChip();
+        root.textContent = "";
+        const box = el("div", BOX);
+        box.append(el("div", bad ? HEAD + "color: #b02a2a;" : HEAD, title));
+        if (note) box.append(el("div", bad ? ERR : QUIET, note));
         const row = el("div", ACTIONS);
         row.append(button("Close", BTN, "#e6eaee", dismiss));
-        box.append(note, row);
-        arm();
+        box.append(row);
+        root.append(box);
+        arm(ms);
         reposition();
     }
 
     /* --- lifecycle -------------------------------------------------------- */
 
-    function arm() {
+    function arm(ms = AUTO_DISMISS_MS) {
         clearTimeout(timer);
-        timer = setTimeout(dismiss, AUTO_DISMISS_MS);
+        timer = setTimeout(dismiss, ms);
     }
 
     function onKey(ev) {
@@ -358,6 +381,8 @@
 
     function dismiss() {
         clearTimeout(timer);
+        offerSeq++; // a reply still in flight must not reopen the chip
+        loading = false;
         if (host) {
             window.removeEventListener("scroll", reposition, true);
             window.removeEventListener("resize", reposition);
@@ -370,4 +395,13 @@
         picks = null;
         editing = false;
     }
+
+    /* --- menu feedback from the service worker ---------------------------- */
+
+    chrome.runtime.onMessage.addListener((msg) => {
+        if (msg?.type !== "ripdl_status" || typeof msg.text !== "string") return;
+        offerSeq++; // a pending copy reply must not replace this message
+        rememberAnchor(null, window.getSelection());
+        showStatus(msg.text, "", !!msg.bad, 6000);
+    });
 })();

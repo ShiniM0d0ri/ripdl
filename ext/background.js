@@ -21,7 +21,8 @@
 
 /* --- hoster plugins (user-loadable; see plugins.js) ------------------- */
 
-import { pluginNameFor, pluginResolve, registry, validateRecipe } from "./plugins.js";
+import { pluginMatches, pluginNameFor, pluginResolve, registry, validateRecipe } from "./plugins.js";
+import { filenameListener } from "./handoff.js";
 
 /** Fill in filenames a page never knew: a plugin may read a name carried in
  * the URL fragment, so grouping works before any network happens. */
@@ -41,29 +42,27 @@ async function nameLinks(links) {
 
 /** Resolve share links into direct ones at send time. A part that fails
  * (plugin errors, host refuses, no plugin) keeps its original URL - the
- * honest-fallback rule: queue it as-is rather than lose it. */
+ * honest-fallback rule: queue it as-is rather than lose it. `unresolved`
+ * counts only links an enabled plugin claimed but could not resolve. */
 async function resolveParts(parts) {
-    let resolved = 0;
     let unresolved = 0;
     const out = [];
     for (const p of parts) {
         let r = null;
         try { r = await pluginResolve(p); } catch { r = null; }
         if (r && r.url && r.url !== p.url) {
-            resolved++;
             out.push({
                 ...p,
                 url: r.url,
                 filename: r.name || p.filename,
                 headers: r.headers && typeof r.headers === "object" ? { ...p.headers, ...r.headers } : p.headers,
             });
-        } else {
-            if (r) { /* matched but returned the same URL */ resolved++; }
-            else { unresolved++; }
-            out.push(p);
+            continue;
         }
+        if (await pluginMatches(p.url, true)) unresolved++;
+        out.push(p);
     }
-    return { parts: out, resolved, unresolved };
+    return { parts: out, unresolved };
 }
 
 const HOST_NAME = "org.ripdl.host";
@@ -262,7 +261,8 @@ function httpOnly(url) {
     }
 }
 
-/** Keep only what the wire protocol needs: http(s), deduped, bounded. */
+/** Keep only what the wire protocol needs: http(s), deduped, bounded.
+ * `weak` marks a candidate the page only suggested (see capture.js). */
 function sanitizeLinks(list) {
     const out = [];
     const seen = new Set();
@@ -272,7 +272,17 @@ function sanitizeLinks(list) {
         if (!url || seen.has(url)) continue;
         seen.add(url);
         const raw = item && typeof item.name === "string" ? item.name.trim().slice(0, 200) : "";
-        out.push({ url, filename: raw || null });
+        out.push({ url, filename: raw || null, weak: !!(item && item.weak) });
+    }
+    return out;
+}
+
+/** Weak candidates (plain anchors in a copied selection) stay only when an
+ * enabled plugin or the built-in file-type list claims their URL. */
+async function keepRecognized(links) {
+    const out = [];
+    for (const l of links) {
+        if (!l.weak || (await pluginMatches(l.url))) out.push(l);
     }
     return out;
 }
@@ -340,6 +350,7 @@ async function sendGroups(groups, page) {
     let singles = 0;
     let failed = 0;
     let unresolved = 0;
+    const dupes = [];
     for (const g of Array.isArray(groups) ? groups : []) {
         const raw = (g.parts || [])
             .map((p) => ({
@@ -369,19 +380,40 @@ async function sendGroups(groups, page) {
             if (resp) daemonBundles = false;
         }
         for (const p of parts) {
-            if (await sendSingle(p)) singles++;
+            const r = await addOne(p.url, p.headers);
+            if (r.status === "added") singles++;
+            else if (r.status === "duplicate") dupes.push({ url: p.url, filename: p.filename || "", headers: p.headers || {}, task: r.task });
             else failed++;
         }
     }
-    return { ok: bundles + singles > 0, bundles, singles, failed, unresolved };
+    // Links ripdl already has: one window lists them, each with its own choices.
+    if (dupes.length) openDuplicateWindow({ items: dupes, browser: null }).catch(() => {});
+    const result = { ok: bundles + singles + dupes.length > 0, bundles, singles, duplicates: dupes.length, failed, unresolved };
+    return { ...result, summary: summarize(result) };
 }
 
-async function sendSingle(part) {
+/** What a send did, in a few words ("2 bundles + 1 download"). */
+function summarize(r) {
+    const bits = [];
+    if (r.bundles) bits.push(`${r.bundles} bundle${r.bundles === 1 ? "" : "s"}`);
+    if (r.singles) bits.push(`${r.singles} download${r.singles === 1 ? "" : "s"}`);
+    if (r.duplicates) bits.push(`${r.duplicates} already in ripdl`);
+    if (r.failed) bits.push(`${r.failed} refused`);
+    if (r.unresolved) bits.push(`${r.unresolved} not resolved`);
+    return bits.join(" + ") || "nothing";
+}
+
+/** One direct download. An existing copy comes back as `duplicate` (its own
+ * window lets the user choose) instead of being shared silently. */
+async function addOne(url, headers) {
     const resp = await send({
         id: `link-${nextId++}`,
-        cmd: { type: "add", url: part.url, dest_dir: null, headers: part.headers || {} },
+        cmd: { type: "add", url, dest_dir: null, headers: headers || {}, on_duplicate: "report" },
     });
-    return resp?.reply?.type === "added";
+    const reply = resp?.reply;
+    if (reply?.type === "added") return { status: "added", task: null };
+    if (reply?.type === "duplicate") return { status: "duplicate", task: reply.task ?? null };
+    return { status: "failed", task: null };
 }
 
 /** Popup and other UI poke us here; answer is mirrored via storage. */
@@ -396,21 +428,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "ripdl_offer") {
         // The copy chip: group the selection and describe it. Nothing is
         // queued here - the user still has to click Send.
-        (async () => {
-            const links = sanitizeLinks(msg.links);
-            if (!links.length) {
-                sendResponse({ groups: [], bundled: daemonBundles !== false });
-                return;
-            }
+        replyAsync(sendResponse, async () => {
+            const links = await keepRecognized(sanitizeLinks(msg.links));
+            if (!links.length) return { groups: [], bundled: daemonBundles !== false };
             const preview = await previewGroups(links);
-            sendResponse({ groups: preview.groups, bundled: preview.bundled, hostAlive });
-        })();
+            return { groups: preview.groups, bundled: preview.bundled, hostAlive };
+        });
         return true; // async reply
     }
     if (msg?.type === "ripdl_offer_send") {
-        (async () => {
-            sendResponse(await sendGroups(msg.groups, msg.page));
-        })();
+        replyAsync(sendResponse, () => sendGroups(msg.groups, msg.page));
         return true; // async reply
     }
     if (msg?.type === "ripdl_hunt_query") {
@@ -521,6 +548,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             return { ok: true, ...out };
         });
         return true;
+    }
+    if (msg?.type === "ripdl_dup_action" && typeof msg.key === "string") {
+        // Only the duplicate window may act on a stored job.
+        if (!String(sender?.url || "").startsWith(chrome.runtime.getURL("duplicate.html"))) {
+            sendResponse({ ok: false, error: "Not allowed." });
+            return;
+        }
+        replyAsync(sendResponse, () => duplicateAction(msg.key, Number(msg.index), String(msg.action)));
+        return true; // async reply
     }
     if (msg?.type === "ripdl_send" && msg.cmd && typeof msg.cmd.type === "string") {
         // Popup-initiated task add (hunt buttons). Same rejection contract:
@@ -655,138 +691,365 @@ function findRecord(item, ignoreContentLength) {
     return null;
 }
 
-/* --- capture: watch -> offer -> cancel (or let the browser proceed) ---- */
+/* --- capture: decide -> take the browser's copy (or let it proceed) --- */
 
-chrome.downloads.onDeterminingFilename.addListener(async (item, suggest) => {
+/** The daemon's verdict on this link: `{verdict: "new"|"duplicate", task}`,
+ * or null (keep the browser's copy). The browser's copy goes only on `new` or
+ * `duplicate`. */
+async function decideHandoff(item, ctx) {
+    if (takeOwnBrowserDownload(item)) return null; // ripdl handed this one back to the browser
     const { capture } = await settings();
-    if (!capture || !hostAlive) {
-        suggest();
-        return false;
-    }
-
-    const rec = findRecord(item, false);
+    if (!capture || !hostAlive) return null;
+    if (item.totalBytes > 0 && item.totalBytes < MIN_SEIZE_BYTES) return null; // small files: browser is fine.
+    let rec = findRecord(item, false);
     if (!rec) {
         // Possibly a service-worker download whose request details are still
         // arriving: wait once for the race, then decide.
-        return new Promise((resolve) => {
-            setTimeout(async () => {
-                const late = findRecord(item, true);
-                if (!late) {
-                    resolve(false);
-                    suggest(); // unknown origin: browser keeps it.
-                    return;
-                }
-                await seize(item, suggest, late);
-                resolve(true);
-            }, SW_RACE_WAIT_MS);
-        });
-    }
-    await seize(item, suggest, rec);
-    return true;
-});
-
-/** Offer the task to the daemon; accepted -> stop the browser's copy. */
-async function seize(item, suggest, rec) {
-    if (item.totalBytes > 0 && item.totalBytes < MIN_SEIZE_BYTES) {
-        suggest(); // below the floor: browser handles small files fine.
-        return;
+        await new Promise((resolve) => setTimeout(resolve, SW_RACE_WAIT_MS));
+        rec = findRecord(item, true);
+        if (!rec) return null; // unknown origin: browser keeps it.
     }
     const headers = await headersFor(item, rec);
-    const url = item.finalUrl || item.url;
-    const resp = await send({ id: `dl-${nextId++}`, cmd: { type: "add", url, dest_dir: null, headers } });
-    const accepted = resp?.reply?.type === "added";
-    if (!accepted) {
-        setHostAlive(!!resp); // a null reply means the host is gone.
-        suggest(); // daemon refused: the browser keeps its download.
-        return;
-    }
+    const proposal = `dl-${Date.now().toString(36)}-${nextId++}`;
+    if (!ctx.beginProposal(proposal)) return null; // the browser already kept it.
+    const resp = await send({
+        id: proposal,
+        cmd: {
+            type: "propose",
+            proposal,
+            url: item.finalUrl || item.url,
+            headers,
+            expected_bytes: item.totalBytes > 0 ? item.totalBytes : null,
+        },
+    });
+    setHostAlive(!!resp); // a null reply means the host is gone.
+    if (resp?.reply?.type !== "proposed") return null;
+    const { outcome, task } = resp.reply;
+    if (outcome === "new" || outcome === "duplicate") return { verdict: outcome, task: task ?? null, headers };
+    return null;
+}
+
+/** Cancel and erase the browser's copy. False when Chrome would not let go. */
+async function takeBrowserItem(item) {
     try {
         await chrome.downloads.cancel(item.id);
+    } catch {
+        return false;
+    }
+    try {
         await chrome.downloads.erase({ id: item.id });
     } catch {
-        // Already gone (service-worker races); erase-only is fine.
+        // Already gone (service-worker races): the cancel is what matters.
+    }
+    return true;
+}
+
+/** The browser kept its copy after a `new` answer: drop the daemon's task. */
+function abandonProposal(proposal) {
+    send({ id: `ab-${nextId++}`, cmd: { type: "abandon", proposal } }).catch(() => {});
+}
+
+/* --- duplicates: a small window lists what ripdl already has --------- */
+
+/** How long a duplicate window's job stays readable. */
+const DUP_JOB_TTL_MS = 15 * 60 * 1000;
+/** Links ripdl handed back to the browser ("Let browser download"), with the
+ * time each expires. The browser's own copy must not be seized again, or the
+ * choice would loop straight back into the window. */
+const BROWSER_OWN_TTL_MS = 60 * 1000;
+const browserOwned = new Map();
+
+function ownBrowserDownload(url) {
+    const now = Date.now();
+    for (const [known, until] of browserOwned) if (until <= now) browserOwned.delete(known);
+    browserOwned.set(url, now + BROWSER_OWN_TTL_MS);
+}
+
+/** True once for a download the browser started on ripdl's behalf. */
+function takeOwnBrowserDownload(item) {
+    for (const url of [item.url, item.finalUrl]) {
+        const until = url ? browserOwned.get(url) : undefined;
+        if (until === undefined) continue;
+        browserOwned.delete(url);
+        return until > Date.now();
+    }
+    return false;
+}
+
+/** A `duplicate` verdict on a browser download. The browser's copy is already
+ * stopped when `taken`; otherwise the browser keeps going and the window says so. */
+function onCaptureDuplicate(item, verdict, taken) {
+    openDuplicateWindow({
+        items: [{
+            url: item.finalUrl || item.url,
+            filename: item.filename || "",
+            headers: verdict.headers || {},
+            task: verdict.task ?? null,
+        }],
+        browser: { id: item.id, taken },
+    }).catch(() => {});
+}
+
+/** One window per send. Its job (rows, choices, the browser copy) lives in
+ * session storage, is never sent to a page, and is dropped when the window closes. */
+async function openDuplicateWindow(job) {
+    const key = `${Date.now().toString(36)}-${nextId++}`;
+    const slot = `dup:${key}`;
+    const cutoff = Date.now() - DUP_JOB_TTL_MS;
+    const stored = await chrome.storage.session.get(null);
+    const stale = Object.keys(stored).filter((k) => k.startsWith("dup:") && (stored[k]?.createdAt || 0) < cutoff);
+    if (stale.length) await chrome.storage.session.remove(stale);
+    await chrome.storage.session.set({ [slot]: { ...job, createdAt: Date.now() } });
+    const win = await chrome.windows.create({
+        url: chrome.runtime.getURL(`duplicate.html?key=${key}`),
+        type: "popup",
+        width: 480,
+        height: Math.min(640, 210 + 116 * Math.min(job.items.length, 4)),
+        focused: true,
+    });
+    const saved = (await chrome.storage.session.get(slot))[slot];
+    if (saved) await chrome.storage.session.set({ [slot]: { ...saved, windowId: win.id } });
+}
+
+chrome.windows.onRemoved.addListener((windowId) => {
+    chrome.storage.session.get(null).then((all) => {
+        const gone = Object.keys(all).filter((k) => k.startsWith("dup:") && all[k]?.windowId === windowId);
+        if (gone.length) return chrome.storage.session.remove(gone);
+    }).catch(() => {});
+});
+
+/** One request to the daemon on behalf of the duplicate window. */
+function ask(cmd) {
+    return send({ id: `dup-${nextId++}`, cmd });
+}
+
+/** The daemon's answer, as the window's answer. */
+function outcomeOf(resp, okMessage) {
+    const type = resp?.reply?.type;
+    if (type === "ok" || type === "added") return { ok: true, message: okMessage };
+    if (type === "error") return { ok: false, error: resp.reply.message || "ripdl could not do that." };
+    return { ok: false, error: "ripdl is not running." };
+}
+
+/** "Let browser download": Chrome fetches the link itself. The URL is marked
+ * first, so the handoff gives that one download back to the browser. */
+async function startBrowserCopy(url) {
+    if (!httpOnly(url)) return { ok: false, error: "The browser cannot fetch this link." };
+    ownBrowserDownload(url);
+    try {
+        await chrome.downloads.download({ url });
+        return { ok: true, message: "The browser is downloading it." };
+    } catch {
+        browserOwned.delete(url);
+        return { ok: false, error: "The browser refused the download." };
     }
 }
 
+/** The window's choice for row `index` of job `key`. The window only names a
+ * row and a choice; the URL, headers and task come from the stored job. */
+async function duplicateAction(key, index, action) {
+    const slot = `dup:${key}`;
+    const job = (await chrome.storage.session.get(slot))[slot];
+    const item = job?.items?.[index];
+    if (!item) return { ok: false, error: "This choice has expired. Start the download again." };
+    // The browser's copy, while it still runs: a ripdl choice stops it below.
+    const browser = job.browser && !job.browser.taken ? job.browser : null;
+    if (action === "browser") {
+        if (browser) return { ok: true, message: "The browser keeps its copy." };
+        return startBrowserCopy(item.url);
+    }
+    const taskId = item.task?.id || null;
+    let out;
+    if (action === "copy") {
+        out = outcomeOf(
+            await ask({ type: "add", url: item.url, dest_dir: null, headers: item.headers || {}, on_duplicate: "copy" }),
+            "Downloading a second copy.",
+        );
+    } else if (!taskId) {
+        return { ok: false, error: "ripdl no longer has this download." };
+    } else if (action === "keep") {
+        const listed = await ask({ type: "list" });
+        const exists = (listed?.reply?.tasks || []).some((t) => t.id === taskId);
+        out = exists
+            ? { ok: true, message: "Kept ripdl's download." }
+            : { ok: false, error: "ripdl no longer has this download." };
+    } else if (action === "open" || action === "reveal") {
+        out = outcomeOf(
+            await ask({ type: "open", id: taskId, folder: action === "reveal" }),
+            action === "reveal" ? "Shown in its folder." : "Opened.",
+        );
+    } else if (action === "resume") {
+        out = outcomeOf(await ask({ type: "resume", id: taskId }), "Resumed.");
+    } else {
+        return { ok: false, error: "Unknown choice." };
+    }
+    if (!out.ok || !browser) return out;
+    // ripdl has the file now: the browser's copy stops, so the bytes come once.
+    if (await takeBrowserItem({ id: browser.id })) {
+        job.browser.taken = true;
+        await chrome.storage.session.set({ [slot]: job });
+    } else {
+        out.message = `${out.message} The browser's copy could not be stopped.`;
+    }
+    return out;
+}
+
+chrome.downloads.onDeterminingFilename.addListener(
+    filenameListener({
+        decide: decideHandoff,
+        takeItem: takeBrowserItem,
+        abandon: abandonProposal,
+        onDuplicate: onCaptureDuplicate,
+    }),
+);
+
 /* --- selection / all-links: on-demand scripting, never resident ------- */
 
-/** Injected at menu-click time; collects links absolutely. Anchor text is
+/** Injected at menu-click time, so it must be self-contained. Anchor text is
  * kept only when it names a file: a page full of "Download" anchors must not
- * turn every link into a part called "Download". */
-function collectLinksInView(mode) {
+ * turn every link into a part called "Download". Bare URLs count too: a list
+ * pasted as plain text has no anchors at all. */
+function collectLinksInView(mode, selectedText) {
     const FILENAME_RE = /^[^\\/:*?"<>|\r\n]{1,120}\.[A-Za-z0-9]{1,8}$/;
+    const URL_RE = /https?:\/\/[^\s<>"'`]+/gi;
     const seen = new Set();
     const links = [];
-    const push = (a) => {
+    const add = (raw, name) => {
         try {
-            const u = new URL(a.href, document.baseURI);
+            const u = new URL(raw, document.baseURI);
             if (u.protocol !== "http:" && u.protocol !== "https:") return;
             if (seen.has(u.href) || links.length >= 100) return;
             seen.add(u.href);
-            const text = (a.textContent || "").trim();
-            links.push({ url: u.href, name: FILENAME_RE.test(text) ? text : "" });
+            links.push({ url: u.href, name: name || "" });
         } catch {
             // unresolvable href: skip
         }
     };
-    if (mode === "selection") {
-        const sel = window.getSelection();
-        if (sel && sel.rangeCount) {
-            // Selection ranges must be cloned into a scratch node to expose
-            // their anchor elements (apply-to-selection standard technique).
-            const scratch = document.createElement("div");
-            for (let i = 0; i < sel.rangeCount; ++i) {
-                scratch.appendChild(sel.getRangeAt(i).cloneContents());
-            }
-            scratch.querySelectorAll("a[href]").forEach(push);
+    const addAnchor = (a) => {
+        const text = (a.textContent || "").trim();
+        add(a.href, FILENAME_RE.test(text) ? text : "");
+    };
+    if (mode !== "selection") {
+        document.querySelectorAll("a[href]").forEach(addAnchor);
+        return { links };
+    }
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount) {
+        // Selection ranges must be cloned into a scratch node to expose
+        // their anchor elements (apply-to-selection standard technique).
+        const scratch = document.createElement("div");
+        for (let i = 0; i < sel.rangeCount; ++i) {
+            scratch.appendChild(sel.getRangeAt(i).cloneContents());
         }
-    } else {
-        document.querySelectorAll("a[href]").forEach(push);
+        scratch.querySelectorAll("a[href]").forEach(addAnchor);
+    }
+    // Text typed into a field is not part of the document selection.
+    const field = document.activeElement;
+    const inField = !!field && (field.tagName === "INPUT" || field.tagName === "TEXTAREA")
+        && typeof field.selectionStart === "number";
+    const fieldText = inField ? field.value.slice(field.selectionStart, field.selectionEnd) : "";
+    for (const m of (fieldText || String(selectedText || "")).matchAll(URL_RE)) {
+        add(m[0].replace(/[.,;:!?]+$/, "").replace(/[)\]}>]+$/, ""), "");
     }
     return { links };
 }
 
 /* --- context menu: explicit, on-demand handoff ------------------------ */
 
-chrome.contextMenus.onClicked.addListener(async (info) => {
-    if (info.menuItemId === "ripdl-selection" || info.menuItemId === "ripdl-all-links") {
-        const mode = info.menuItemId === "ripdl-selection" ? "selection" : "all";
-        if (!info.tabId) return;
-        let links = [];
-        try {
-            const [{ result }] = await chrome.scripting.executeScript({
-                target: { tabId: info.tabId },
-                func: collectLinksInView,
-                args: [mode],
-            });
-            links = (result && result.links) || [];
-        } catch {
-            // chrome:// or protected pages: scripting is refused; stay quiet.
-            setBadge("!");
-            setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
-            return;
-        }
-        if (!links.length) {
-            setBadge("0");
-            setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
-            return;
-        }
-        // An offer, not a pile: group it exactly the way the copy chip does,
-        // so twelve parts become one task with one folder.
-        const preview = await previewGroups(sanitizeLinks(links));
-        const res = await sendGroups(preview.groups, info.pageUrl);
-        // The badge counts what ripdl gained: bundles are one row each.
-        setBadge(String(res.bundles + res.singles));
-        setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
+/** Tell the page what happened, as a chip line. Protected pages have no
+ * content script, so a failed delivery is simply ignored. */
+function pageStatus(tabId, text, bad) {
+    if (tabId < 0) return;
+    chrome.tabs.sendMessage(tabId, { type: "ripdl_status", text, bad: !!bad }).catch(() => {});
+}
+
+/** Show a short badge result, then the liveness marker again. */
+function flashBadge(text) {
+    setBadge(text);
+    setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
+}
+
+/** One result for a menu send: the page line and the badge. */
+function reportSend(tabId, res) {
+    const done = res ? res.bundles + res.singles : 0;
+    const dupes = res ? res.duplicates || 0 : 0;
+    const text = done ? `Queued ${res.summary}` : dupes ? `${res.summary}: choose in the ripdl window` : "Nothing was queued";
+    pageStatus(tabId, text, (!done && !dupes) || !!res?.failed);
+    // The badge counts what ripdl gained: a bundle is one row. "=" marks links ripdl already had.
+    flashBadge(done ? String(done) : dupes ? "=" : (hostAlive ? "!" : "off"));
+}
+
+/** Selection and all-links: read the page on demand, then queue the groups
+ * the same way the copy chip would. */
+async function queueFromPage(tabId, info, mode) {
+    if (tabId < 0) return;
+    setBadge("...");
+    let links = [];
+    try {
+        const [{ result }] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: collectLinksInView,
+            args: [mode, info.selectionText || ""],
+        });
+        links = (result && result.links) || [];
+    } catch {
+        // chrome:// or protected pages: scripting is refused.
+        flashBadge("!");
         return;
     }
+    if (!links.length) {
+        pageStatus(tabId, mode === "selection" ? "No links found in the selection" : "No links found on this page", true);
+        flashBadge("0");
+        return;
+    }
+    pageStatus(tabId, `Queuing ${links.length} link${links.length === 1 ? "" : "s"}\u2026`, false);
+    try {
+        // Grouped like the copy chip: twelve parts become one task, one folder.
+        const preview = await previewGroups(sanitizeLinks(links));
+        reportSend(tabId, await sendGroups(preview.groups, info.pageUrl));
+    } catch {
+        reportSend(tabId, null);
+    }
+}
 
-    const url = info.linkUrl || info.pageUrl;
-    if (!url) return;
-    const resp = await send({ id: `ctx-${nextId++}`, cmd: { type: "add", url, dest_dir: null, headers: {} } });
-    const accepted = resp?.reply?.type === "added";
-    setBadge(accepted ? "1" : "off");
-    setTimeout(() => setBadge(hostAlive ? "" : "off"), 1500);
+/** Single link: the same pipeline as a selection, so a share link is resolved
+ * to its file rather than queued as the web page behind it. */
+async function queueLink(tabId, info) {
+    const links = sanitizeLinks([info.linkUrl]);
+    if (!links.length) {
+        reportSend(tabId, null);
+        return;
+    }
+    setBadge("...");
+    try {
+        const preview = await previewGroups(links);
+        reportSend(tabId, await sendGroups(preview.groups, info.pageUrl));
+    } catch {
+        reportSend(tabId, null);
+    }
+}
+
+chrome.contextMenus.onClicked.addListener(async (info) => {
+    const tabId = typeof info.tabId === "number" ? info.tabId : -1;
+    if (info.menuItemId === "ripdl-selection" || info.menuItemId === "ripdl-all-links") {
+        await queueFromPage(tabId, info, info.menuItemId === "ripdl-selection" ? "selection" : "all");
+        return;
+    }
+    if (info.menuItemId === "ripdl-link" && info.linkUrl) {
+        await queueLink(tabId, info);
+        return;
+    }
+    if (info.menuItemId === "ripdl-page" && info.pageUrl) {
+        setBadge("...");
+        const r = await addOne(info.pageUrl, {});
+        const accepted = r.status === "added";
+        const dupe = r.status === "duplicate";
+        if (dupe) {
+            openDuplicateWindow({ items: [{ url: info.pageUrl, filename: "", headers: {}, task: r.task }], browser: null }).catch(() => {});
+        }
+        pageStatus(tabId, accepted ? "Queued 1 download" : dupe ? "Already in ripdl: choose in the ripdl window" : "Nothing was queued", !accepted && !dupe);
+        flashBadge(accepted ? "1" : dupe ? "=" : (hostAlive ? "!" : "off"));
+    }
 });
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -804,6 +1067,11 @@ chrome.runtime.onInstalled.addListener(() => {
         id: "ripdl-selection",
         title: "Download selected links with ripdl",
         contexts: ["selection"],
+    });
+    chrome.contextMenus.create({
+        id: "ripdl-all-links",
+        title: "Download all links on this page with ripdl",
+        contexts: ["page"],
     });
 });
 

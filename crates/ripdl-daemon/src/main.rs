@@ -1,6 +1,6 @@
 ﻿use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,8 +11,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use ripdl_core::rpc::{
-    BundlePart, Command, ExtensionStatus, LanInfo, LanSendInfo, Reply, Request, Response,
-    TaskDetailsSnapshot, TaskInfo, DEFAULT_PORT,
+    BundlePart, Command, DuplicatePolicy, ExtensionStatus, LanInfo, LanSendInfo, ProposalOutcome,
+    Reply, Request, Response, TaskDetailsSnapshot, TaskInfo,
 };
 use ripdl_core::task::{Progress, TaskKind, TaskState};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
@@ -38,6 +38,10 @@ struct TaskRecord {
     /// Resolved output file once a tool produced one (completion-time).
     #[serde(default)]
     dest_file: Option<PathBuf>,
+    /// Fixed output name for a "download again" copy (see `free_copy_name`).
+    /// None = the engine plans the name from the server's headers.
+    #[serde(default)]
+    output_name: Option<String>,
     /// Final byte counters, kept so boot-restored records still show a
     /// size/percent in the UI after a daemon restart.
     #[serde(default)]
@@ -204,6 +208,9 @@ fn window_rate(window: &VecDeque<(Instant, u64)>) -> Option<f64> {
 
 struct Daemon {
     port: u16,
+    /// Per-start secret every RPC connection must present first. Written to
+    /// `rpc.token` only after the TCP endpoint is ours (see `run`).
+    rpc_token: String,
     queue_path: PathBuf,
     /// Where the settings file lives (kept so SetConfig can persist).
     config_path: PathBuf,
@@ -257,7 +264,29 @@ struct Daemon {
     /// Outgoing LAN copies, newest last. Volatile: a LAN copy is not a queue
     /// task, so a daemon restart simply forgets finished ones.
     lan_sends: Mutex<Vec<Arc<Mutex<LanSendState>>>>,
+    /// Browser handoffs by the extension's proposal id (see `cmd_propose`).
+    proposals: Mutex<HashMap<String, Proposal>>,
 }
+
+/// A browser handoff, keyed by the extension's proposal id.
+struct Proposal {
+    at: Instant,
+    state: ProposalState,
+}
+
+enum ProposalState {
+    /// Probe running; no task yet.
+    Pending,
+    /// Queued for this proposal: an abandon removes that task.
+    Taken(String),
+    /// An abandon arrived first (or while probing): a late propose is refused.
+    Abandoned,
+}
+
+/// Probe budget for one handoff; the extension gives up after about 3 s.
+const PROPOSAL_PROBE: Duration = Duration::from_secs(2);
+/// How long a handoff keeps its state, so a late abandon still finds it.
+const PROPOSAL_TTL: Duration = Duration::from_secs(60);
 
 /// Live state of one outgoing LAN copy.
 struct LanSendState {
@@ -300,7 +329,8 @@ impl Daemon {
         };
 
         Ok(Self {
-            port: DEFAULT_PORT,
+            port: ripdl_core::transport::rpc_port(),
+            rpc_token: ripdl_core::transport::generate_token(),
             queue_path,
             config_path,
             extension_status_path,
@@ -325,6 +355,7 @@ impl Daemon {
             update_busy: std::sync::atomic::AtomicBool::new(false),
             lan: tokio::sync::Mutex::new(None),
             lan_sends: Mutex::new(Vec::new()),
+            proposals: Mutex::new(HashMap::new()),
         })
     }
 
@@ -782,19 +813,22 @@ impl Daemon {
     /// daemon also serves a named pipe (locally-isolated, port-free); clients
     /// try the pipe first and fall back to this TCP socket.
     async fn run(self: Arc<Self>) -> Result<()> {
+        // TCP is the single-instance gate: a second daemon fails here before
+        // it can touch the pipe, the unix socket file or the token file.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
+            .await
+            .with_context(|| format!("cannot bind 127.0.0.1:{} (is the daemon already running?)", self.port))?;
+        ripdl_core::transport::write_rpc_token(&self.rpc_token)
+            .context("cannot write the daemon token (rpc.token)")?;
         {
             let daemon = Arc::clone(&self);
             // Windows: named pipe. Unix: domain socket. Both feed the same
-            // generic connection handler; TCP below is the universal
-            // fallback.
+            // authenticated connection handler; TCP is the universal fallback.
             #[cfg(windows)]
             tokio::spawn(daemon.pipe_accept_loop());
             #[cfg(not(windows))]
             tokio::spawn(daemon.unix_accept_loop());
         }
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, self.port))
-            .await
-            .with_context(|| format!("cannot bind 127.0.0.1:{} (is the daemon already running?)", self.port))?;
         tracing::info!(port = self.port, "ripdl daemon listening");
 
         loop {
@@ -845,6 +879,7 @@ impl Daemon {
         }
         let snapshot = self.records.lock().unwrap().clone();
         let _ = self.persist(&snapshot);
+        ripdl_core::transport::clear_rpc_token(&self.rpc_token);
         tracing::info!("ripdl daemon stopped");
         Ok(())
     }
@@ -901,9 +936,10 @@ impl Daemon {
     async fn pipe_accept_loop(self: Arc<Self>) {
         use tokio::net::windows::named_pipe::ServerOptions;
 
+        let pipe = ripdl_core::transport::pipe_name();
         let first = match ServerOptions::new()
             .first_pipe_instance(true)
-            .create(ripdl_core::transport::PIPE_NAME)
+            .create(&pipe)
         {
             Ok(s) => s,
             Err(e) => {
@@ -917,13 +953,11 @@ impl Daemon {
             if let Err(e) = cur.connect().await {
                 tracing::warn!(error = %e, "pipe accept failed");
                 // Recycle an instance so clients don't see a hole.
-                next = ServerOptions::new().create(ripdl_core::transport::PIPE_NAME).ok();
+                next = ServerOptions::new().create(&pipe).ok();
                 continue;
             }
             // Reserve the next instance BEFORE serving this connection.
-            next = ServerOptions::new()
-                .create(ripdl_core::transport::PIPE_NAME)
-                .ok();
+            next = ServerOptions::new().create(&pipe).ok();
             let daemon = Arc::clone(&self);
             tokio::spawn(async move {
                 if let Err(e) = daemon.handle_conn(cur).await {
@@ -936,6 +970,24 @@ impl Daemon {
     async fn handle_conn(self: Arc<Self>, stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin) -> Result<()> {
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
+
+        // Every connection opens with the daemon token (see
+        // `transport::auth_line`). Anything else gets one refusal with id 0
+        // and is closed before any command is read.
+        let authorized = match lines.next_line().await? {
+            Some(first) => ripdl_core::transport::auth_matches(first.trim(), &self.rpc_token),
+            None => false,
+        };
+        if !authorized {
+            let refusal = Response {
+                id: 0,
+                reply: Reply::Error { message: "unauthorized".to_string() },
+            };
+            let mut out = serde_json::to_string(&refusal).context("serialize response")?;
+            out.push('\n');
+            write.write_all(out.as_bytes()).await?;
+            return Ok(());
+        }
 
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
@@ -967,8 +1019,8 @@ impl Daemon {
 
     async fn dispatch(self: &Arc<Self>, req: Request) -> Response {
         match req.cmd {
-            Command::Add { url, dest_dir, headers, start_at, kind, sequential, only_files } => {
-                self.cmd_add(req.id, url, dest_dir, headers, start_at, kind, sequential, only_files)
+            Command::Add { url, dest_dir, headers, start_at, kind, sequential, only_files, on_duplicate } => {
+                self.cmd_add(req.id, url, dest_dir, headers, start_at, kind, sequential, only_files, on_duplicate)
             }
             Command::TorrentPreview { payload } => {
                 self.cmd_torrent_preview(req.id, &payload).await
@@ -990,9 +1042,14 @@ impl Daemon {
             }
             Command::Pause { id } => self.cmd_pause(req.id, &id).await,
             Command::Resume { id } => self.cmd_resume(req.id, &id),
+            Command::Open { id, folder } => self.cmd_open(req.id, &id, folder),
             Command::Remove { id, delete_files } => {
                 self.cmd_remove(req.id, &id, delete_files).await
             }
+            Command::Propose { proposal, url, headers, expected_bytes } => {
+                self.cmd_propose(req.id, proposal, url, headers, expected_bytes).await
+            }
+            Command::Abandon { proposal } => self.cmd_abandon(req.id, &proposal).await,
             Command::Shutdown => {
                 self.shutdown.notify_waiters();
                 Response { id: req.id, reply: Reply::Ok }
@@ -1391,12 +1448,12 @@ impl Daemon {
         if !info.update_available {
             bail!("already on the latest release (v{})", info.current);
         }
-        let setup = info.setup.as_ref()
-            .context("the new release has no Windows setup.exe attached")?;
+        // Both the installer and its checksum, or no install at all.
+        let (setup, sums) = ripdl_core::update::plan_install(&info)?;
         let update_dir = ripdl_core::update::update_dir(
             self.config_path.parent().unwrap_or(&std::env::temp_dir()),
         );
-        let path = ripdl_core::update::download_setup(&update_dir, setup, info.sha256.as_ref())
+        let verified = ripdl_core::update::download_setup(&update_dir, setup, sums)
             .await
             .context("installer download failed")?;
         // The installer force-kills us by image name (it can no longer kill
@@ -1419,8 +1476,12 @@ impl Daemon {
                 token.cancel();
             }
         }
-        tracing::info!(path = %path.display(), "launching upgrade installer");
-        ripdl_core::update::run_installer(&path, silent)
+        // Re-check the bytes just before launch. The held handle shares read
+        // access only, so the file cannot be replaced while it is open.
+        let _held = ripdl_core::update::open_verified(&verified.path, &verified.sha256)
+            .context("installer check before launch failed")?;
+        tracing::info!(path = %verified.path.display(), "launching upgrade installer");
+        ripdl_core::update::run_installer(&verified.path, silent)
             .context("failed to launch installer")
     }
 
@@ -1906,7 +1967,46 @@ impl Daemon {
         kind: TaskKind,
         sequential: bool,
         only_files: Option<Vec<usize>>,
+        on_duplicate: DuplicatePolicy,
     ) -> Response {
+        let reply = match self.enqueue(
+            url,
+            dest_dir,
+            headers,
+            start_at,
+            kind,
+            sequential,
+            only_files,
+            on_duplicate,
+        ) {
+            Ok(Enqueued::New(id)) => Reply::Added { id },
+            Ok(Enqueued::Existing(id)) if on_duplicate == DuplicatePolicy::Report => {
+                match self.task_info_for(&id) {
+                    Some(task) => Reply::Duplicate { task },
+                    None => Reply::Error {
+                        message: "the existing download was removed; add it again".to_string(),
+                    },
+                }
+            }
+            Ok(Enqueued::Existing(id)) => Reply::Added { id },
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
+    }
+
+    /// Queue one HTTP, video, torrent or copy task. What an identical existing
+    /// download means is up to `policy` (see `DuplicatePolicy`).
+    fn enqueue(
+        self: &Arc<Self>,
+        url: String,
+        dest_dir: Option<PathBuf>,
+        headers: std::collections::HashMap<String, String>,
+        start_at: Option<i64>,
+        kind: TaskKind,
+        sequential: bool,
+        only_files: Option<Vec<usize>>,
+        policy: DuplicatePolicy,
+    ) -> Result<Enqueued, String> {
         // Tasks without an explicit destination land in the user's Downloads
         // folder - never in the daemon's working directory.
         let dest_dir = dest_dir
@@ -1916,7 +2016,7 @@ impl Daemon {
         // double-download into one file (sidecar trample = corrupt output).
         // Re-adding shares the existing task instead.
         let id = uuid::Uuid::new_v4().to_string();
-        let rec = TaskRecord {
+        let mut rec = TaskRecord {
             id: id.clone(),
             url: url.clone(),
             dest_dir,
@@ -1926,6 +2026,7 @@ impl Daemon {
             start_at,
             kind,
             dest_file: None,
+            output_name: None,
             downloaded: 0,
             total: None,
             info_hash: None,
@@ -1945,26 +2046,26 @@ impl Daemon {
             // concurrent same-URL adds (browser retry / double dialog
             // submit) must not both pass the check and both insert.
             let mut records = self.records.lock().unwrap();
-            if kind == TaskKind::Torrent {
-                // Torrents additionally dedupe across destinations: the daemon
-                // runs ONE rqbit session where a payload maps to a single
-                // ManagedTorrent (one output folder), so two same-payload tasks
-                // would fight over the same handle - share the existing task.
-                if let Some(r) = records
-                    .iter()
-                    .find(|r| r.kind == TaskKind::Torrent && r.url.trim() == url.trim())
-                {
-                    return Response {
-                        id: req_id,
-                        reply: Reply::Added { id: r.id.clone() },
-                    };
+            if policy == DuplicatePolicy::Copy {
+                // A copy is a second file beside the first, so it never meets
+                // the duplicate check. It gets a name nothing else uses.
+                rec.output_name = Some(copy_output_name(&records, &url, &rec.dest_dir, kind)?);
+            } else {
+                if kind == TaskKind::Torrent {
+                    // Torrents additionally dedupe across destinations: the daemon
+                    // runs ONE rqbit session where a payload maps to a single
+                    // ManagedTorrent (one output folder), so two same-payload tasks
+                    // would fight over the same handle - share the existing task.
+                    if let Some(r) = records
+                        .iter()
+                        .find(|r| r.kind == TaskKind::Torrent && r.url.trim() == url.trim())
+                    {
+                        return Ok(Enqueued::Existing(r.id.clone()));
+                    }
                 }
-            }
-            if let Some(id) = duplicate_task(&records, &url, &rec.dest_dir, kind) {
-                return Response {
-                    id: req_id,
-                    reply: Reply::Added { id },
-                };
+                if let Some(existing) = duplicate_task(&records, &url, &rec.dest_dir, kind) {
+                    return Ok(Enqueued::Existing(existing));
+                }
             }
             records.push(rec.clone());
             let snapshot = records.clone();
@@ -1972,7 +2073,140 @@ impl Daemon {
             let _ = self.persist(&snapshot);
         }
         self.spawn_runner(rec);
-        Response { id: req_id, reply: Reply::Added { id } }
+        Ok(Enqueued::New(id))
+    }
+
+    /// The current view of one task, for the `Duplicate` answers. Lock order
+    /// records -> progress, as in `cmd_list`.
+    fn task_info_for(&self, id: &str) -> Option<TaskInfo> {
+        let records = self.records.lock().unwrap();
+        let progress = self.progress.lock().unwrap();
+        records.iter().find(|r| r.id == id).map(|r| task_info_of(r, &progress))
+    }
+
+    /// Open a task's file, or reveal it in its folder (`Command::Open`). Only
+    /// the path the task itself recorded is ever handed to the shell.
+    fn cmd_open(&self, req_id: u64, id: &str, folder: bool) -> Response {
+        let file = {
+            let records = self.records.lock().unwrap();
+            records.iter().find(|r| r.id == id).map(|r| r.dest_file.clone())
+        };
+        let reply = match file {
+            None => Reply::Error { message: format!("no task {id}") },
+            Some(None) => Reply::Error { message: "this download has no file yet".to_string() },
+            Some(Some(path)) if !path.exists() => Reply::Error {
+                message: format!("the file is gone: {}", path.display()),
+            },
+            Some(Some(path)) => match open_in_shell(&path, folder) {
+                Ok(()) => Reply::Ok,
+                Err(e) => Reply::Error { message: format!("cannot open {}: {e}", path.display()) },
+            },
+        };
+        Response { id: req_id, reply }
+    }
+
+    /// Browser handoff, step 1 (`Command::Propose`). The probe carries the
+    /// browser's headers and the size it saw, so a link that answers
+    /// differently for ripdl (cookie-gated, another file) is refused before
+    /// the browser's copy is cancelled. Only `new` means "take it"; `duplicate`
+    /// asks the user first (see `Reply::Proposed`).
+    async fn cmd_propose(
+        self: &Arc<Self>,
+        req_id: u64,
+        proposal: String,
+        url: String,
+        headers: std::collections::HashMap<String, String>,
+        expected_bytes: Option<u64>,
+    ) -> Response {
+        // The claim covers the probe. A duplicate id is refused without
+        // touching the claim that already owns it.
+        let claimed = begin_proposal(&mut self.proposals.lock().unwrap(), &proposal, Instant::now());
+        if let Err(why) = claimed {
+            return refused(req_id, why);
+        }
+        let total = match self.probe_total(&url, &headers).await {
+            Ok(total) => total,
+            Err(why) => return self.release_refused(req_id, &proposal, why),
+        };
+        if let (Some(expected), Some(total)) = (expected_bytes, total) {
+            if expected != total {
+                let why = format!("size differs: browser saw {expected} bytes, server says {total}");
+                return self.release_refused(req_id, &proposal, why);
+            }
+        }
+        let mut map = self.proposals.lock().unwrap();
+        // An abandon that arrived during the probe wins: the browser kept its copy.
+        if matches!(map.get(&proposal).map(|p| &p.state), Some(ProposalState::Abandoned)) {
+            map.remove(&proposal);
+            return refused(req_id, "abandoned while probing");
+        }
+        // A duplicate is an answer, not a refusal: the extension shows the
+        // choice, and the browser keeps its copy until the user decides.
+        match self.enqueue(url, None, headers, None, TaskKind::Http, false, None, DuplicatePolicy::Report) {
+            Ok(Enqueued::New(id)) => {
+                let state = ProposalState::Taken(id.clone());
+                map.insert(proposal, Proposal { at: Instant::now(), state });
+                Response {
+                    id: req_id,
+                    reply: Reply::Proposed {
+                        outcome: ProposalOutcome::New,
+                        id: Some(id),
+                        reason: None,
+                        task: None,
+                    },
+                }
+            }
+            Ok(Enqueued::Existing(id)) => {
+                // Not queued by this proposal: an abandon must not remove it.
+                map.remove(&proposal);
+                let task = self.task_info_for(&id);
+                Response {
+                    id: req_id,
+                    reply: Reply::Proposed {
+                        outcome: ProposalOutcome::Duplicate,
+                        id: Some(id),
+                        reason: None,
+                        task,
+                    },
+                }
+            }
+            Err(why) => {
+                map.remove(&proposal);
+                refused(req_id, why)
+            }
+        }
+    }
+
+    /// The size `url` reports with the browser's headers, or why it could not
+    /// say in time. Bounded by `PROPOSAL_PROBE`.
+    async fn probe_total(
+        &self,
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<u64>, String> {
+        let engine = Engine::new(self.engine_config(headers, false)).map_err(|e| e.to_string())?;
+        match tokio::time::timeout(PROPOSAL_PROBE, engine.plan(url)).await {
+            Ok(Ok(plan)) => Ok(plan.total),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("the server did not answer in time".to_string()),
+        }
+    }
+
+    /// A `refused` answer that also releases the claim on `proposal`.
+    fn release_refused(&self, req_id: u64, proposal: &str, why: String) -> Response {
+        self.proposals.lock().unwrap().remove(proposal);
+        refused(req_id, why)
+    }
+
+    /// Browser handoff, step 2 (`Command::Abandon`). The browser kept its copy,
+    /// so the task a `new` propose queued goes, files included. An abandon that
+    /// arrives first leaves a tombstone that refuses the late propose.
+    async fn cmd_abandon(self: &Arc<Self>, req_id: u64, proposal: &str) -> Response {
+        let taken = abandon_proposal(&mut self.proposals.lock().unwrap(), proposal, Instant::now());
+        if let Some(id) = taken {
+            let _ = self.cmd_remove(req_id, &id, true).await;
+        }
+        Response { id: req_id, reply: Reply::Ok }
     }
 
     /// Queue one bundle: every link becomes a part of a single task that owns
@@ -2055,6 +2289,7 @@ impl Daemon {
             start_at,
             kind: TaskKind::Bundle,
             dest_file: None,
+            output_name: None,
             downloaded: 0,
             total: None,
             info_hash: None,
@@ -2676,81 +2911,7 @@ impl Daemon {
 
         let tasks = records
             .iter()
-            .map(|r| {
-                // A parked task keeps its last sample for resume bookkeeping,
-                // but reporting it as a live rate prints bandwidth that is not
-                // moving (and inflates a frontend's total-speed strip).
-                let live = matches!(r.state, TaskState::Running | TaskState::Queued);
-                // No sample yet on a live task: the engine is still probing the
-                // URL and planning segments (HTTP/video only - a torrent has
-                // its own metadata state).
-                let probing = live && r.kind != TaskKind::Torrent && !progress.contains_key(&r.id);
-                // Bundle rows: how many parts are done and how many the
-                // numbering proves exist (0 = the selection does not say).
-                let (parts_done, parts_total, parts_missing) = if r.kind == TaskKind::Bundle {
-                    let seqs: Vec<Option<u32>> = r.parts.iter().map(|p| p.seq).collect();
-                    let (_, total, missing) = ripdl_core::bundle::numbering(&seqs);
-                    let done = r
-                        .parts
-                        .iter()
-                        .filter(|p| p.state == TaskState::Completed)
-                        .count() as u32;
-                    (done, total.unwrap_or(0), missing)
-                } else {
-                    (0, 0, Vec::new())
-                };
-                 let (downloaded, total, speed_bps, percent, uploaded, upload_bps, verifying) =
-                    match progress.get(&r.id) {
-                        Some(t) => (
-                            t.last.downloaded,
-                            t.last.total,
-                            if live { t.speed } else { None },
-                            t.last.percent,
-                            t.last.uploaded.max(r.uploaded),
-                            r.upload_bps.or(t.last.upload_bps),
-                            t.last.verifying,
-                        ),
-                        None => (
-                            r.downloaded,
-                            r.total,
-                            None,
-                            // No live sample: never claim 100%. A paused task
-                            // has a total too (it used to read "paused 100%").
-                            None,
-                            r.uploaded,
-                            r.upload_bps,
-                            false,
-                        ),
-                    };
-                TaskInfo {
-                    id: r.id.clone(),
-                    url: r.url.clone(),
-                    state: r.state,
-                    dest_dir: r.dest_dir.clone(),
-                    downloaded,
-                    total,
-                    speed_bps,
-                    uploaded,
-                    upload_bps,
-                    seeding: r.seeding,
-                    seeding_stopped: r.seed_paused,
-                    peers: r.peers,
-                    verifying,
-                    probing,
-                    error: r.error.clone(),
-                    start_at: r.start_at,
-                    kind: r.kind,
-                    percent,
-                    dest_file: r.dest_file.clone(),
-                    name: r.bundle_name.clone().or_else(|| r.torrent_name.clone()),
-                    info_hash: r.info_hash.clone(),
-                    sequential: r.sequential,
-                    only_files: r.only_files.clone(),
-                    parts_done,
-                    parts_total,
-                    parts_missing,
-                }
-            })
+            .map(|r| task_info_of(r, &progress))
             .collect();
 
         drop(records);
@@ -3380,7 +3541,13 @@ impl Daemon {
                         }
                     };
                     engine
-                        .download(&rec.url, rec.dest_dir.clone(), token, on_progress)
+                        .download_named(
+                            &rec.url,
+                            rec.dest_dir.clone(),
+                            rec.output_name.clone(),
+                            token,
+                            on_progress,
+                        )
                         .await
                         .map(Some)
                 }
@@ -3753,6 +3920,65 @@ fn delete_artifacts(rec: &TaskRecord) -> Vec<PathBuf> {
     deleted
 }
 
+/// What `Daemon::enqueue` did with a request.
+enum Enqueued {
+    /// A new task was queued under this id.
+    New(String),
+    /// The same download already exists under this id; nothing was queued.
+    Existing(String),
+}
+
+/// A `refused` answer to a browser handoff: the browser keeps its download.
+fn refused(req_id: u64, why: impl Into<String>) -> Response {
+    Response {
+        id: req_id,
+        reply: Reply::Proposed {
+            outcome: ProposalOutcome::Refused,
+            id: None,
+            reason: Some(why.into()),
+            task: None,
+        },
+    }
+}
+
+/// Claim a proposal id for its probe. A tombstone left by an earlier abandon
+/// is consumed and refuses the propose; a live id cannot be claimed twice.
+fn begin_proposal(
+    map: &mut HashMap<String, Proposal>,
+    key: &str,
+    now: Instant,
+) -> Result<(), String> {
+    prune_proposals(map, now);
+    match map.get(key).map(|p| matches!(p.state, ProposalState::Abandoned)) {
+        Some(true) => {
+            map.remove(key);
+            Err("abandoned before it arrived".to_string())
+        }
+        Some(false) => Err("duplicate proposal id".to_string()),
+        None => {
+            map.insert(key.to_string(), Proposal { at: now, state: ProposalState::Pending });
+            Ok(())
+        }
+    }
+}
+
+/// Settle an abandon: returns the task the proposal queued, if it queued one.
+/// Anything else leaves a tombstone so a propose not yet seen is refused.
+fn abandon_proposal(map: &mut HashMap<String, Proposal>, key: &str, now: Instant) -> Option<String> {
+    prune_proposals(map, now);
+    match map.remove(key) {
+        Some(Proposal { state: ProposalState::Taken(id), .. }) => Some(id),
+        _ => {
+            map.insert(key.to_string(), Proposal { at: now, state: ProposalState::Abandoned });
+            None
+        }
+    }
+}
+
+fn prune_proposals(map: &mut HashMap<String, Proposal>, now: Instant) {
+    map.retain(|_, p| now.saturating_duration_since(p.at) < PROPOSAL_TTL);
+}
+
 /// Idempotency guard: the same URL, tool and destination must not
 /// double-download into one file (sidecar trample = corrupt output).
 fn duplicate_task(
@@ -3765,6 +3991,143 @@ fn duplicate_task(
         .iter()
         .find(|r| r.kind == kind && &r.url == url && &r.dest_dir == dest_dir)
         .map(|r| r.id.clone())
+}
+
+/// The file name for a "download again" copy of the direct download `url` in
+/// `dest_dir`: the original's file name, suffixed until nothing uses it. A name
+/// is taken while a file or its resume sidecar sits on disk, or while a task
+/// owns it, so a copy never shares bytes or a sidecar with another task.
+fn copy_output_name(
+    records: &[TaskRecord],
+    url: &str,
+    dest_dir: &Option<PathBuf>,
+    kind: TaskKind,
+) -> Result<String, String> {
+    if kind != TaskKind::Http {
+        return Err("download again is only offered for direct downloads".to_string());
+    }
+    let original = records
+        .iter()
+        .filter(|r| r.kind == kind && r.url == url && &r.dest_dir == dest_dir)
+        .find_map(|r| r.dest_file.as_ref()?.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| "this download has no file yet, so there is nothing to copy".to_string())?;
+    let dir = dest_dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    (0..10_000u32)
+        .map(|n| ripdl_core::names::suffixed(&original, n))
+        .find(|name| {
+            let dest = dir.join(name);
+            !dest.exists()
+                && !ripdl_core::engine::sidecar_path(&dest).exists()
+                && !records.iter().any(|r| {
+                    r.dest_dir.as_ref() == Some(&dir)
+                        && (r.output_name.as_deref() == Some(name.as_str())
+                            || r.dest_file.as_deref() == Some(dest.as_path()))
+                })
+        })
+        .ok_or_else(|| "no free file name next to the existing download".to_string())
+}
+
+/// The view of one record that every frontend shows (`Reply::Tasks`,
+/// `Reply::Duplicate`). The caller holds the `progress` lock.
+fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> TaskInfo {
+    // A parked task keeps its last sample for resume bookkeeping, but
+    // reporting it as a live rate prints bandwidth that is not moving (and
+    // inflates a frontend's total-speed strip).
+    let live = matches!(r.state, TaskState::Running | TaskState::Queued);
+    // No sample yet on a live task: the engine is still probing the URL and
+    // planning segments (HTTP/video only - a torrent has its own metadata
+    // state).
+    let probing = live && r.kind != TaskKind::Torrent && !progress.contains_key(&r.id);
+    // Bundle rows: how many parts are done and how many the numbering proves
+    // exist (0 = the selection does not say).
+    let (parts_done, parts_total, parts_missing) = if r.kind == TaskKind::Bundle {
+        let seqs: Vec<Option<u32>> = r.parts.iter().map(|p| p.seq).collect();
+        let (_, total, missing) = ripdl_core::bundle::numbering(&seqs);
+        let done = r
+            .parts
+            .iter()
+            .filter(|p| p.state == TaskState::Completed)
+            .count() as u32;
+        (done, total.unwrap_or(0), missing)
+    } else {
+        (0, 0, Vec::new())
+    };
+    let (downloaded, total, speed_bps, percent, uploaded, upload_bps, verifying) =
+        match progress.get(&r.id) {
+            Some(t) => (
+                t.last.downloaded,
+                t.last.total,
+                if live { t.speed } else { None },
+                t.last.percent,
+                t.last.uploaded.max(r.uploaded),
+                r.upload_bps.or(t.last.upload_bps),
+                t.last.verifying,
+            ),
+            None => (
+                r.downloaded,
+                r.total,
+                None,
+                // No live sample: never claim 100%. A paused task has a total
+                // too (it used to read "paused 100%").
+                None,
+                r.uploaded,
+                r.upload_bps,
+                false,
+            ),
+        };
+    TaskInfo {
+        id: r.id.clone(),
+        url: r.url.clone(),
+        state: r.state,
+        dest_dir: r.dest_dir.clone(),
+        downloaded,
+        total,
+        speed_bps,
+        uploaded,
+        upload_bps,
+        seeding: r.seeding,
+        seeding_stopped: r.seed_paused,
+        peers: r.peers,
+        verifying,
+        probing,
+        error: r.error.clone(),
+        start_at: r.start_at,
+        kind: r.kind,
+        percent,
+        dest_file: r.dest_file.clone(),
+        name: r.bundle_name.clone().or_else(|| r.torrent_name.clone()),
+        info_hash: r.info_hash.clone(),
+        sequential: r.sequential,
+        only_files: r.only_files.clone(),
+        parts_done,
+        parts_total,
+        parts_missing,
+    }
+}
+
+/// Hand `path` to the desktop shell: the file itself, or its folder with the
+/// file selected. The process is spawned, not waited for.
+#[cfg(windows)]
+fn open_in_shell(path: &Path, folder: bool) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("explorer.exe");
+    if folder {
+        cmd.arg(format!("/select,{}", path.display()));
+    } else {
+        cmd.arg(path);
+    }
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.spawn().map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn open_in_shell(path: &Path, folder: bool) -> std::io::Result<()> {
+    let target = if folder { path.parent().unwrap_or(path) } else { path };
+    std::process::Command::new("xdg-open").arg(target).spawn().map(|_| ())
 }
 
 /// How long the runner must hold a task Queued before it may start.
@@ -3788,11 +4151,216 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
 
+    /// A daemon whose queue and downloads live in a fresh temp folder.
+    fn proposal_daemon(tag: &str) -> (Arc<Daemon>, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("ripdl-proposal-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = ripdl_core::rpc::DaemonSettings {
+            default_download_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let daemon = Daemon::new(dir.join("queue.json"), dir.join("config.json"), config).unwrap();
+        (Arc::new(daemon), dir)
+    }
+
+    /// Loopback server for handoff probes: HEAD reports `len` bytes, while the
+    /// body request never answers, so a queued task stays live for the test.
+    async fn proposal_server(len: u64) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut byte).await {
+                            Ok(1) => head.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    if head.starts_with(b"HEAD ") {
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = sock.write_all(answer.as_bytes()).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/file.bin")
+    }
+
+    fn proposed(resp: Response) -> (ProposalOutcome, Option<String>, Option<String>) {
+        match resp.reply {
+            Reply::Proposed { outcome, id, reason, .. } => (outcome, id, reason),
+            other => panic!("expected a proposed reply, got {other:?}"),
+        }
+    }
+
+    fn has_task(daemon: &Daemon, id: &str) -> bool {
+        daemon.records.lock().unwrap().iter().any(|r| r.id == id)
+    }
+
+    #[tokio::test]
+    async fn propose_queues_once_and_abandon_drops_only_its_own_task() {
+        let (daemon, dir) = proposal_daemon("own");
+        let url = proposal_server(4096).await;
+
+        let (outcome, task, _) =
+            proposed(daemon.cmd_propose(1, "dl-a".into(), url.clone(), HashMap::new(), Some(4096)).await);
+        assert_eq!(outcome, ProposalOutcome::New);
+        let task = task.expect("new task id");
+        assert!(has_task(&daemon, &task));
+
+        // The same link proposed again is a duplicate: the answer names the
+        // queued task so the browser can ask the user, and owns nothing.
+        match daemon.cmd_propose(2, "dl-b".into(), url.clone(), HashMap::new(), None).await.reply {
+            Reply::Proposed { outcome, id, task: Some(info), .. } => {
+                assert_eq!(outcome, ProposalOutcome::Duplicate);
+                assert_eq!(id.as_deref(), Some(task.as_str()));
+                assert_eq!(info.id, task);
+            }
+            other => panic!("expected a duplicate answer with its task, got {other:?}"),
+        }
+
+        daemon.cmd_abandon(3, "dl-b").await;
+        assert!(has_task(&daemon, &task), "abandon of a shared task must not remove it");
+
+        daemon.cmd_abandon(4, "dl-a").await;
+        assert!(!has_task(&daemon, &task), "abandon removes the task its proposal queued");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn propose_refuses_what_the_browser_did_not_see() {
+        let (daemon, dir) = proposal_daemon("refuse");
+        let url = proposal_server(4096).await;
+
+        let (outcome, id, reason) =
+            proposed(daemon.cmd_propose(1, "dl-size".into(), url, HashMap::new(), Some(1000)).await);
+        assert_eq!(outcome, ProposalOutcome::Refused);
+        assert!(id.is_none());
+        assert!(reason.unwrap_or_default().contains("size"));
+
+        // Nothing listens on this port: the link is refused, not queued.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (outcome, _, _) = proposed(
+            daemon
+                .cmd_propose(2, "dl-dead".into(), format!("http://{closed}/x.bin"), HashMap::new(), None)
+                .await,
+        );
+        assert_eq!(outcome, ProposalOutcome::Refused);
+        assert!(daemon.records.lock().unwrap().is_empty());
+        assert!(daemon.proposals.lock().unwrap().is_empty(), "refusals release their claim");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn abandon_that_arrives_first_refuses_the_late_propose() {
+        let (daemon, dir) = proposal_daemon("tombstone");
+        let url = proposal_server(4096).await;
+
+        daemon.cmd_abandon(1, "dl-late").await;
+        let (outcome, id, _) =
+            proposed(daemon.cmd_propose(2, "dl-late".into(), url, HashMap::new(), None).await);
+        assert_eq!(outcome, ProposalOutcome::Refused);
+        assert!(id.is_none());
+        assert!(daemon.records.lock().unwrap().is_empty());
+        assert!(daemon.proposals.lock().unwrap().is_empty(), "the tombstone is consumed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_refuses_a_connection_without_the_token() {
+        let (daemon, dir) = proposal_daemon("auth-refuse");
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serve = tokio::spawn(daemon.clone().handle_conn(server));
+        // A wrong token is refused, and the list request behind it never runs.
+        client
+            .write_all(b"{\"auth\":\"not-the-token\"}\n{\"id\":5,\"cmd\":{\"type\":\"list\"}}\n")
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(client).lines();
+        let refusal: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(refusal["id"], 0);
+        assert_eq!(refusal["reply"]["type"], "error");
+        assert_eq!(refusal["reply"]["message"], "unauthorized");
+        assert!(lines.next_line().await.unwrap().is_none(), "the connection is closed");
+        serve.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_serves_commands_after_the_token() {
+        let (daemon, dir) = proposal_daemon("auth-ok");
+        let token = daemon.rpc_token.clone();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serve = tokio::spawn(daemon.clone().handle_conn(server));
+        let hello = format!("{{\"auth\":\"{token}\"}}\n{{\"id\":5,\"cmd\":{{\"type\":\"list\"}}}}\n");
+        client.write_all(hello.as_bytes()).await.unwrap();
+        let mut lines = BufReader::new(client).lines();
+        let reply: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(reply["id"], 5);
+        assert_eq!(reply["reply"]["type"], "tasks");
+        drop(lines);
+        serve.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn open_refuses_an_unknown_task() {
+        let (daemon, dir) = proposal_daemon("open");
+        match daemon.cmd_open(1, "nope", false).reply {
+            Reply::Error { message } => assert!(message.contains("no task"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn copy_output_name_takes_the_first_free_suffix() {
+        let dir = std::env::temp_dir().join(format!("ripdl-copyname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.zip"), b"done").unwrap();
+        let url = "https://x/file.zip";
+        let dest = Some(dir.clone());
+        let mut done = rec("t1", url, dir.to_str());
+        done.dest_file = Some(dir.join("file.zip"));
+        let first = ripdl_core::names::suffixed("file.zip", 1);
+        let second = ripdl_core::names::suffixed("file.zip", 2);
+
+        // The original is on disk, so the copy takes the first suffix that is free.
+        assert_eq!(copy_output_name(&[done.clone()], url, &dest, TaskKind::Http), Ok(first.clone()));
+
+        // A name another task already owns is skipped too.
+        let mut owner = rec("t2", url, dir.to_str());
+        owner.output_name = Some(first);
+        assert_eq!(copy_output_name(&[done.clone(), owner], url, &dest, TaskKind::Http), Ok(second));
+
+        // Only direct downloads have a copy, and only once a file exists.
+        assert!(copy_output_name(&[done.clone()], url, &dest, TaskKind::Torrent).is_err());
+        assert!(copy_output_name(&[], url, &dest, TaskKind::Http).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn rec(id: &str, url: &str, dest: Option<&str>) -> TaskRecord {
         TaskRecord {
             id: id.to_string(),
             url: url.to_string(),
             dest_dir: dest.map(PathBuf::from),
+            output_name: None,
             state: TaskState::Completed,
             error: None,
             headers: std::collections::HashMap::new(),
@@ -3965,6 +4533,7 @@ mod tests {
             sequential: false,
             only_files: None,
             dest_file: Some(out.clone()),
+            output_name: None,
             downloaded: 4,
             total: Some(4),
             info_hash: None,
@@ -3996,6 +4565,7 @@ mod tests {
         let rec = TaskRecord {
             id: "t".into(),
             url: "https://x/never.seen".into(),
+            output_name: None,
             dest_dir: Some(tmp.clone()),
             state: TaskState::Failed,
             error: None,
@@ -4594,6 +5164,7 @@ mod tests {
             sequential: false,
             only_files: None,
             dest_file: Some(root.clone()),
+            output_name: None,
             downloaded: data.len() as u64,
             total: Some(data.len() as u64),
             info_hash: Some(pv.info_hash.clone()),

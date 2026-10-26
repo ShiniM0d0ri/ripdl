@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use ripdl_core::rpc::{BundlePart, Command, Reply, Request, Response};
+use ripdl_core::rpc::{BundlePart, Command, ProposalOutcome, Reply, Request, Response};
 use ripdl_core::{Engine, EngineConfig};
 
 /// Lowercase label for one `ls` row (avoids `{state:?}` + `to_lowercase`
@@ -289,7 +289,7 @@ enum LanCmd {
     /// Copy a file to a receiver on this network.
     Send {
         path: PathBuf,
-        /// Receiver base URL, e.g. `http://192.168.1.8:8463`.
+        /// Receiver base URL, e.g. `http://192.0.2.10:8463`.
         #[arg(long)]
         to: String,
         /// Pairing code shown by the receiver (not needed when it accepts
@@ -409,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
                 kind,
                 sequential,
                 only_files,
+                on_duplicate: Default::default(),
             })
             .await
         }
@@ -812,6 +813,18 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
     match reply {
         Reply::Ok => println!("ok"),
         Reply::Added { id } => println!("queued: {id}"),
+        Reply::Duplicate { task } => println!("already in ripdl: {}", task.id),
+        Reply::Proposed { outcome, id, reason, .. } => {
+            let what = match outcome {
+                ProposalOutcome::New => "queued",
+                ProposalOutcome::Duplicate => "already in ripdl",
+                ProposalOutcome::Refused => "refused",
+            };
+            match id.or(reason) {
+                Some(detail) => println!("{what}: {detail}"),
+                None => println!("{what}"),
+            }
+        }
         Reply::BundlePartsAdded { id, added } => {
             if added == 0 {
                 println!("{id}: nothing to add, the bundle already carries those links");

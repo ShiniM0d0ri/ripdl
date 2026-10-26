@@ -7,7 +7,7 @@ import vm from "node:vm";
 
 import generic from "../hosts/generic.js";
 import { BUILTINS } from "../hosts/index.js";
-import { validateRecipe, recipeToPlugin, scriptProblem } from "../plugins.js";
+import { pluginMatches, validateRecipe, recipeToPlugin, scriptProblem } from "../plugins.js";
 
 let pass = 0;
 const ok = (name) => { pass++; console.log(`  ok  ${name}`); };
@@ -42,6 +42,13 @@ ok("generic match: archives/media yes, pages no");
 assert.equal(generic.name("https://host.example/a/My%20File.part2.rar"), "My File.part2.rar");
 assert.equal(generic.name("https://host.example/"), null);
 ok("generic name: decoded tail");
+
+/* ---------------- enabled-plugin claims (node has no storage: builtins only) ---------------- */
+
+assert.equal(await pluginMatches("https://host.example/Game.part1.rar"), true, "builtin file types are claimed");
+assert.equal(await pluginMatches("https://host.example/page"), false);
+assert.equal(await pluginMatches("https://host.example/abc123", true), false, "share links need a resolving plugin");
+ok("pluginMatches: file types claimed; resolve-only filter skips them");
 
 /* ---------------- script shape ---------------- */
 

@@ -23,8 +23,8 @@ plugin code (MV3 forbids it anyway), telemetry.
 - The daemon holds `records` (queue.json) and `progress`, one runner per task,
   `max_concurrent` enforced by one `Semaphore` permit per task.
 - The extension has `webRequest` + `scripting` + `activeTab`, resolves
-  per-request referer/cookies, and "Download selected links" currently queues
-  **every link as its own HTTP task** (same-URL dedupe only).
+  per-request referer/cookies, and "Download selected links" groups links like the copy chip and queues them at once
+  (parts of one set become one bundle; singles stay HTTP tasks).
 - GUI rows are keyed by `TaskKind` (`torrent` / `http` / `video`), with a
   details dialog per kind and a sidebar transport filter for torrents.
 - `ripdl-core::torrent` already owns `<dest>/<name>/` naming, so the bundle
@@ -173,7 +173,7 @@ first rule that fits (case-insensitive):
   "Download" anchors must not rename every part "Download", and - worse -
   identical link texts would wrongly merge unrelated links into one bundle.
   An anchor without a filename-looking label still counts when the selection
-  text itself carries `http(s)` URLs.
+  text itself carries `http(s)` URLs. Otherwise such an anchor is weak: it is offered only when a plugin claims its URL (the built-in generic plugin claims known archive and media extensions).
 - The chip lists what would be queued ("Send 3 links", then
   `x - 3 of 3 parts`, singles as "2 single downloads", missing numbers in
   the group line) with **Send / Edit / Dismiss**. Nothing is queued until
@@ -234,8 +234,8 @@ ext/hosts/index.js   // built-in registry; per-host enable flag in chrome.storag
 - A `generic` plugin always exists: every `a[href]` with a known archive/media
   extension, so plugins are an enhancement, not a requirement.
 - Plugins may only read what the page already offers or calls the host's own
-  public endpoints; no captcha/paywall logic, no credentials stored.
-- Ships with `[generic, <top hosters>]`; adding a built-in is a single file +
+  public endpoints; no captcha/paywall logic, no skipping of waiting timers or ads, no credentials stored.
+- Ships with `[generic]`; adding a built-in is a single file +
   registry line, covered by a node test that loads every plugin and checks
   `match()` and shape.
 
@@ -315,7 +315,7 @@ the final clicks from the user.
 
 ```
 Ctrl+C / context menu / popup
-  -> extension: collect links (anchors with filename-looking text, bare URLs)
+  -> extension: collect links (anchors, bare URLs; see copy capture for which anchors count)
   -> host: {"cmd":{"type":"preview_bundle","links":[...]}}
   <- groups (name + parts)
   -> user clicks Send

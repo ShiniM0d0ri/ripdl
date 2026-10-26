@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ripdl: already downloaded</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172522;
+      --muted: #687772;
+      --line: #dce5e1;
+      --surface: #fff;
+      --wash: #f3f7f5;
+      --teal: #0c7669;
+      --teal-dark: #075c53;
+      --warn: #a45c10;
+      --bad: #a43b36;
+      --ok: #186b46;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--surface);
+      color: var(--ink);
+      font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+      overflow: hidden;
+    }
+    button { font: inherit; }
+    button:focus-visible { outline: 2px solid #268f80; outline-offset: 2px; }
+    .shell { display: flex; flex-direction: column; height: 100%; padding: 14px 16px 12px; gap: 10px; }
+    .masthead { display: flex; align-items: center; gap: 10px; }
+    .brand-mark {
+      display: grid; place-items: center; width: 30px; height: 30px; flex: none;
+      border-radius: 8px; background: var(--teal); color: #fff;
+      font-size: 18px; font-weight: 700; line-height: 1;
+    }
+    h1 { margin: 0; font-size: 15px; line-height: 1.2; font-weight: 700; }
+    .note { margin-top: 2px; color: var(--warn); font-size: 11.5px; }
+    .note:empty { display: none; }
+    .rows {
+      flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 0;
+      list-style: none; border-top: 1px solid var(--line);
+    }
+    .row { padding: 10px 0; border-bottom: 1px solid var(--line); }
+    .row.done { opacity: 0.7; }
+    .name { font-weight: 650; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .state { margin-top: 2px; color: var(--muted); font-size: 11.5px; }
+    .url { margin-top: 1px; color: #8a9a95; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .action {
+      border: 1px solid #b9d3c9; border-radius: 6px; padding: 5px 10px;
+      background: #fff; color: var(--teal-dark); font-size: 12px; font-weight: 600; cursor: pointer;
+    }
+    .action:hover:not(:disabled) { background: #f2f8f5; border-color: var(--teal); }
+    .action.primary { background: var(--teal); border-color: var(--teal); color: #fff; }
+    .action.primary:hover:not(:disabled) { background: var(--teal-dark); border-color: var(--teal-dark); }
+    .action:disabled { opacity: 0.5; cursor: default; }
+    .result { margin-top: 6px; font-size: 11.5px; color: var(--ok); }
+    .result.bad { color: var(--bad); }
+    .result:empty { display: none; }
+    .none { color: var(--muted); font-size: 11.5px; }
+    .footer { display: flex; align-items: center; gap: 8px; }
+    .hint { flex: 1; color: var(--muted); font-size: 10.5px; }
+    #close {
+      border: 1px solid var(--line); border-radius: 6px; padding: 5px 12px;
+      background: #fff; cursor: pointer; font-size: 12px;
+    }
+    #close:hover { background: var(--wash); }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div class="brand-mark" aria-hidden="true">r</div>
+      <div>
+        <h1 id="title">ripdl</h1>
+        <div id="note" class="note"></div>
+      </div>
+    </header>
+    <ul id="rows" class="rows" aria-live="polite"></ul>
+    <p id="expired" class="none hidden">This choice has expired. Start the download again.</p>
+    <footer class="footer">
+      <span class="hint">Enter runs the first choice. Esc leaves everything as it is.</span>
+      <button id="close" type="button">Close</button>
+    </footer>
+  </main>
+  <script type="module" src="duplicate.js"></script>
+</body>
+</html>

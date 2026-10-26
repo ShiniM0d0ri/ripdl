@@ -274,6 +274,10 @@ pub enum Command {
         /// Comes from the Add dialog's pre-add file checklist.
         #[serde(default)]
         only_files: Option<Vec<usize>>,
+        /// What happens when this download already exists (same URL, tool and
+        /// destination). Default `share`: the existing task's id comes back.
+        #[serde(default)]
+        on_duplicate: DuplicatePolicy,
     },
     /// Queue several direct links as **one** task that owns a folder
     /// (`<dest>/<name>/<parts...>`), the way a torrent owns its root. The
@@ -343,11 +347,37 @@ pub enum Command {
     Resume {
         id: String,
     },
+    /// Open a task's file in the default app, or (`folder`) reveal it in its
+    /// folder. Only the path the daemon recorded for the task is ever used.
+    Open {
+        id: String,
+        #[serde(default)]
+        folder: bool,
+    },
     Remove {
         id: String,
         /// Also delete the downloaded file(s) from disk (default: keep them).
         #[serde(default)]
         delete_files: bool,
+    },
+    /// Browser handoff, step 1: probe `url` with the browser's headers and
+    /// queue it when the answer matches what the browser saw (`expected_bytes`
+    /// when known). `Reply::Proposed` `new` queued it; `duplicate` means the
+    /// same download already exists (nothing queued, the existing task comes
+    /// back) and the caller asks the user. Both let the browser copy go;
+    /// `refused` does not. `proposal` is the caller's id for this decision.
+    Propose {
+        proposal: String,
+        url: String,
+        #[serde(default)]
+        headers: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        expected_bytes: Option<u64>,
+    },
+    /// Browser handoff, step 2: the browser kept its copy after all (deadline
+    /// passed, or its cancel failed). Drops the task a `new` propose queued.
+    Abandon {
+        proposal: String,
     },
     /// Current daemon-wide settings (config.json contents).
     GetConfig,
@@ -389,6 +419,30 @@ pub enum Command {
     Shutdown,
 }
 
+/// How `Add` treats a download that already exists (same URL, tool and
+/// destination directory).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicatePolicy {
+    /// Answer `added` with the existing task's id (idempotent retries).
+    #[default]
+    Share,
+    /// Queue nothing and answer `duplicate` with the existing task, so the
+    /// caller can ask the user what to do.
+    Report,
+    /// Queue another copy anyway ("download again"). Torrents never copy.
+    Copy,
+}
+
+/// Verdict on a browser handoff (`Reply::Proposed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalOutcome {
+    New,
+    Duplicate,
+    Refused,
+}
+
 /// A daemon reply. One JSON object per line.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Response {
@@ -401,6 +455,24 @@ pub struct Response {
 pub enum Reply {
     Added {
         id: String,
+    },
+    /// Answer to `Propose`: `new` (queued now), `duplicate` (the same download
+    /// already exists as `task`; nothing new was queued), or `refused`
+    /// (leave it to the browser; `reason` says why).
+    Proposed {
+        outcome: ProposalOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// The existing task, for a `duplicate` verdict.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<TaskInfo>,
+    },
+    /// Answer to `Add` with `on_duplicate: report`: the same download already
+    /// exists and nothing was queued. `task` is its current state.
+    Duplicate {
+        task: TaskInfo,
     },
     Tasks {
         tasks: Vec<TaskInfo>,
@@ -686,6 +758,61 @@ pub struct TaskDetailsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_commands_parse_from_the_extension() {
+        let propose: Request = serde_json::from_str(
+            r#"{"id":7,"cmd":{"type":"propose","proposal":"dl-1","url":"https://files.example/a.zip","headers":{"Referer":"https://files.example/"},"expected_bytes":42}}"#,
+        )
+        .expect("propose parses");
+        assert!(matches!(propose.cmd, Command::Propose { expected_bytes: Some(42), .. }));
+
+        // The extension sends null when the browser did not know the size.
+        let no_size: Request = serde_json::from_str(
+            r#"{"id":8,"cmd":{"type":"propose","proposal":"dl-2","url":"https://files.example/b.zip","expected_bytes":null}}"#,
+        )
+        .expect("null-size propose parses");
+        assert!(matches!(no_size.cmd, Command::Propose { expected_bytes: None, .. }));
+
+        let abandon: Request =
+            serde_json::from_str(r#"{"id":9,"cmd":{"type":"abandon","proposal":"dl-1"}}"#)
+                .expect("abandon parses");
+        assert!(matches!(abandon.cmd, Command::Abandon { ref proposal } if proposal == "dl-1"));
+
+        let reply: Reply = serde_json::from_str(r#"{"type":"proposed","outcome":"duplicate","id":"t1"}"#)
+            .expect("proposed parses");
+        assert!(matches!(
+            reply,
+            Reply::Proposed { outcome: ProposalOutcome::Duplicate, id: Some(ref id), reason: None, task: None } if id == "t1"
+        ));
+    }
+
+    #[test]
+    fn duplicate_policy_defaults_to_share_and_parses() {
+        let plain: Request = serde_json::from_str(
+            r#"{"id":1,"cmd":{"type":"add","url":"https://files.example/a.zip"}}"#,
+        )
+        .expect("add parses");
+        assert!(matches!(
+            plain.cmd,
+            Command::Add { on_duplicate: DuplicatePolicy::Share, .. }
+        ));
+
+        for (word, want) in [
+            ("report", DuplicatePolicy::Report),
+            ("copy", DuplicatePolicy::Copy),
+        ] {
+            let line = format!(
+                r#"{{"id":2,"cmd":{{"type":"add","url":"https://files.example/a.zip","on_duplicate":"{word}"}}}}"#
+            );
+            let req: Request = serde_json::from_str(&line).expect("policy parses");
+            assert!(matches!(req.cmd, Command::Add { on_duplicate, .. } if on_duplicate == want));
+        }
+
+        let open: Request = serde_json::from_str(r#"{"id":3,"cmd":{"type":"open","id":"t1"}}"#)
+            .expect("open parses");
+        assert!(matches!(open.cmd, Command::Open { ref id, folder: false } if id == "t1"));
+    }
 
     #[test]
     fn config_reply_carries_extension_status() {

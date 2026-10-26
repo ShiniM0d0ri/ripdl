@@ -1,7 +1,8 @@
 //! One GUI per machine session.
 //!
 //! The first process owns a local endpoint (Windows named pipe
-//! `\\.\pipe\ripdl-gui`, unix socket `<data_dir>/gui.sock`). A second launch
+//! `\\.\pipe\ripdl-gui`, or the name in `RIPDL_GUI_PIPE` for an isolated
+//! run; unix socket `<data_dir>/gui.sock`). A second launch
 //! connects, sends `show`, and exits; the running instance brings its window
 //! back (same behavior as clicking the tray icon). Kernel objects disappear
 //! with the process, so there is no stale state to clean up - except a unix
@@ -15,6 +16,9 @@ use std::io;
 
 #[cfg(windows)]
 const GUARD_ENDPOINT: &str = "\\\\.\\pipe\\ripdl-gui";
+/// Environment override for [`GUARD_ENDPOINT`] (test seam, unset in use).
+#[cfg(windows)]
+const GUARD_ENV: &str = "RIPDL_GUI_PIPE";
 /// `CreateNamedPipeW` reports this when another process owns the first
 /// instance (`first_pipe_instance(true)`), i.e. an instance already exists.
 #[cfg(windows)]
@@ -47,13 +51,25 @@ pub struct Guard {
 pub fn claim() -> io::Result<Option<Guard>> {
     #[cfg(windows)]
     {
-        claim_named(GUARD_ENDPOINT)
+        claim_named(&guard_endpoint())
     }
     #[cfg(unix)]
     {
         let path = ripdl_core::transport::data_dir()?.join("gui.sock");
         claim_path(&path)
     }
+}
+
+/// Test seam: `RIPDL_GUI_PIPE` moves the Windows guard so an isolated GUI run
+/// (the e2e runner) never collides with the user's window. Unset or blank
+/// keeps the per-machine default.
+#[cfg(windows)]
+fn guard_endpoint() -> String {
+    std::env::var(GUARD_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| GUARD_ENDPOINT.to_string())
 }
 
 impl Guard {

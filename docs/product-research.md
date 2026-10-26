@@ -40,7 +40,7 @@ single-stream, no queue control, no retry policy, no packages, no extraction.
 
 - **Link containers / grabber**: paste or copy a list → one package → one
   folder. This is why people still run JD2 despite the UI: it is the only tool
-  that eats "release page → 9 filehost links → one folder".
+  that eats "release page → 9 part links → one folder".
 - **Package semantics**: aggregate progress/speed per package, per-package
   destination, per-package extraction.
 - **Auto-extract with part-set awareness** (know a set is incomplete, wait,
@@ -84,8 +84,8 @@ post-download hooks, history, queue priorities, bandwidth scheduling.
 1. **Grabber + packages + extraction** (P5, planned) — the JD2-shaped
    differentiator; nobody else combines this with a fast native engine and no
    ads/telemetry.
-2. **Hoster resolution + session reuse + browser handoff** (P6, planned) —
-  supports multi-part file-host workflows through normal browser handoff.
+2. **Link resolution + browser handoff** (P6, planned) —
+  user-loadable resolvers handle share links; multi-part sets go through normal browser handoff.
 3. **Categories + per-category folder/queue/speed policy** (small, expected;
    also gives the scheduler a queue dimension).
 4. **Proxy + per-host concurrency + priority ordering** (IDM/Gopeed parity;
@@ -154,6 +154,6 @@ post-download hooks, history, queue priorities, bandwidth scheduling.
 - IDM Grabber documentation (recursive site crawl with page/file filters,
   project templates, saved projects, scheduling).
 - Community reports: JD2 adware-installer complaints; Malwarebytes (2026-05)
-  on the JDownloader site being compromised to serve malware; an unverified
-  report describes handing a copied link list to JD2/IDM when a file host
-  presents a Cloudflare challenge (not a guaranteed workflow).
+  on the JDownloader site being compromised to serve malware.
+  Listed as context for the survey; no workflow is implied.
+  

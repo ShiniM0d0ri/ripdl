@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/main-window.png" alt="ripdl downloading a file">
+  <img src="docs/screenshots/main-window.png" alt="ripdl main window">
 </p>
 
 ## What is ripdl?
@@ -68,8 +68,8 @@ of them.
 
 Turn it on in **Settings → Combine network connections**, or add `--bond` on the
 command line (`ripdl download --bond <url>`). Every parallel connection gets its
-own source address, so a server that throttles "one client" sees several and the
-bytes add up.
+own source address, so the traffic leaves over every uplink you have. Bonding
+combines the uplinks you own on your side. It is not a way around per-IP or per-account limits a server sets.
 
 **Honest limits:** the uplinks must be genuinely independent. A cable and Wi-Fi
 that both belong to the same router still share one ISP line, so you gain
@@ -140,7 +140,7 @@ modern Linux desktop. No .NET, no Java, no extra runtimes.
 3. Watch it go. Right-click a row to pause, resume, open the file or remove it.
 
 <p align="center">
-  <img src="docs/screenshots/add-url.png" alt="Add URL dialog" width="720">
+  <img src="docs/screenshots/add-url.png" alt="Add URL dialog">
 </p>
 
 The list is remembered: downloads keep running while the window sits in the
@@ -158,7 +158,7 @@ The toolbar is icon-only (hover anything for a tooltip):
 | **⏸** | Pause every running task |
 | **trash** | Clear completed tasks from the list (files stay on disk) |
 | **paper plane** | Send / receive files on your network |
-| **sliders** | Settings |
+| **gear** | Settings |
 
 On a task row: **double-click** opens details (segments, torrent files/peers),
 **right-click** gives pause, resume, refresh address, open file/folder and
@@ -171,23 +171,15 @@ magnet link into Add. Single-file torrents land directly in Downloads;
 multi-file torrents get their own folder. Double-click a torrent row to see its
 files, peers and trackers — and untick anything you don't want.
 
-<p align="center">
-  <img src="docs/screenshots/torrent-details.png" alt="Torrent details: files, peers, trackers" width="720">
-</p>
-
 ## Send a file to your phone, or between two PCs
 
 1. Click the paper-plane button (**Send & Receive**).
 2. Turn on **Receive files on this network**. ripdl shows an address such as
-   `http://192.168.1.8:8463` and a short code.
+   `http://192.0.2.10:8463` and a short code.
 3. On your phone (same Wi-Fi) open that address in any browser, type the code,
    pick a file and press **Send**. It appears in `Downloads\ripdl-inbox`.
 4. To send *from* this PC, pick the other device under **Send** (or type its
    address and code) and click **Send file…**.
-
-<p align="center">
-  <img src="docs/screenshots/send-receive.png" alt="Send and receive dialog" width="720">
-</p>
 
 Nothing leaves your network. The code is the key — turn on **No code** only on
 a network you trust.
@@ -195,11 +187,11 @@ a network you trust.
 ## Settings worth knowing
 
 <p align="center">
-  <img src="docs/screenshots/settings.png" alt="Settings" width="720">
+  <img src="docs/screenshots/settings.png" alt="Settings">
 </p>
 
-- **Concurrent downloads / max segments** — how many tasks run at once, and how
-  many connections each one gets (8 is a good default).
+- **Downloads at once / Connections per download** — how many tasks run at once,
+  and how many connections each one gets (8 is a good default).
 - **Combine network connections** — spread one download over every uplink
   (see [above](#one-download-over-every-connection)).
 - **Speed cap** — one shared limit for everything (`2MiB`, `500k`, empty =
@@ -222,16 +214,16 @@ ripdl pause <id> | ripdl resume <id> | ripdl rm <id> [--files]
 ripdl download <url> -o ~/Downloads -s 16       # one-off download, no daemon
 ripdl add --after 1h <url>                      # start it later
 ripdl add <magnet-or-.torrent> --sequential     # torrents
-ripdl add --video "https://youtube.com/watch?v=..."   # needs yt-dlp
+ripdl add --video "https://example.com/watch?v=..."   # needs yt-dlp
 
 ripdl lan info                                  # this PC's address + code
-ripdl lan send photo.jpg --to http://192.168.1.8:8463 --code ABC123
+ripdl lan send photo.jpg --to http://192.0.2.10:8463 --code <code>
 
 ripdl config                                    # see or change settings
 ripdl update                                    # check for a newer release
 ```
 
-Run `ripdl --help` for the full list, and `ripdl <command> --help` for flags.
+Run `ripdl --help` for the full list, and `ripdl <command> --help` for flags. **Use responsibly:** you are responsible for copyright and for the terms of any site you download from. ripdl does not bypass DRM, paywalls, logins, or captchas.
 
 ## Browser extension (optional)
 
@@ -246,7 +238,7 @@ The extension hands downloads to ripdl instead of the browser's own downloader
 4. Right-click any link → **Download link with ripdl**. After an app update,
   reload the extension when Settings reports that the browser copy is behind.
 
-It only acts when you click, and it never reads pages in the background.
+It only acts when you click, and it never reads pages in the background. Copying text that contains links shows an offer chip (nothing is queued until you press Send); right-clicking a selection queues its links, and parts of one set become one folder.
 
 ## Staying up to date
 

@@ -142,6 +142,7 @@ async fn add_task(
         kind,
         sequential: sequential.unwrap_or(false),
         only_files,
+        on_duplicate: Default::default(),
     })
     .await?
     {
@@ -176,6 +177,7 @@ async fn add_video_task(url: String, dest_dir: Option<String>) -> Result<String,
         kind: TaskKind::Video,
         sequential: false,
         only_files: None,
+        on_duplicate: Default::default(),
     })
     .await?
     {

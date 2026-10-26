@@ -15,12 +15,15 @@
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::rpc::{Command, Reply, DEFAULT_PORT};
+use crate::rpc::{Command, Reply};
 
 /// Chrome caps messages sent *by* the host at 1 MiB. Stay under it; a `tasks`
 /// listing wider than this earns an in-band error, not a corrupt frame.
@@ -101,34 +104,91 @@ pub struct BridgeConfig {
     /// TCP. Tests disable this: an unrelated live daemon on the build host
     /// owns the pipe and would answer for any mock TCP server otherwise.
     pub use_pipe: bool,
+    /// Token presented first on every connection. `None` reads `rpc.token`
+    /// from the data directory, which is what the installed host does.
+    pub rpc_token: Option<String>,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            port: DEFAULT_PORT,
+            port: crate::transport::rpc_port(),
             connect_attempts: 20,
             connect_delay: Duration::from_millis(100),
             spawn_daemon: true,
             rpc_timeout: Duration::from_secs(30),
             use_pipe: true,
+            rpc_token: None,
         }
     }
 }
 
+/// Worker threads answering browser requests. A `propose` can wait up to 2 s
+/// in the daemon, and a slow daemon can hold any request much longer; with a
+/// single worker, every frame queued behind such a request stalled too.
+const WORKERS: usize = 8;
+/// Frames read ahead of the workers. Once this many are waiting the reader
+/// stops pulling from the browser, which is the backpressure we want.
+const QUEUE_DEPTH: usize = 64;
+
 /// Serve the native-messaging loop on stdin/stdout until the pipe closes.
 /// Per-request failures become `error` replies in-band; this function only
 /// returns when stdin reaches EOF or the framing itself breaks.
+///
+/// Requests run concurrently on a small worker pool, so replies can arrive
+/// out of order. Each one carries the caller's id, which is how the extension
+/// matches it to its request.
 pub fn serve(config: BridgeConfig) -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut input = stdin.lock();
-    let mut out = stdout.lock();
-    let mut rpc_seq: u64 = 0;
+    serve_with(config, std::io::stdin().lock(), std::io::stdout())
+}
 
-    while let Some(frame) = read_frame(&mut input)? {
-        let msg: NativeRequest = match serde_json::from_slice(&frame) {
-            Ok(m) => m,
+/// [`serve`] over any reader and writer. Returns once the reader reaches EOF
+/// and every queued request has been answered.
+pub fn serve_with<R, W>(config: BridgeConfig, mut input: R, output: W) -> Result<()>
+where
+    R: Read,
+    W: Write + Send + 'static,
+{
+    let out = Arc::new(Mutex::new(output));
+    let config = Arc::new(config);
+    let rpc_seq = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<NativeRequest>(QUEUE_DEPTH);
+    let rx = Arc::new(Mutex::new(rx));
+
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let (rx, out, config, rpc_seq) =
+                (rx.clone(), out.clone(), config.clone(), rpc_seq.clone());
+            std::thread::spawn(move || answer_loop(&rx, &out, &config, &rpc_seq))
+        })
+        .collect();
+    // Only the workers keep the queue alive. When they have all exited (the
+    // browser went away), the reader's send fails instead of blocking forever.
+    drop(rx);
+
+    let result = read_loop(&mut input, &tx, &out);
+    // Closing the queue lets the workers finish what is already read.
+    drop(tx);
+    for worker in workers {
+        let _ = worker.join();
+    }
+    result
+}
+
+/// Read frames and queue them for the workers. Unparseable frames are
+/// answered here, since they have no id a worker could answer under.
+fn read_loop<R: Read, W: Write>(
+    input: &mut R,
+    tx: &SyncSender<NativeRequest>,
+    out: &Mutex<W>,
+) -> Result<()> {
+    while let Some(frame) = read_frame(input)? {
+        match serde_json::from_slice::<NativeRequest>(&frame) {
+            Ok(msg) => {
+                if tx.send(msg).is_err() {
+                    return Err(Error::State("bridge workers stopped".to_string()));
+                }
+            }
             Err(e) => {
                 // Unparseable frames cannot be correlated to an id; the only
                 // safe reply is a generic error under a synthetic id.
@@ -138,26 +198,64 @@ pub fn serve(config: BridgeConfig) -> Result<()> {
                         message: format!("bad native request: {e}"),
                     },
                 };
-                let json = serde_json::to_vec(&reply)?;
-                write_frame(&mut out, &json)?;
-                continue;
+                send_reply(out, &reply)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// One worker: take the next queued request, forward it, write the answer.
+fn answer_loop<W: Write>(
+    rx: &Mutex<Receiver<NativeRequest>>,
+    out: &Mutex<W>,
+    config: &BridgeConfig,
+    rpc_seq: &AtomicU64,
+) {
+    loop {
+        // The queue lock covers only the wait for the next request. The
+        // forward itself runs unlocked so the other workers keep pulling.
+        let next = match rx.lock() {
+            Ok(queue) => queue.recv(),
+            Err(poisoned) => poisoned.into_inner().recv(),
         };
-        let reply = match forward_once(&config, &mut rpc_seq, msg.cmd) {
+        let Ok(msg) = next else { return };
+        let reply = match forward_once(config, rpc_seq, msg.cmd) {
             Ok(r) => r,
             Err(e) => Reply::Error {
                 message: e.to_string(),
             },
         };
-        let resp = NativeResponse { id: msg.id, reply };
-        write_frame(&mut out, &serde_json::to_vec(&resp)?)?;
+        if send_reply(out, &NativeResponse { id: msg.id, reply }).is_err() {
+            return;
+        }
     }
-    Ok(())
 }
 
-/// Push one command to the daemon over TCP, spawning it if absent (once per
-/// call; every later request just races the freshly spawned listener).
-fn forward_once(config: &BridgeConfig, rpc_seq: &mut u64, cmd: Command) -> Result<Reply> {
+/// Write one reply under the shared stdout lock, so frames from concurrent
+/// workers never interleave. A reply too wide for one native frame becomes an
+/// in-band error with the same id, so the caller still gets an answer.
+fn send_reply<W: Write>(out: &Mutex<W>, resp: &NativeResponse) -> Result<()> {
+    let mut json = serde_json::to_vec(resp)?;
+    if json.len() + 4 > HOST_TO_BROWSER_MAX {
+        let too_big = NativeResponse {
+            id: resp.id.clone(),
+            reply: Reply::Error {
+                message: format!("reply too large for the browser ({} bytes)", json.len()),
+            },
+        };
+        json = serde_json::to_vec(&too_big)?;
+    }
+    let mut writer = match out.lock() {
+        Ok(w) => w,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    write_frame(&mut *writer, &json)
+}
+
+/// Push one command to the daemon, spawning it if absent (once per call;
+/// every later request just races the freshly spawned listener).
+fn forward_once(config: &BridgeConfig, rpc_seq: &AtomicU64, cmd: Command) -> Result<Reply> {
     let mut spawned = false;
     for attempt in 0..config.connect_attempts {
         match talk(config, rpc_seq, &cmd) {
@@ -192,7 +290,7 @@ fn connect_daemon_sync(use_pipe: bool, port: u16) -> std::io::Result<Box<dyn Rpc
         if let Ok(pipe) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(crate::transport::PIPE_NAME)
+            .open(crate::transport::pipe_name())
         {
             return Ok(Box::new(pipe));
         }
@@ -211,18 +309,25 @@ fn connect_daemon_sync(use_pipe: bool, port: u16) -> std::io::Result<Box<dyn Rpc
     Ok(Box::new(stream))
 }
 
-fn talk(config: &BridgeConfig, rpc_seq: &mut u64, cmd: &Command) -> Result<Reply> {
-    *rpc_seq += 1;
-
+fn talk(config: &BridgeConfig, rpc_seq: &AtomicU64, cmd: &Command) -> Result<Reply> {
+    // Read the token per attempt: a daemon restarted under the browser writes
+    // a fresh one, and the next attempt picks it up.
+    let token = match &config.rpc_token {
+        Some(token) => token.clone(),
+        None => crate::transport::read_rpc_token()?,
+    };
     let mut stream = connect_daemon_sync(config.use_pipe, config.port)?;
     // Build the request after the connection exists: a failed connect (spawn
     // warming up) must not clone the payload per retry attempt.
     let req = crate::rpc::Request {
-        id: *rpc_seq,
+        id: rpc_seq.fetch_add(1, Ordering::Relaxed) + 1,
         cmd: cmd.clone(),
     };
 
-    let mut line = serde_json::to_string(&req)?;
+    // The auth line comes first on every connection, then the request. One
+    // write, so the two cannot be split across packets.
+    let mut line = crate::transport::auth_line(&token);
+    line.push_str(&serde_json::to_string(&req)?);
     line.push('\n');
     stream.write_all(line.as_bytes())?;
 
@@ -250,6 +355,13 @@ fn talk(config: &BridgeConfig, rpc_seq: &mut u64, cmd: &Command) -> Result<Reply
     }
     let resp: crate::rpc::Response = serde_json::from_slice(&resp_line)?;
     if resp.id != req.id {
+        // Id 0 is the daemon's connection-level refusal (a token it rejects).
+        if resp.id == 0 {
+            return Err(Error::State(
+                "daemon refused the connection (rpc token rejected or protocol mismatch)"
+                    .to_string(),
+            ));
+        }
         return Err(Error::State(format!(
             "daemon reply id mismatch: sent {}, got {}",
             req.id, resp.id
@@ -385,63 +497,202 @@ mod tests {
         write_frame(&mut sink, &okmsg).unwrap();
     }
 
-    /// Offline forward test: a one-shot fake daemon (std TcpListener on an
-    /// ephemeral loopback port) answers one canned response; the bridge must
-    /// regenerate its own RPC id, keep the caller's string id, and surface
-    /// the daemon's reply.
-    #[test]
-    fn forwards_to_daemon_and_back() {
+    /// `add` as the browser sends it, for the bridge tests.
+    fn add_cmd(url: &str) -> Command {
+        Command::Add {
+            url: url.to_string(),
+            dest_dir: None,
+            headers: Default::default(),
+            start_at: None,
+            kind: Default::default(),
+            sequential: Default::default(),
+            only_files: Default::default(),
+            on_duplicate: Default::default(),
+        }
+    }
+
+    /// Cloneable in-memory sink for `serve_with` output.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every native frame written to `out`, in arrival order.
+    fn frames(out: &SharedBuf) -> Vec<NativeResponse> {
+        let bytes = out.0.lock().unwrap().clone();
+        let mut cursor = Cursor::new(bytes);
+        let mut got = Vec::new();
+        while let Some(frame) = read_frame(&mut cursor).unwrap() {
+            got.push(serde_json::from_slice(&frame).unwrap());
+        }
+        got
+    }
+
+    /// Loopback stand-in for the daemon, one thread per connection like the
+    /// real one. It checks the auth line first and refuses a wrong token the
+    /// way the daemon does (id 0, then close). Otherwise it answers
+    /// `Added { id: url }`, after 1.2 s when the URL contains "slow". Every
+    /// request it answers is sent on the returned channel.
+    fn fake_daemon(token: &'static str) -> (u16, std::sync::mpsc::Receiver<crate::rpc::Request>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut line = Vec::new();
-            std::io::BufReader::new(&mut sock)
-                .read_until(b'\n', &mut line)
-                .unwrap();
-            // Whatever id the bridge assigned, echo it back in a canned reply.
-            let req: crate::rpc::Request = serde_json::from_slice(&line).unwrap();
-            let resp = crate::rpc::Response {
-                id: req.id,
-                reply: Reply::Added {
-                    id: "task-1".to_string(),
-                },
-            };
-            let mut out = serde_json::to_string(&resp).unwrap();
-            out.push('\n');
-            use std::io::Write;
-            (&mut sock).write_all(out.as_bytes()).unwrap();
-            req
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(sock) = sock else { return };
+                let seen_tx = seen_tx.clone();
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(sock);
+                    let mut auth = Vec::new();
+                    let _ = reader.read_until(b'\n', &mut auth);
+                    let authed = std::str::from_utf8(&auth)
+                        .is_ok_and(|l| crate::transport::auth_matches(l.trim_end(), token));
+                    let mut line = Vec::new();
+                    let _ = reader.read_until(b'\n', &mut line);
+                    let reply = if !authed {
+                        crate::rpc::Response {
+                            id: 0,
+                            reply: Reply::Error {
+                                message: "unauthorized".to_string(),
+                            },
+                        }
+                    } else {
+                        let req: crate::rpc::Request = serde_json::from_slice(&line).unwrap();
+                        let Command::Add { url, .. } = &req.cmd else {
+                            panic!("fake daemon only answers add")
+                        };
+                        let url = url.clone();
+                        if url.contains("slow") {
+                            std::thread::sleep(Duration::from_millis(1200));
+                        }
+                        let resp = crate::rpc::Response {
+                            id: req.id,
+                            reply: Reply::Added { id: url },
+                        };
+                        let _ = seen_tx.send(req);
+                        resp
+                    };
+                    let mut out = serde_json::to_string(&reply).unwrap();
+                    out.push('\n');
+                    let _ = reader.get_mut().write_all(out.as_bytes());
+                });
+            }
         });
+        (port, seen_rx)
+    }
 
+    /// The bridge forwards one command over loopback: it opens with the auth
+    /// line, assigns its own numeric rpc id, and returns the daemon's reply.
+    #[test]
+    fn forwards_to_daemon_and_back() {
+        let (port, seen) = fake_daemon("tok");
         let config = BridgeConfig {
             port,
             spawn_daemon: false,
             connect_attempts: 1,
             use_pipe: false,
+            rpc_token: Some("tok".to_string()),
             ..BridgeConfig::default()
         };
-        let mut seq = 0;
-        let reply = forward_once(
-            &config,
-            &mut seq,
-            Command::Add {
-                url: "https://x/f.zip".to_string(),
-                dest_dir: None,
-                headers: Default::default(),
-                start_at: None,
-                kind: Default::default(),
-                sequential: Default::default(),
-                only_files: Default::default(),
-            },
-        )
-        .unwrap();
+        let seq = AtomicU64::new(0);
+        let reply = forward_once(&config, &seq, add_cmd("https://x/f.zip")).unwrap();
         assert_eq!(
             serde_json::to_value(&reply).unwrap(),
-            serde_json::json!({"type": "added", "id": "task-1"})
+            serde_json::json!({"type": "added", "id": "https://x/f.zip"})
         );
-        let req = server.join().unwrap();
+        let req = seen.recv().unwrap();
         assert_eq!(req.id, 1, "bridge assigns its own numeric rpc ids");
+    }
+
+    #[test]
+    fn bridge_reports_a_refused_token_instead_of_a_mismatch() {
+        let (port, _seen) = fake_daemon("right");
+        let config = BridgeConfig {
+            port,
+            spawn_daemon: false,
+            connect_attempts: 1,
+            use_pipe: false,
+            rpc_token: Some("wrong".to_string()),
+            ..BridgeConfig::default()
+        };
+        let seq = AtomicU64::new(0);
+        let err = forward_once(&config, &seq, Command::List).unwrap_err();
+        assert!(err.to_string().contains("refused"), "got: {err}");
+    }
+
+    /// A slow request (the daemon holds it 1.2 s) must not hold up the fast
+    /// one that was read after it. The old serial loop answered in order.
+    #[test]
+    fn slow_request_does_not_hold_up_fast_ones() {
+        let (port, _seen) = fake_daemon("tok");
+        let config = BridgeConfig {
+            port,
+            spawn_daemon: false,
+            use_pipe: false,
+            rpc_token: Some("tok".to_string()),
+            ..BridgeConfig::default()
+        };
+        let mut input = Vec::new();
+        for (id, url) in [("slow", "https://x/slow.zip"), ("fast", "https://x/fast.zip")] {
+            let req = NativeRequest {
+                id: id.to_string(),
+                cmd: add_cmd(url),
+            };
+            write_frame(&mut input, &serde_json::to_vec(&req).unwrap()).unwrap();
+        }
+        let out = SharedBuf::default();
+        serve_with(config, Cursor::new(input), out.clone()).unwrap();
+        let ids: Vec<String> = frames(&out).into_iter().map(|f| f.id).collect();
+        assert_eq!(
+            ids,
+            ["fast", "slow"],
+            "the fast reply must not wait behind the slow one"
+        );
+    }
+
+    #[test]
+    fn unparseable_frame_gets_an_inband_error_and_serving_continues() {
+        let mut input = Vec::new();
+        write_frame(&mut input, b"not json").unwrap();
+        let config = BridgeConfig {
+            spawn_daemon: false,
+            use_pipe: false,
+            ..BridgeConfig::default()
+        };
+        let out = SharedBuf::default();
+        serve_with(config, Cursor::new(input), out.clone()).unwrap();
+        let got = frames(&out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "<parse>");
+        assert!(matches!(got[0].reply, Reply::Error { .. }));
+    }
+
+    /// A reply wider than one native frame must still answer its id.
+    #[test]
+    fn oversized_reply_becomes_an_inband_error() {
+        let resp = NativeResponse {
+            id: "big".to_string(),
+            reply: Reply::Error {
+                message: "x".repeat(HOST_TO_BROWSER_MAX),
+            },
+        };
+        let out = SharedBuf::default();
+        send_reply(&Mutex::new(out.clone()), &resp).unwrap();
+        let got = frames(&out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "big");
+        match &got[0].reply {
+            Reply::Error { message } => assert!(message.contains("too large"), "{message}"),
+            other => panic!("expected an error reply, got {other:?}"),
+        }
     }
 
     /// Daemon down (retry loop exhausted, spawn disabled) → an `error` reply,
@@ -460,10 +711,11 @@ mod tests {
             connect_attempts: 2,
             connect_delay: Duration::from_millis(20),
             use_pipe: false,
+            rpc_token: Some("t".to_string()),
             ..BridgeConfig::default()
         };
-        let mut seq = 0;
-        let result = forward_once(&config, &mut seq, Command::List);
+        let seq = AtomicU64::new(0);
+        let result = forward_once(&config, &seq, Command::List);
         assert!(result.is_err(), "expected unreachable daemon error");
     }
 }

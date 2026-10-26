@@ -55,11 +55,9 @@ pub struct UpdateAsset {
 }
 
 impl UpdateAsset {
+    /// Shape check for the path-safety gate; release picking is exact, see [`pick_assets`].
     fn is_windows_setup(&self) -> bool {
         self.name.ends_with("-x86_64-windows-setup.exe")
-    }
-    fn is_sums(&self) -> bool {
-        self.name.eq_ignore_ascii_case("SHA256SUMS.txt")
     }
     /// The URL to fetch bytes from: the web URL when the API supplied one
     /// (GitHub always does), else the raw `url` (local mocks).
@@ -97,10 +95,11 @@ pub struct UpdateInfo {
     pub notes: Option<String>,
     /// `latest` is strictly newer than `current`.
     pub update_available: bool,
-    /// Windows installer asset, when attached.
+    /// Windows installer for `latest`: exact name, served from this repo's
+    /// release for the tag (see [`pick_assets`]). `None` when absent.
     #[serde(default)]
     pub setup: Option<UpdateAsset>,
-    /// Checksum source for `setup`, when attached.
+    /// `SHA256SUMS.txt` of the same release; required to install `setup`.
     #[serde(default)]
     pub sha256: Option<UpdateAsset>,
 }
@@ -140,8 +139,7 @@ pub async fn fetch_latest_from(endpoint: &str, current: &str) -> Result<UpdateIn
 
     let latest = rel.tag_name.trim().trim_start_matches(['v', 'V']).to_string();
     let update_available = compare_versions(&latest, current) == Ordering::Greater;
-    let setup = rel.assets.iter().find(|a| a.is_windows_setup()).cloned();
-    let sha256 = rel.assets.iter().find(|a| a.is_sums()).cloned();
+    let (setup, sha256) = pick_assets(&latest, &rel.assets);
     Ok(UpdateInfo {
         current: current.to_string(),
         latest,
@@ -152,6 +150,43 @@ pub async fn fetch_latest_from(endpoint: &str, current: &str) -> Result<UpdateIn
         setup,
         sha256,
     })
+}
+
+/// Name of the Windows installer that release `version` must carry.
+pub fn setup_name(version: &str) -> String {
+    format!("ripdl-v{version}-x86_64-windows-setup.exe")
+}
+
+/// The checksum file every release carries next to its installer.
+pub const SUMS_NAME: &str = "SHA256SUMS.txt";
+
+/// The installer and checksum of release `version`: exact names, and only
+/// when served from this repo's release page for that tag. A lookalike name,
+/// another host, or an older build's installer is never offered as an update.
+pub fn pick_assets(version: &str, assets: &[UpdateAsset]) -> (Option<UpdateAsset>, Option<UpdateAsset>) {
+    let pick = |name: &str| {
+        let served_from = format!("https://github.com/{RELEASE_REPO}/releases/download/v{version}/{name}");
+        assets
+            .iter()
+            .find(|a| a.name == name && a.browser_download_url == served_from)
+            .cloned()
+    };
+    (pick(&setup_name(version)), pick(SUMS_NAME))
+}
+
+/// The installer and checksum an install needs, both or nothing. An install
+/// never runs without the digest that proves the bytes.
+pub fn plan_install(info: &UpdateInfo) -> Result<(&UpdateAsset, &UpdateAsset)> {
+    let setup = info.setup.as_ref().ok_or_else(|| {
+        Error::Update(format!("release v{} has no verified Windows installer", info.latest))
+    })?;
+    let sums = info.sha256.as_ref().ok_or_else(|| {
+        Error::Update(format!(
+            "release v{} has no {}; refusing an unverified install",
+            info.latest, SUMS_NAME
+        ))
+    })?;
+    Ok((setup, sums))
 }
 
 /// Dotted compare: "0.4.10" > "0.3.1", "0.10" > "0.9", "0.4" == "0.4.0".
@@ -235,17 +270,23 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Download the Windows setup into `dest_dir`. When a SHA256SUMS asset is
-/// given, the filename must be listed there and the digest must match.
-/// A previously downloaded copy (same name + size, the directory only
-/// retains hash-verified files) is reused without re-downloading.
+/// An installer whose bytes matched the release's checksum.
+#[derive(Debug, Clone)]
+pub struct VerifiedSetup {
+    pub path: PathBuf,
+    /// Lowercase hex SHA-256 the bytes were checked against.
+    pub sha256: String,
+}
+
+/// Fetch the release installer into `dest_dir`, verified against the release's
+/// `SHA256SUMS.txt`. The checksum is read on every call, and a file is reused
+/// only when its bytes hash to that checksum right now (never by name or
+/// size). A download that fails the check is deleted, not kept.
 pub async fn download_setup(
     dest_dir: &std::path::Path,
     setup: &UpdateAsset,
-    sums: Option<&UpdateAsset>,
-) -> Result<PathBuf> {
-    use sha2::{Digest, Sha256};
-
+    sums: &UpdateAsset,
+) -> Result<VerifiedSetup> {
     // Path-safety: the name is joined into dest_dir unescaped.
     let suspicious = setup.name.is_empty()
         || setup.name.contains("..")
@@ -259,52 +300,66 @@ pub async fn download_setup(
     std::fs::create_dir_all(dest_dir).map_err(Error::Io)?;
     let dest = dest_dir.join(&setup.name);
 
-    // Fast reuse path: exact name+size match on an existing file.
-    if setup.size > 0 {
-        if let Ok(md) = std::fs::metadata(&dest) {
-            if md.len() == setup.size {
-                return Ok(dest);
-            }
-        }
-    }
-
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Update(format!("http client: {e}")))?;
 
-    // Expected digest from SHA256SUMS.txt. Missing sums for a filename the
-    // sums file was expected to cover = refuse, never install blind.
-    let mut expected = None;
-    if let Some(sums) = sums {
-        let text = client
-            .get(sums.download_url())
-            .header(reqwest::header::USER_AGENT, "ripdl-updater")
-            .send()
-            .await
-            .map_err(|e| Error::Update(format!("sums unreachable: {e}")))?
-            .error_for_status()
-            .map_err(|e| Error::Update(format!("sums unreachable: {e}")))?
-            .text()
-            .await
-            .map_err(|e| Error::Update(format!("sums unreadable: {e}")))?;
-        expected = parse_sums(&text).get(&setup.name).cloned();
-        if expected.is_none() {
-            return Err(Error::Update(format!(
-                "{} not listed in {}; refusing unverified install",
-                setup.name, sums.name
-            )));
+    // The digest comes first, and it is required: an installer that the
+    // checksum file does not list is never fetched.
+    let text = client
+        .get(sums.download_url())
+        .header(reqwest::header::USER_AGENT, "ripdl-updater")
+        .send()
+        .await
+        .map_err(|e| Error::Update(format!("sums unreachable: {e}")))?
+        .error_for_status()
+        .map_err(|e| Error::Update(format!("sums unreachable: {e}")))?
+        .text()
+        .await
+        .map_err(|e| Error::Update(format!("sums unreadable: {e}")))?;
+    let expected = parse_sums(&text).get(&setup.name).cloned().ok_or_else(|| {
+        Error::Update(format!(
+            "{} not listed in {}; refusing unverified install",
+            setup.name, sums.name
+        ))
+    })?;
+
+    // A copy already on disk is reused only if its bytes hash to the digest.
+    if let Ok(file) = std::fs::File::open(&dest) {
+        if hash_reader(file).ok().as_deref() == Some(expected.as_str()) {
+            return Ok(VerifiedSetup { path: dest, sha256: expected });
         }
     }
 
-    // Same size but wrong content is possible for a size-only reuse miss:
-    // verify bytes against the digest when one is known.
-    if let (Some(want), Ok(bytes)) = (&expected, std::fs::read(&dest)) {
-        if hex(&Sha256::digest(&bytes)) == *want {
-            return Ok(dest);
+    let tmp = dest.with_extension("part");
+    let got = match stream_to(&client, setup, &tmp).await {
+        Ok(got) => got,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
         }
+    };
+    if got != expected {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(Error::Update(format!(
+            "checksum mismatch for {}: got {got}, want {expected}",
+            setup.name
+        )));
     }
+    tokio::fs::rename(&tmp, &dest).await.map_err(Error::Io)?;
+    Ok(VerifiedSetup { path: dest, sha256: expected })
+}
+
+/// Streams the installer to `tmp`, enforcing the size cap and the listed
+/// size. Returns the SHA-256 of the bytes written.
+async fn stream_to(
+    client: &reqwest::Client,
+    setup: &UpdateAsset,
+    tmp: &std::path::Path,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
 
     let mut resp = client
         .get(setup.download_url())
@@ -314,16 +369,10 @@ pub async fn download_setup(
         .map_err(|e| Error::Update(format!("download failed: {e}")))?
         .error_for_status()
         .map_err(|e| Error::Update(format!("download failed: {e}")))?;
-    if let Some(len) = resp.content_length() {
-        if len > MAX_SETUP_BYTES {
-            return Err(Error::Update("setup.exe impossibly large".to_string()));
-        }
+    if resp.content_length().is_some_and(|len| len > MAX_SETUP_BYTES) {
+        return Err(Error::Update("setup.exe impossibly large".to_string()));
     }
-
-    // Atomic: stream to `.part`, then rename, so a half download can not
-    // be mistaken for a complete installer by the size-based reuse path.
-    let tmp = dest.with_extension("part");
-    let mut file = tokio::fs::File::create(&tmp).await.map_err(Error::Io)?;
+    let mut file = tokio::fs::File::create(tmp).await.map_err(Error::Io)?;
     let mut received: u64 = 0;
     let mut hasher = Sha256::new();
     while let Some(chunk) = resp
@@ -333,7 +382,6 @@ pub async fn download_setup(
     {
         received += chunk.len() as u64;
         if received > MAX_SETUP_BYTES {
-            let _ = tokio::fs::remove_file(&tmp).await;
             return Err(Error::Update("setup.exe impossibly large".to_string()));
         }
         hasher.update(&chunk);
@@ -341,26 +389,51 @@ pub async fn download_setup(
     }
     file.flush().await.map_err(Error::Io)?;
     drop(file);
-
-    if let Some(want) = &expected {
-        let got = hex(&hasher.finalize());
-        if got != *want {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(Error::Update(format!(
-                "checksum mismatch for {}: got {got}, want {want}",
-                setup.name
-            )));
-        }
-    }
     if setup.size > 0 && received != setup.size {
-        let _ = tokio::fs::remove_file(&tmp).await;
         return Err(Error::Update(format!(
             "size mismatch: got {received}, expected {}",
             setup.size
         )));
     }
-    tokio::fs::rename(&tmp, &dest).await.map_err(Error::Io)?;
-    Ok(dest)
+    Ok(hex(&hasher.finalize()))
+}
+
+/// SHA-256 of everything `reader` yields, as lowercase hex.
+fn hash_reader(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// Opens an installer for launch and checks that it still holds `sha256`.
+/// On Windows the handle shares read access only, so nothing can replace the
+/// file while it is open: keep the returned handle until the installer has
+/// started.
+pub fn open_verified(path: &std::path::Path, sha256: &str) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ (0x1) and nothing else: no writer can open the file.
+        opts.share_mode(0x0000_0001);
+    }
+    let file = opts.open(path).map_err(Error::Io)?;
+    let got = hash_reader(&file).map_err(Error::Io)?;
+    if got != sha256 {
+        return Err(Error::Update(format!(
+            "installer changed on disk (sha256 {got}, want {sha256}); refusing to run it"
+        )));
+    }
+    Ok(file)
 }
 
 /// Whether this process already has administrator rights. Silent
@@ -578,38 +651,78 @@ mod tests {
 
     #[test]
     fn asset_picking() {
+        let served = |name: &str| format!("https://github.com/ShiniM0d0ri/ripdl/releases/download/v0.4.0/{name}");
+        let asset = |name: &str| UpdateAsset {
+            name: name.into(),
+            url: "https://api.github.com/repos/ShiniM0d0ri/ripdl/releases/assets/1".into(),
+            browser_download_url: served(name),
+            size: 1,
+        };
         let assets = vec![
-            UpdateAsset {
-                name: "ripdl-v0.4.0-x86_64-linux.tar.gz".into(),
-                url: "http://api/x/l".into(),
-                browser_download_url: "http://x/l".into(),
-                size: 1,
-            },
-            UpdateAsset {
-                name: "ripdl-v0.4.0-x86_64-windows.zip".into(),
-                url: "http://api/x/p".into(),
-                browser_download_url: "http://x/p".into(),
-                size: 2,
-            },
-            UpdateAsset {
-                name: "ripdl-v0.4.0-x86_64-windows-setup.exe".into(),
-                url: "http://api/x/s".into(),
-                browser_download_url: "http://x/s".into(),
-                size: 3,
-            },
-            UpdateAsset {
-                name: "SHA256SUMS.txt".into(),
-                url: "http://api/x/h".into(),
-                browser_download_url: "http://x/h".into(),
-                size: 4,
-            },
+            asset("ripdl-v0.4.0-x86_64-linux.tar.gz"),
+            asset("ripdl-v0.4.0-x86_64-windows.zip"),
+            asset("ripdl-v0.4.0-x86_64-windows-setup.exe"),
+            asset("SHA256SUMS.txt"),
         ];
-        let setup = assets.iter().find(|a| a.is_windows_setup()).unwrap();
-        let sums = assets.iter().find(|a| a.is_sums()).unwrap();
-        assert_eq!(setup.download_url(), "http://x/s"); // installer, not the portable zip
-        assert_eq!(sums.download_url(), "http://x/h");
-        // API asset URLs return JSON metadata; never download from them.
-        assert_ne!(setup.download_url(), setup.url);
+        let (setup, sums) = pick_assets("0.4.0", &assets);
+        // The installer, not the portable zip; never the API JSON URL.
+        let setup = setup.unwrap();
+        assert_eq!(setup.name, "ripdl-v0.4.0-x86_64-windows-setup.exe");
+        assert_eq!(setup.download_url(), served(&setup.name));
+        assert_eq!(sums.unwrap().name, SUMS_NAME);
+    }
+
+    /// Lookalikes, foreign hosts and older builds are never offered.
+    #[test]
+    fn pick_rejects_lookalikes_and_foreign_hosts() {
+        let served = |name: &str| format!("https://github.com/ShiniM0d0ri/ripdl/releases/download/v0.4.0/{name}");
+        let asset = |name: &str, from: &str| UpdateAsset {
+            name: name.into(),
+            url: "https://api.github.com/x".into(),
+            browser_download_url: from.into(),
+            size: 1,
+        };
+        // Right name, foreign host.
+        let foreign = vec![
+            asset("ripdl-v0.4.0-x86_64-windows-setup.exe", "https://evil.example/ripdl-v0.4.0-x86_64-windows-setup.exe"),
+            asset("SHA256SUMS.txt", &served("SHA256SUMS.txt")),
+        ];
+        let (setup, sums) = pick_assets("0.4.0", &foreign);
+        assert!(setup.is_none());
+        assert!(sums.is_some());
+        // Lookalike suffix, an older build's installer, a renamed checksum file.
+        let lookalikes = vec![
+            asset("evil-x86_64-windows-setup.exe", &served("evil-x86_64-windows-setup.exe")),
+            asset("ripdl-v0.3.9-x86_64-windows-setup.exe", &served("ripdl-v0.3.9-x86_64-windows-setup.exe")),
+            asset("sha256sums.txt", &served("sha256sums.txt")),
+        ];
+        let (setup, sums) = pick_assets("0.4.0", &lookalikes);
+        assert!(setup.is_none());
+        assert!(sums.is_none());
+    }
+
+    #[test]
+    fn plan_install_needs_both_assets() {
+        let asset = |name: &str| UpdateAsset {
+            name: name.into(),
+            browser_download_url: format!("https://github.com/ShiniM0d0ri/ripdl/releases/download/v0.4.0/{name}"),
+            ..Default::default()
+        };
+        let mut info = UpdateInfo {
+            current: "0.3.1".into(),
+            latest: "0.4.0".into(),
+            url: String::new(),
+            published_at: None,
+            notes: None,
+            update_available: true,
+            setup: Some(asset(&setup_name("0.4.0"))),
+            sha256: None,
+        };
+        assert!(plan_install(&info).is_err(), "no checksum, no install");
+        info.sha256 = Some(asset(SUMS_NAME));
+        let (setup, sums) = plan_install(&info).unwrap();
+        assert_eq!(setup.name, "ripdl-v0.4.0-x86_64-windows-setup.exe");
+        assert_eq!(sums.name, SUMS_NAME);
     }
 
     /// Regression: GitHub's asset object carries both `url` (API JSON) and
@@ -643,60 +756,195 @@ mod tests {
         assert_eq!(m.len(), 2); // junk line filtered (wrong digest length)
     }
 
+    const SETUP_NAME: &str = "ripdl-v0.4.0-x86_64-windows-setup.exe";
+
+    /// Loopback server that answers GET by exact path and records each path.
+    struct Mock {
+        addr: std::net::SocketAddr,
+        hits: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Mock {
+        async fn start(routes: Vec<(String, Vec<u8>)>) -> Mock {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = hits.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                    seen.lock().unwrap().push(path.clone());
+                    let body = routes.iter().find(|(p, _)| *p == path).map(|(_, b)| b.clone());
+                    let head = match &body {
+                        Some(b) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            b.len()
+                        ),
+                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                    };
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    if let Some(b) = body {
+                        let _ = sock.write_all(&b).await;
+                    }
+                }
+            });
+            Mock { addr, hits, task }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.addr)
+        }
+
+        fn paths(&self) -> Vec<String> {
+            self.hits.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// An asset as a release lists it, served by `mock`.
+    fn asset_at(mock: &Mock, name: &str, size: u64) -> UpdateAsset {
+        UpdateAsset {
+            name: name.to_string(),
+            url: mock.url(&format!("/api/{name}")),
+            browser_download_url: mock.url(&format!("/{name}")),
+            size,
+        }
+    }
+
+    /// A SHA256SUMS.txt that lists `digest` for the installer.
+    fn sums_listing(digest: &str) -> Vec<u8> {
+        format!("{digest}  {SETUP_NAME}\n").into_bytes()
+    }
+
     #[tokio::test]
     async fn download_verifies_and_reuses() {
         use sha2::{Digest, Sha256};
-
-        let body = "SETUP-BYTES-0123456789ABCDEF".as_bytes().to_vec();
+        let body = b"SETUP-BYTES-0123456789ABCDEF".to_vec();
         let sha = hex(&Sha256::digest(&body));
-        let name = "ripdl-v0.4.0-x86_64-windows-setup.exe".to_string();
-        let sums = format!("{sha}  {name}\n");
-        let (body_len, sums_len) = (body.len(), sums.len());
-        let body_s = String::from_utf8(body.clone()).unwrap();
+        let sums = sums_listing(&sha);
+        let mock = Mock::start(vec![
+            ("/SHA256SUMS.txt".into(), sums.clone()),
+            (format!("/{SETUP_NAME}"), body.clone()),
+        ])
+        .await;
+        let setup = asset_at(&mock, SETUP_NAME, body.len() as u64);
+        let sums_asset = asset_at(&mock, SUMS_NAME, sums.len() as u64);
+        let dir = std::env::temp_dir().join(format!("ripdl-update-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            // Sums first, then the setup file.
-            for (snippet, payload) in
-                [("/SHA256SUMS.txt", sums), ("windows-setup.exe", body_s)]
-            {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                let mut buf = [0u8; 8192];
-                let n = sock.read(&mut buf).await.unwrap();
-                assert!(std::str::from_utf8(&buf[..n]).unwrap().contains(snippet));
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                );
-                sock.write_all(resp.as_bytes()).await.unwrap();
-            }
-        });
+        let got = download_setup(&dir, &setup, &sums_asset).await.unwrap();
+        assert_eq!(got.sha256, sha);
+        assert_eq!(std::fs::read(&got.path).unwrap(), body);
+        assert_eq!(
+            mock.paths(),
+            vec!["/SHA256SUMS.txt".to_string(), format!("/{SETUP_NAME}")]
+        );
 
-        // GitHub-shaped assets: `url` is the API endpoint (JSON), the web URL
-        // is what must be fetched. Point `url` at the mock too so the test
-        // stays offline while still exercising the browser_download_url path.
-        let setup = UpdateAsset {
-            name: name.clone(),
-            url: format!("http://{addr}/api-json"),
-            browser_download_url: format!("http://{addr}/{name}"),
-            size: body_len as u64,
-        };
-        let sums_asset = UpdateAsset {
-            name: "SHA256SUMS.txt".to_string(),
-            url: format!("http://{addr}/api-json"),
-            browser_download_url: format!("http://{addr}/SHA256SUMS.txt"),
-            size: sums_len as u64,
-        };
-        let dir = std::env::temp_dir().join(format!("ripdl-update-test-{}", std::process::id()));
-        let got = download_setup(&dir, &setup, Some(&sums_asset)).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(std::fs::read(&got).unwrap(), body);
+        // Reuse: the checksum is read again, the installer is not fetched.
+        let again = download_setup(&dir, &setup, &sums_asset).await.unwrap();
+        assert_eq!(again.path, got.path);
+        assert_eq!(mock.paths().len(), 3);
+        assert_eq!(mock.paths()[2], "/SHA256SUMS.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // Reuse: on-disk file matches, no second run against the mock.
-        let again = download_setup(&dir, &setup, Some(&sums_asset)).await.unwrap();
-        assert_eq!(again, got);
+    /// Regression: reuse used to trust name + size. A same-size file with
+    /// other bytes must be fetched again, never launched.
+    #[tokio::test]
+    async fn same_size_tampered_copy_is_not_reused() {
+        use sha2::{Digest, Sha256};
+        let body = b"GOOD-INSTALLER-BYTES".to_vec();
+        let sums = sums_listing(&hex(&Sha256::digest(&body)));
+        let mock = Mock::start(vec![
+            ("/SHA256SUMS.txt".into(), sums.clone()),
+            (format!("/{SETUP_NAME}"), body.clone()),
+        ])
+        .await;
+        let setup = asset_at(&mock, SETUP_NAME, body.len() as u64);
+        let sums_asset = asset_at(&mock, SUMS_NAME, sums.len() as u64);
+        let dir = std::env::temp_dir().join(format!("ripdl-update-tamper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Same name and size as the release, different bytes.
+        std::fs::write(dir.join(SETUP_NAME), vec![b'X'; body.len()]).unwrap();
+
+        let got = download_setup(&dir, &setup, &sums_asset).await.unwrap();
+        assert_eq!(std::fs::read(&got.path).unwrap(), body);
+        assert!(
+            mock.paths().contains(&format!("/{SETUP_NAME}")),
+            "a tampered copy must be fetched again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_leaves_nothing_behind() {
+        let served = b"NOT-WHAT-THE-SUMS-SAY".to_vec();
+        let sums = sums_listing(&"0".repeat(64));
+        let mock = Mock::start(vec![
+            ("/SHA256SUMS.txt".into(), sums.clone()),
+            (format!("/{SETUP_NAME}"), served.clone()),
+        ])
+        .await;
+        let setup = asset_at(&mock, SETUP_NAME, served.len() as u64);
+        let sums_asset = asset_at(&mock, SUMS_NAME, sums.len() as u64);
+        let dir = std::env::temp_dir().join(format!("ripdl-update-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = download_setup(&dir, &setup, &sums_asset).await.unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        assert!(!dir.join(SETUP_NAME).exists());
+        assert!(!dir.join("ripdl-v0.4.0-x86_64-windows-setup.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unlisted_installer_is_never_fetched() {
+        let sums = format!("{}  ripdl-v0.4.0-x86_64-windows.zip\n", "a".repeat(64)).into_bytes();
+        let mock = Mock::start(vec![
+            ("/SHA256SUMS.txt".into(), sums.clone()),
+            (format!("/{SETUP_NAME}"), b"x".to_vec()),
+        ])
+        .await;
+        let setup = asset_at(&mock, SETUP_NAME, 1);
+        let sums_asset = asset_at(&mock, SUMS_NAME, sums.len() as u64);
+        let dir = std::env::temp_dir().join(format!("ripdl-update-unlisted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = download_setup(&dir, &setup, &sums_asset).await.unwrap_err();
+        assert!(err.to_string().contains("not listed"), "{err}");
+        assert_eq!(mock.paths(), vec!["/SHA256SUMS.txt".to_string()]);
+    }
+
+    /// The launch re-check: right bytes open, changed bytes are refused, and
+    /// on Windows the open handle blocks any writer.
+    #[test]
+    fn open_verified_checks_the_bytes_and_holds_the_file() {
+        use sha2::{Digest, Sha256};
+        let dir = std::env::temp_dir().join(format!("ripdl-open-verified-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SETUP_NAME);
+        std::fs::write(&path, b"INSTALLER").unwrap();
+        let sha = hex(&Sha256::digest(b"INSTALLER"));
+
+        assert!(open_verified(&path, &"0".repeat(64)).is_err());
+        let held = open_verified(&path, &sha).unwrap();
+        #[cfg(windows)]
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&path).is_err(),
+            "a verified installer must not be writable while it is held"
+        );
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

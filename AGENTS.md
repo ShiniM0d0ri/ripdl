@@ -6,7 +6,7 @@ current when build commands, architecture, or conventions change.
 ## What this is
 
 `ripdl` — a free, ad-free, multi-segment download manager in Rust. An
-open-source alternative to IDM (overpriced) and FDM (ad-supported). Zero
+open-source alternative to IDM and FDM. Zero
 telemetry, zero ads, forever — non-negotiable, code it into no feature.
 
 ## Layout
@@ -47,6 +47,56 @@ Smoke-test URL (manual verification only):
 `https://speed.cloudflare.com/__down?bytes=N` — no range support, exercises
 the single-stream path.
 
+Extension checks are plain node scripts. `plugins` and `handoff` also run in
+CI; `duplicate-model` is local only:
+
+```sh
+node ext/test/plugins.test.mjs
+node ext/test/handoff.test.mjs
+node ext/test/duplicate-model.test.mjs
+```
+
+End-to-end gate (manual, not in CI): one isolated pass of the CLI, a private
+daemon, the extension in headless Edge, and the GUI (single-instance hand-off,
+Settings, Add URL). The GUI phase needs the interactive desktop, so run it
+through the helper, one pass at a time:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ext\test\e2e\run-in-session.ps1 -HarnessArgs "--no-build"
+```
+
+- `--no-build` reuses `target\e2e\debug\*.exe`. Without it the harness first runs
+  `cargo build -p ripdl-cli -p ripdl-daemon -p ripdl-gui --target-dir target/e2e`;
+  rebuild before trusting a `--no-build` pass after Rust edits.
+- Full build: run the same helper without `-HarnessArgs`. An empty `""` is dropped
+  on the PowerShell 5.1 command line and the parameter binding fails.
+- `--only=cli,ext,gui` limits the phases. Exit 0 = all checks pass, 1 = some
+  failed, 2 = harness exception.
+- Scenarios (101 checks; last full pass 2026-10-26, 101/101):
+  - Setup (1): the private daemon stays inside the run folders.
+  - CLI, A0-A12 (32): the daemon answers on its own pipe; ranged and no-range
+    downloads match SHA-256; a wrong token gets no task list; pause, address
+    refresh and resume keep the bytes; a duplicate add returns the existing id;
+    `rm` removes the file and the task; bad config values are refused; a bundle
+    preview becomes one task of three parts; `info` and a direct download add no
+    task; LAN drop box: the page hides the pairing code, a wrong code gets 403
+    before the body, the right code delivers with a matching SHA-256.
+  - Extension, B0-B17 (61): headless Edge with the real bridge; the copy chip for
+    prose, bundles, a textarea and one link; a popup add through the native
+    host; the duplicate window for finished, paused and captured files (Download
+    again, Resume, browser keeps its copy); the options page; a daemon stop and
+    restart still lands a fallback byte for byte; SHA-256 of every fixture; box
+    and prose links never fetched; Referer rules; no console errors.
+  - GUI, C0-C3 (5): first window up; a second launch hands off and exits; Settings
+    and Add URL open. Closing checks (2): the installed daemon, its queue and
+    Downloads are untouched.
+- Output: `target\e2e\runs\<RUN>\` (`report.json`, logs, `shots\`, `downloads\`).
+- Isolation: a private daemon (own pipe, TCP fallback, data folder), its own GUI
+  pipe and WebView2 profile, a dead proxy, and the update check off. The
+  installed daemon, its queue, and the user's Downloads must not change. The LAN
+  check briefly opens the private drop box on all interfaces (the one network
+  exception).
+
 ## Environment gotchas
 
 - **PowerShell**: `cargo ... 2>&1 | Select-Object ...` wraps stderr as
@@ -58,6 +108,19 @@ the single-stream path.
   unix socket `<data_dir>/rpc.sock` on non-Windows. Client transport helpers
   live in `ripdl_core.transport`. Daemon policy file:
   `%LOCALAPPDATA%\ripdl\config.json` (all-optional fields).
+- **E2E GUI**: the agent shell is elevated (session 0), where WebView2 cannot
+  open windows (`0x80070578`), and elevation ignores
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`. Run GUI checks only through
+  `run-in-session.ps1`, which starts the harness in the desktop session via a
+  one-off scheduled task and waits for `done.flag`. The extension phase is
+  headless Edge and needs no desktop.
+- Send & Receive is outside the gate: opening it runs LAN discovery, so the
+  drop box is covered by API checks instead.
+- Do not run `research/gui-*.js` probes: they spawn `target\debug\ripdl-gui.exe`
+  without isolation and reach the installed daemon.
+- Keep PowerShell scripts ASCII-only (Windows PowerShell 5.1 reads BOM-less
+  files as ANSI). Wait on a per-call event id and check `done.flag`; a fixed
+  `Wait-Event` source id can return a stale event from an earlier run.
 
 ## Conventions
 
@@ -79,8 +142,9 @@ the single-stream path.
 
 ## CI / release
 
-- `.github/workflows/ci.yml`: on every push/PR, `cargo check` + offline
-  `cargo test` on windows-latest and ubuntu-latest.
+- `.github/workflows/ci.yml`: on pushes to `main` and PRs, `cargo check` +
+  offline `cargo test` + the `plugins` and `handoff` node tests, on
+  windows-latest and ubuntu-latest. The e2e gate is not in CI.
 - `.github/workflows/release.yml`: on tag `v*` (plus `workflow_dispatch`
   dry run - packages everything, no release). Version source = workspace
   Cargo.toml (tag must match). Artifacts: `ripdl-vX.Y.Z-x86_64-windows-`
@@ -142,7 +206,7 @@ auto-spawns the daemon like the bridge). Torrent rows show display names +
 Torrents sidebar filter; "Add Torrent" picker; details dialog (double-click)
 with Files/Peers/Trackers tabs refreshed every 2s. P4 complete and E2E
 verified (2026-10-19): yt-dlp standalone binary via config `ytdlp_path`
-watched the "Me at the zoo" task end-to-end (`ripdl add … --video` →
+watched a test clip end-to-end (`ripdl add … --video` →
 completed webm in Downloads), and the popup chain proven over CDP in
 headless Edge (branded Chrome ≥137 ignores `--load-extension`; a repurposed
 driver lives at `research/ext-e2e-cdp.js`): `ripdl_send` add and
@@ -367,14 +431,19 @@ click/menu, second-instance forward - goes through `reveal()`, which resumes
 before showing), and the webview is software-composited
 (`additionalBrowserArgs = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection
 --disable-gpu"`; setting it replaces wry's defaults, so they are repeated).
-Measured here (2 completed tasks): idle private 192 -> 101 MB, resident 418 ->
-316 MB shown, ~34 MB a minute after hiding, hidden CPU ~0 % (the poll timer is
-frozen with the page). Two traps worth remembering: a plain hide frees nothing
-(WebView2 keeps everything resident) and Tauri only flips the *window's*
-visible flag, never the webview's, so `SetIsVisible(false)` is mandatory or
-`TrySuspend` fails with ERROR_INVALID_STATE; resident memory also takes ~30-60 s
-to be trimmed after suspension, so measure late. Resume paints the last frame
-and the pending poll fires at once (verified hide -> 50 s -> reveal).
+Approximate A/B (2026-10-26, dev builds, 2 runs per side, same fixtures, GUI and
+WebView2 combined; baseline = HEAD without these two changes, not v0.3.13; local
+bench, not committed): hidden 30-90 s working set 53-60 MB vs 341-369 MB; hidden
+private commit ~106 MB vs ~178 MB; visible private commit ~110 MB vs ~171 MB, most
+of it the GPU process (~78 MB before, ~15 MB now); hidden CPU 0.0 % vs 2.5 %; after
+reveal working set ~155 MB vs ~330 MB. Visible working set barely moves (~340 vs
+~361 MB). Report working set next to private commit: working set double-counts
+shared pages. Two traps worth remembering: a plain hide frees nothing (WebView2
+keeps everything resident) and Tauri only flips the *window's* visible flag, never
+the webview's, so `SetIsVisible(false)` is mandatory or `TrySuspend` fails with
+ERROR_INVALID_STATE; resident memory also takes 30-90 s to be trimmed after
+suspension, so measure late. Resume paints the last frame and the pending poll
+fires at once (verified hide -> 50 s -> reveal).
 On main after the tag: the single-instance guard no longer fails open when an
 instance owns the pipe but cannot be poked - a GUI relaunched by an elevated
 installer runs elevated, and a normal-integrity second launch cannot write to

@@ -55,7 +55,7 @@ pub struct LanFile {
 /// A receiver discovered on the local network.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LanPeer {
-    /// Base URL, e.g. `http://192.168.1.8:8463`.
+    /// Base URL, e.g. `http://192.0.2.10:8463`.
     pub url: String,
     /// Device name shown to the user.
     pub name: String,

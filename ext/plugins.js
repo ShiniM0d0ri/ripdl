@@ -283,3 +283,18 @@ export async function pluginResolve(part) {
     }
     return null;
 }
+
+/** Does an enabled plugin claim this URL? With `needResolve`, only plugins
+ * that can turn the link into a direct one count (share links). */
+export async function pluginMatches(url, needResolve = false) {
+    let entries = [];
+    try { entries = await registry(); } catch { return false; }
+    for (const e of entries) {
+        if (!e.enabled || !e.plugin?.match) continue;
+        if (needResolve && !e.plugin.resolve) continue;
+        try {
+            if (e.plugin.match(url)) return true;
+        } catch { /* a broken plugin claims nothing */ }
+    }
+    return false;
+}

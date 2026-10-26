@@ -39,3 +39,7 @@ jobs:
       # Extension plugin layer: recipe engine + script shape + built-ins.
       - name: Extension plugin tests
         run: node ext/test/plugins.test.mjs
+
+      # Browser handoff contract: one onDeterminingFilename decision per download.
+      - name: Extension handoff tests
+        run: node ext/test/handoff.test.mjs

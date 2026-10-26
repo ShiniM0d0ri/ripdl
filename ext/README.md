@@ -58,7 +58,7 @@ load of *any* ripdl extension build has id
 
 ## How capture works
 
-- Context menu on a link/page -> the URL is queued to the daemon.
+- Context menu on a link -> the link goes through the same hoster plugins as the chip, then is queued with the page as Referer.
 - Right-click over a text selection -> the links inside the selection are
   grouped the way the copy chip groups them, then queued: parts of one
   multi-part set become ONE bundle task (one folder), single links stay
@@ -72,16 +72,18 @@ load of *any* ripdl extension build has id
   clipboard, and the chip lives in a shadow root so page CSS cannot touch
   it. An anchor's visible text is used as the part filename only when it
   actually names a file (a page full of "Download" anchors must not rename
-  every part "Download").
+  every part "Download"). An anchor with no file-looking label is offered only when the copied text itself has an http(s) URL, or when a plugin or known file type claims its URL.
 - Grouping is the daemon's job (`preview_bundle`), so the chip, the GUI
   dialog and the CLI all agree. A daemon that predates bundles is detected
   through its `config` reply (`bundles` capability flag) and the offer
   degrades to one ordinary download per link - the chip says so.
 - While the daemon answers, browser-initiated downloads are intercepted in
-  `downloads.onDeterminingFilename` and re-queued fast (with their Referer
-  and browser User-Agent so protected links still resolve). If the daemon
-  disappears, captures stop interfering immediately: the browser downloads
-  normally.
+  `downloads.onDeterminingFilename` (with their Referer and browser
+  User-Agent so protected links still resolve). The daemon probes the link
+  first, and the browser's copy is cancelled only once the daemon has queued
+  it. If the daemon refuses or does not answer within 3 seconds, the browser
+  keeps the download. If the daemon disappears, captures stop interfering
+  immediately.
 - The popup controls two switches: intercept on/off, and cookie sharing.
   Cookie sharing is an optional permission - turning it on makes the
   BROWSER ask you; turning it off revokes the permission entirely. Cookies
@@ -121,13 +123,13 @@ would group under and the direct URL it would resolve to. Nothing is queued
 by a test.
 
 Trust rules, by design: no eval, no remote plugin code, no captcha/paywall
-logic, no stored credentials. A plugin's `resolve()` may only talk to the
+logic, no skipping of waiting timers or ads, no stored credentials. A plugin's `resolve()` may only talk to the
 host it matches; a failed resolve never drops a link - it queues as-is and
-the chip says how many parts went unresolved.
+the chip says how many parts were not resolved.
 
 ## Hunt offers (video popup)
 
-- Open the popup on a video/stream page (YouTube, Bilibili, Twitch...) and
+- Open the popup on a video or stream page and
   a "Download page as video" button appears - it queues a *video* task the
   daemon runs through the `yt-dlp` sidecar.
 - Direct media the page actually streamed (containers by content-type or
@@ -137,6 +139,8 @@ the chip says how many parts went unresolved.
   access. The page URL is read once via `activeTab`, which Chrome grants
   only while the popup is open. Media sightings live in the worker's
   memory for 15 minutes and vanish with it.
+
+Use responsibly: you are responsible for copyright and for the terms of any site you download from. ripdl does not bypass DRM, paywalls, logins, or captchas.
 
 ## Deliberately not present (yet)
 

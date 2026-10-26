@@ -242,7 +242,7 @@
           <div id="lan-peers" class="lan-peers"></div>
           <div class="lan-row">
             <span class="lan-label">To</span>
-            <input id="lan-to" type="text" spellcheck="false" placeholder="http://192.168.1.8:8463" />
+            <input id="lan-to" type="text" spellcheck="false" placeholder="http://192.0.2.10:8463" />
           </div>
           <div class="lan-row">
             <span class="lan-label">Code</span>
@@ -361,16 +361,16 @@
           <div class="set-row">
             <div class="set-text">
               <label for="set-conc">Downloads at once</label>
-              <p class="set-desc">Others wait in the queue until a slot is free.</p>
+              <p class="set-desc">Others wait in the queue until a slot is free. Empty means the default, 3.</p>
             </div>
-            <div class="set-control"><input id="set-conc" type="number" min="1" max="64" /></div>
+            <div class="set-control"><input id="set-conc" type="number" min="1" max="64" placeholder="3" /></div>
           </div>
           <div class="set-row">
             <div class="set-text">
               <label for="set-segs">Connections per download</label>
-              <p class="set-desc">Parallel connections used for one file. Lower it if a server rejects them.</p>
+              <p class="set-desc">Parallel connections used for one file. Lower it if a server rejects them. Empty means the default, 8.</p>
             </div>
-            <div class="set-control"><input id="set-segs" type="number" min="1" max="64" /></div>
+            <div class="set-control"><input id="set-segs" type="number" min="1" max="64" placeholder="8" /></div>
           </div>
           <div class="set-row">
             <div class="set-text">
