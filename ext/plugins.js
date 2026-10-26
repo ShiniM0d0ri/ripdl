@@ -269,15 +269,18 @@ export async function pluginNameFor(url) {
 }
 
 /** Send-time resolution. Returns {url, name?, headers?} or null (leave the
- * link untouched). Only plugins whose match(url) is true get asked. */
-export async function pluginResolve(part) {
+ * link untouched). Only plugins whose match(url) is true get asked. `extras`
+ * carries framework capabilities the SW adds (e.g. resolveViaPage); plugins
+ * must feature-detect whatever they use - node tests run without any. */
+export async function pluginResolve(part, extras) {
     const url = typeof part === "string" ? part : part?.url;
     if (!url) return null;
+    const ctx = { fetch: (u, o) => fetch(u, o), ...(extras && typeof extras === "object" ? extras : {}) };
     for (const e of await registry()) {
         if (!e.enabled || !e.plugin?.resolve) continue;
         try {
             if (!e.plugin.match(url)) continue;
-            const out = await e.plugin.resolve({ url, filename: (part && part.filename) || null }, { fetch: (u, o) => fetch(u, o) });
+            const out = await e.plugin.resolve({ url, filename: (part && part.filename) || null }, ctx);
             if (out && typeof out.url === "string" && /^https?:\/\//i.test(out.url)) return out;
         } catch { /* fall through: the link queues as-is */ }
     }

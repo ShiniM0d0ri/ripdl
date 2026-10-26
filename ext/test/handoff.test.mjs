@@ -175,6 +175,25 @@ test("an unknown verdict is treated as keep", async () => {
     assert.deepEqual(calls.duplicates, []);
 });
 
+test("self: an internal resolve's copy is taken and stays entirely quiet", async () => {
+    const { calls } = run({ decide: async () => ({ verdict: "self" }) });
+    await wait(5);
+    assert.equal(calls.take, 1);
+    assert.equal(calls.suggest, 0, "the resolve is done; nothing waits on suggest");
+    assert.deepEqual(calls.abandon, [], "no proposal exists to abandon");
+    assert.deepEqual(calls.duplicates, [], "no duplicate window for a download ripdl itself opened");
+});
+
+test("self but the browser would not let go: browser keeps the copy", async () => {
+    const { calls } = run({
+        decide: async () => ({ verdict: "self" }),
+        takeItem: async () => false,
+    });
+    await wait(5);
+    assert.equal(calls.suggest, 1, "the download must not hang on the filename hold");
+    assert.deepEqual(calls.duplicates, []);
+});
+
 test("duplicate: the request headers ride along to the duplicate window", async () => {
     const headers = { Referer: "https://files.example/", "User-Agent": "test" };
     const { calls } = run({

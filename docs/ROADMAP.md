@@ -345,6 +345,38 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       registry, show actionable recipe import errors, and expose the browser
       setup checklist in Settings. Verified JSON file/paste import and reload
       persistence in a clean temporary browser profile.
+- [x] Selection fallback + page resolve (2026-10-27): the selection menu no
+      longer dies silently when the page cannot be read (chrome://, site
+      access off, protected pages) - it falls back to the selection text the
+      menu already carries and only reports the refusal on the page when
+      nothing came out of it (catch sites log to the service-worker console).
+      Live-session follow-up, same day: the menu entry itself never delivered -
+      Chromium passes the tab as the click event's SECOND callback argument and
+      `OnClickInfo` has no `tabId`, so the listener computed -1 and
+      `queueFromPage()` returned silently (no console, no badge, no toast, no
+      tasks) on every menu click, all items, ever; the e2e suite cannot click
+      native menus so the path was never covered. The listener now takes
+      `(info, tab)`. Verified in the user's real browser over CDP: selection
+      menu -> one bundle -> parts resolved to direct links and queued.
+      New framework capability for hosters whose direct link needs their own
+      page (JDownloader answers such gates with captcha-solver services -
+      rejected design): plugins gain `ctx.resolveViaPage(url, {pick, direct})`
+      - the SW opens the share link in a hidden tab of the user's browser,
+      the page arms itself against its own challenge, the plugin's pick
+      clicks its real download control, and the direct link is captured from
+      any of three paths (the tab address, a response header of the page's
+      own request, or the download it starts). The browser copy cancels and
+      erases (handoff.js gains the internal "self" verdict: no suggest, no
+      propose, no duplicate window), the tab closes, and the plugin pairs the
+      captured URL with its fragment name. Two resolves at a time, the same
+      link resolves once, and a challenge that wants the user reveals the tab
+      once (a 40 s extension of the 25 s hidden budget) instead of calling a
+      solver - no captcha logic anywhere in ripdl. Offline proof
+      (`research/resolve-page/`, gitignored): synthetic share host whose
+      /go refuses bare posts; a 2-link selection resolves through the page
+      into ONE bundle task with both parts direct, bytes hash-verified, no
+      browser download row left, hidden tabs closed. Verified: ext node tests
+      (17 handoff incl. the self verdict + 15 plugin checks).
 - [x] Settings browser tab (v0.4.4): Settings split into General, Network,
       Torrents, Browser, Updates and Advanced tabs. The Browser tab picks
       Chrome, Edge or Brave for Open (launches that browser's extensions page

@@ -14,6 +14,11 @@
  *   4. One content script (`capture.js`) and it only runs a `copy` listener:
  *      no polling loops, no history permission, no remote messaging
  *      channels, no page content read outside a copy the user made.
+ *   5. A host whose direct link needs its own page (that is its right and no
+ *      solver is implemented): for links the user sent, the host's page may be
+ *      opened in a hidden tab of the user's session, the page decides - its
+ *      widget, its click - and the direct link is captured and handed to the
+ *      plugin that asked. The tab closes as soon as the link shows up.
  *
  * The daemon owns capture policy (size floors, extension lists, fallback).
  * The extension only supplies what the wire protocol needs.
@@ -43,25 +48,26 @@ async function nameLinks(links) {
 /** Resolve share links into direct ones at send time. A part that fails
  * (plugin errors, host refuses, no plugin) keeps its original URL - the
  * honest-fallback rule: queue it as-is rather than lose it. `unresolved`
- * counts only links an enabled plugin claimed but could not resolve. */
-async function resolveParts(parts) {
+ * counts only links an enabled plugin claimed but could not resolve. Parts
+ * resolve concurrently (a page resolve queues itself, two tabs at a time). */
+async function resolveParts(parts, ctx) {
+    const out = new Array(parts.length);
     let unresolved = 0;
-    const out = [];
-    for (const p of parts) {
+    await Promise.all(parts.map(async (p, i) => {
         let r = null;
-        try { r = await pluginResolve(p); } catch { r = null; }
+        try { r = await pluginResolve(p, ctx); } catch { r = null; }
         if (r && r.url && r.url !== p.url) {
-            out.push({
+            out[i] = {
                 ...p,
                 url: r.url,
                 filename: r.name || p.filename,
                 headers: r.headers && typeof r.headers === "object" ? { ...p.headers, ...r.headers } : p.headers,
-            });
-            continue;
+            };
+            return;
         }
         if (await pluginMatches(p.url, true)) unresolved++;
-        out.push(p);
-    }
+        out[i] = p;
+    }));
     return { parts: out, unresolved };
 }
 
@@ -362,8 +368,9 @@ async function sendGroups(groups, page) {
         if (!raw.length) continue;
         // Plugins turn share links into direct ones here - after the user
         // said go, before anything is queued. A part no plugin could resolve
-        // keeps its original URL and is counted, never dropped.
-        const { parts, unresolved: unres } = await resolveParts(raw);
+        // keeps its original URL and is counted, never dropped. ctx carries
+        // the framework capabilities a plugin may ask for (see plugins.js).
+        const { parts, unresolved: unres } = await resolveParts(raw, { resolveViaPage });
         unresolved += unres;
         if (parts.length > 1 && daemonBundles === true) {
             const name = typeof g.name === "string" && g.name.trim() ? g.name.trim() : null;
@@ -541,7 +548,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (entry.plugin.match) out.matched = !!entry.plugin.match(msg.url);
             if (out.matched && entry.plugin.name) out.name = (await entry.plugin.name(msg.url)) ?? null;
             if (out.matched && entry.plugin.resolve) {
-                const r = await entry.plugin.resolve({ url: msg.url, filename: null }, { fetch: (u, o) => fetch(u, o) });
+                const r = await entry.plugin.resolve({ url: msg.url, filename: null }, {
+                    fetch: (u, o) => fetch(u, o),
+                    resolveViaPage,
+                });
                 out.resolved = r ? r.url : null;
                 if (r?.name) out.name = r.name;
             }
@@ -601,21 +611,26 @@ function remember(details) {
 }
 
 // Response sizes, for the service-worker download match; content-type
-// video/audio sightings feed the popup's hunt offer.
+// video/audio sightings feed the popup's hunt offer; every response header
+// itself is kept (capped) because the page resolve reads it: a host that
+// answers its own go-request with a redirect header is resolved from a real
+// page, and the plugin tells the framework which values count as the direct
+// link - no header name baked into the framework.
 chrome.webRequest.onHeadersReceived.addListener(
     (details) => {
         const rec = reqByRequestId.get(details.requestId);
         if (rec) {
+            rec.responded = true;
+            rec.resHeaders = {};
             for (const h of details.responseHeaders || []) {
                 const name = h.name.toLowerCase();
                 if (name === "content-length") {
                     const n = Number(h.value);
                     if (Number.isFinite(n)) rec.contentLength = n;
                 }
+                if (Object.keys(rec.resHeaders).length < 24) rec.resHeaders[name] = String(h.value ?? "");
             }
-            const ct = (details.responseHeaders || [])
-                .find((h) => h.name.toLowerCase() === "content-type")
-                ?.value || "";
+            const ct = rec.resHeaders["content-type"] || "";
             if (ct.startsWith("video/") || ct.startsWith("audio/")) {
                 rememberMedia(details.tabId, details.url);
             }
@@ -698,6 +713,23 @@ function findRecord(item, ignoreContentLength) {
  * `duplicate`. */
 async function decideHandoff(item, ctx) {
     if (takeOwnBrowserDownload(item)) return null; // ripdl handed this one back to the browser
+    // A page resolve's own click started this copy: only its URL was wanted,
+    // and a duplicate window (or a stray propose) for a download ripdl itself
+    // opened would be wrong. The request runs through a tab resolveViaPage has
+    // open - that tab is the decisive owner, referrers can lie. The record has
+    // the same arrival race as everywhere else here, so wait for it once.
+    if (pageResolves.size || pageResolveByTab.size) {
+        pageResolveSweep();
+        let rec = findRecord(item, false);
+        if (!rec) {
+            rec = await new Promise((resolve) => setTimeout(() => resolve(findRecord(item, true)), SW_RACE_WAIT_MS));
+        }
+        const p = (rec && pageResolveByTab.get(rec.tabId)) || pageResolves.get(item.referrer || "") || null;
+        if (p) {
+            p.capture(item.finalUrl || item.url);
+            return { verdict: "self", task: null };
+        }
+    }
     const { capture } = await settings();
     if (!capture || !hostAlive) return null;
     if (item.totalBytes > 0 && item.totalBytes < MIN_SEIZE_BYTES) return null; // small files: browser is fine.
@@ -742,6 +774,165 @@ async function takeBrowserItem(item) {
         // Already gone (service-worker races): the cancel is what matters.
     }
     return true;
+}
+
+/* --- page resolve: the host's own page produces the direct link --------- */
+
+/**
+ * Some hosts answer a bare share-URL post with their anti-bot challenge: the
+ * go endpoint wants a token their page has already embedded. External
+ * managers answer that with captcha-solver services (JDownloader's route) -
+ * ripdl has none and wants none. What a real browser session can do that an
+ * outside client can never: open the host's page in a tab of the user's
+ * browser (their own cookies, their own fingerprint), let the page arm
+ * itself, click its real download control, and watch the direct link appear -
+ * as the tab address, in a response header of the page's go-request, or as
+ * the download that starts. The starter of that download is the browser
+ * itself, so the disposable browser copy is cancelled and erased, and the
+ * direct link goes back to the plugin that asked.
+ *
+ * The site knowledge (which control to click, what a direct link looks like)
+ * stays in the plugin, exactly where createLinks lives; the framework only
+ * offers the browser mechanic through plugins' ctx (resolveViaPage).
+ */
+
+/** Hidden-tab resolves run two at a time; the rest queue in order. */
+const PAGE_RESOLVE_SLOTS = 2;
+let pageResolveLive = 0;
+const pageResolveFree = [];
+
+/** Same share link, one tab: offers with repeated parts resolve once. */
+const pageResolveInFlight = new Map();
+/** referrer -> {capture(url), expiry} - decideHandoff stands down for these. */
+const pageResolves = new Map();
+/** tabId -> {capture(url)}: the decisive owner (the download's request went
+ * through this tab), independent of what referrer the item reports. */
+const pageResolveByTab = new Map();
+
+const PAGE_RESOLVE_HIDDEN_MS = 25 * 1000; // page load + silent widget work
+const PAGE_RESOLVE_REVEALED_MS = 40 * 1000; // a challenge wants the user
+const PAGE_RESOLVE_TTL_MS = 2 * 60 * 1000;
+const PAGE_RESOLVE_TICK_MS = 600;
+const PAGE_RESOLVE_CLICKS = 8;
+const PAGE_RESOLVE_CLICK_MS = 1200;
+
+/** The plugin's choices. `pick` runs in the page's own context (self-contained
+ * like the menu's collectors); it clicks the real control and returns true
+ * once. `direct(url)` decides whether a captured candidate is the direct link
+ * the plugin promised - it is deliberately plugin-owned. */
+async function resolveViaPage(pageUrl, opts) {
+    const u = httpOnly(pageUrl);
+    if (!u || !opts || typeof opts.pick !== "function" || typeof opts.direct !== "function") {
+        throw new Error("resolveViaPage: pick(url) and direct(url) are required");
+    }
+    pageResolveSweep();
+    const existing = pageResolveInFlight.get(u);
+    if (existing) return existing;
+    const run = (async () => {
+        await pageResolveSlot();
+        try {
+            return await runPageResolve(u, opts);
+        } finally {
+            pageResolveRelease();
+            pageResolveInFlight.delete(u);
+        }
+    })().catch(() => null);
+    pageResolveInFlight.set(u, run);
+    return run;
+}
+
+async function pageResolveSlot() {
+    if (pageResolveLive < PAGE_RESOLVE_SLOTS) {
+        pageResolveLive++;
+        return;
+    }
+    await new Promise((free) => pageResolveFree.push(free));
+    pageResolveLive++;
+}
+
+function pageResolveRelease() {
+    pageResolveLive--;
+    const next = pageResolveFree.shift();
+    if (next) next();
+}
+
+function pageResolveSweep() {
+    const now = Date.now();
+    for (const [ref, p] of pageResolves) if (p.expiry <= now) pageResolves.delete(ref);
+}
+
+async function runPageResolve(pageUrl, opts) {
+    const job = { capture: null };
+    const looksDirect = (s) => {
+        if (typeof s !== "string") return false;
+        try {
+            const proto = new URL(s).protocol;
+            return (proto === "http:" || proto === "https:") && opts.direct(s);
+        } catch {
+            return false;
+        }
+    };
+    const settle = (url) => {
+        if (job.capture !== null || !looksDirect(url)) return;
+        job.capture = url;
+    };
+    pageResolves.set(pageUrl, { expiry: Date.now() + PAGE_RESOLVE_TTL_MS, capture: settle });
+    const onCreated = (item) => {
+        // The referrer is the page we opened; other tabs' downloads never match.
+        if ((item?.referrer || "") !== pageUrl) return;
+        settle(item.finalUrl || item.url);
+    };
+    chrome.downloads.onCreated.addListener(onCreated);
+    let tabId = -1;
+    try {
+        tabId = (await chrome.tabs.create({ url: pageUrl, active: false })).id;
+        pageResolveByTab.set(tabId, { capture: settle });
+        let deadline = Date.now() + PAGE_RESOLVE_HIDDEN_MS;
+        let loaded = false;
+        let clicks = 0;
+        let revealed = false;
+        while (job.capture === null) {
+            const rest = deadline - Date.now();
+            if (rest <= 0) break;
+            const tabState = await chrome.tabs.get(tabId).then((t) => ({ status: t.status, url: t.url })).catch(() => null);
+            if (!tabState) break; // the tab vanished; nothing further to click
+            settle(tabState.url);
+            for (const r of reqByRequestId.values()) {
+                // Only requests our own tab made: the map is process-wide and a
+                // stale record from another resolve must not supply the badge.
+                if (r.responded && r.resHeaders && r.tabId === tabId) {
+                    for (const v of Object.values(r.resHeaders)) settle(v);
+                }
+            }
+            if (!loaded && tabState.status === "complete") loaded = true;
+            if (loaded && clicks < PAGE_RESOLVE_CLICKS) {
+                try {
+                    const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: opts.pick });
+                    if (result === true) clicks = PAGE_RESOLVE_CLICKS; // armed; wait for the capture
+                    else clicks++;
+                } catch {
+                    // The world navigated (capture may already be running): stop clicking.
+                    clicks = PAGE_RESOLVE_CLICKS;
+                }
+            }
+            // The host wanted the user: show the page once and keep waiting.
+            if (!revealed && Date.now() + PAGE_RESOLVE_TICK_MS >= deadline) {
+                revealed = true;
+                deadline += PAGE_RESOLVE_REVEALED_MS;
+                await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+            }
+            if (job.capture !== null) break;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(rest, PAGE_RESOLVE_TICK_MS)));
+        }
+        return job.capture;
+    } finally {
+        chrome.downloads.onCreated.removeListener(onCreated);
+        pageResolves.delete(pageUrl);
+        if (tabId >= 0) {
+            pageResolveByTab.delete(tabId);
+            chrome.tabs.remove(tabId).catch(() => {});
+        }
+    }
 }
 
 /** The browser kept its copy after a `new` answer: drop the daemon's task. */
@@ -979,12 +1170,31 @@ function reportSend(tabId, res) {
     flashBadge(done ? String(done) : dupes ? "=" : (hostAlive ? "!" : "off"));
 }
 
+/** Bare http(s) URLs in a selection's text - the same rule
+ * collectLinksInView applies to plain text. This is the fallback when the page
+ * itself cannot be read, because the menu already carries the selection text. */
+function linksFromText(text) {
+    const out = [];
+    const seen = new Set();
+    for (const m of String(text || "").matchAll(/https?:\/\/[^\s<>"'`]+/gi)) {
+        const url = m[0].replace(/[.,;:!?]+$/, "").replace(/[)\]}>,]+$/, "");
+        if (!url || seen.has(url) || out.length >= MAX_OFFER_LINKS) continue;
+        seen.add(url);
+        out.push({ url, name: "" });
+    }
+    return out;
+}
+
 /** Selection and all-links: read the page on demand, then queue the groups
- * the same way the copy chip would. */
+ * the same way the copy chip would. The page read is best effort: when it is
+ * refused (site access off the page, a protected page, a policy), the selection
+ * text the menu already carries still holds the URLs, so those are queued
+ * instead of the attempt failing without a trace. */
 async function queueFromPage(tabId, info, mode) {
     if (tabId < 0) return;
     setBadge("...");
     let links = [];
+    let refused = null;
     try {
         const [{ result }] = await chrome.scripting.executeScript({
             target: { tabId },
@@ -992,14 +1202,19 @@ async function queueFromPage(tabId, info, mode) {
             args: [mode, info.selectionText || ""],
         });
         links = (result && result.links) || [];
-    } catch {
-        // chrome:// or protected pages: scripting is refused.
-        flashBadge("!");
-        return;
+    } catch (err) {
+        // chrome:// or protected pages, or site access off the page: the
+        // selection text the menu passes is still the user's pick, so use it.
+        refused = String(err?.message || err).slice(0, 90);
+        console.warn(`ripdl: could not read the page (${refused}); using the selection text instead`);
+        links = mode === "selection" ? linksFromText(info.selectionText) : [];
     }
     if (!links.length) {
-        pageStatus(tabId, mode === "selection" ? "No links found in the selection" : "No links found on this page", true);
-        flashBadge("0");
+        pageStatus(tabId, refused
+            ? `ripdl could not read this page (${refused}); nothing was queued`
+            : mode === "selection" ? "No links found in the selection" : "No links found on this page",
+            true);
+        flashBadge("!");
         return;
     }
     pageStatus(tabId, `Queuing ${links.length} link${links.length === 1 ? "" : "s"}\u2026`, false);
@@ -1007,7 +1222,8 @@ async function queueFromPage(tabId, info, mode) {
         // Grouped like the copy chip: twelve parts become one task, one folder.
         const preview = await previewGroups(sanitizeLinks(links));
         reportSend(tabId, await sendGroups(preview.groups, info.pageUrl));
-    } catch {
+    } catch (err) {
+        console.warn(`ripdl: queuing failed: ${String(err?.message || err)}`);
         reportSend(tabId, null);
     }
 }
@@ -1029,8 +1245,11 @@ async function queueLink(tabId, info) {
     }
 }
 
-chrome.contextMenus.onClicked.addListener(async (info) => {
-    const tabId = typeof info.tabId === "number" ? info.tabId : -1;
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+    // Chromium hands the tab as the event's SECOND argument (tab), never on
+    // OnClickInfo: info.tabId does not exist, so a menu click used to fall
+    // to -1 and queueFromPage() would return silently (filed 2026-10-27).
+    const tabId = typeof (tab && tab.id) === "number" ? tab.id : -1;
     if (info.menuItemId === "ripdl-selection" || info.menuItemId === "ripdl-all-links") {
         await queueFromPage(tabId, info, info.menuItemId === "ripdl-selection" ? "selection" : "all");
         return;

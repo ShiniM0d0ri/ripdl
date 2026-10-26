@@ -2,6 +2,11 @@
 //
 // Chrome holds the filename until suggest() runs or the item is cancelled, so
 // the hold is settled exactly once:
+//   {verdict:"self"}             an internal ripdl resolve started this
+//                                download (hidden tab) and only wanted the URL
+//                                -> cancel the browser's copy, stay silent: no
+//                                   suggest unless Chrome would not let go, no
+//                                   proposal, no duplicate window
 //   {verdict:"new", task}        daemon queued the link now
 //                                -> cancel the browser's copy (no suggest);
 //                                   if Chrome will not let go: suggest() and
@@ -41,7 +46,7 @@ export function filenameListener({
             if (settled) return;
             settled = true;
             clearTimeout(timer);
-            suggest();
+            try { suggest(); } catch { /* the item was already cancelled */ }
             if (proposal !== null) abandon(proposal);
         };
         const timer = setTimeout(keepInBrowser, deadlineMs);
@@ -59,14 +64,21 @@ export function filenameListener({
                 settled = true;
                 clearTimeout(timer);
                 const verdict = normalize(answer);
+                if (verdict.verdict === "self") {
+                    // The URL is already captured by the caller; the browser
+                    // copy is disposable. Nothing abandons, no duplicate window.
+                    const taken = await tryTake(takeItem, item);
+                    if (!taken) { try { suggest(); } catch { /* already cancelled */ } }
+                    return;
+                }
                 if (verdict.verdict === "keep") {
-                    suggest();
+                    try { suggest(); } catch { /* the item was already cancelled */ }
                     return;
                 }
                 const taken = await tryTake(takeItem, item);
                 if (verdict.verdict === "duplicate") onDuplicate(item, verdict, taken);
                 if (taken) return;
-                suggest();
+                try { suggest(); } catch { /* the item was already cancelled */ }
                 if (verdict.verdict === "new" && proposal !== null) abandon(proposal);
             }, keepInBrowser);
         return true;
@@ -76,7 +88,7 @@ export function filenameListener({
 /** Accepts only the documented shape; anything else keeps the browser's copy. */
 function normalize(answer) {
     if (!answer || typeof answer !== "object") return { verdict: "keep" };
-    if (answer.verdict !== "new" && answer.verdict !== "duplicate") return { verdict: "keep" };
+    if (answer.verdict !== "new" && answer.verdict !== "duplicate" && answer.verdict !== "self") return { verdict: "keep" };
     const verdict = { verdict: answer.verdict, task: answer.task ?? null };
     // The request headers the browser used travel with the verdict, so the
     // duplicate window can offer "download again" with the same access.
