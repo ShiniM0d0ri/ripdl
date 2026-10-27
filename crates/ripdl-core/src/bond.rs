@@ -50,6 +50,13 @@ pub struct Link {
     delta: AtomicU64,
     /// Connections (segments/peers) currently dialing or streaming here.
     in_use: AtomicU32,
+    /// Connection-seconds accumulated since the last sample (millis). The
+    /// capacity estimate divides metered bytes by this, so a link's weight
+    /// tracks what *one connection* achieves on it - not how much of the
+    /// task's traffic the weighting itself steered there (aggregate rates
+    /// are self-reinforcing: more weight -> more connections -> more
+    /// metered bytes -> more weight, with no reference to real capacity).
+    conn_ms: AtomicU64,
     inner: Mutex<LinkInner>,
 }
 
@@ -57,6 +64,10 @@ pub struct Link {
 struct LinkInner {
     /// EMA of measured bytes/second (0 until the first sample with bytes).
     rate: f64,
+    /// EMA of per-connection throughput (bytes/s per active connection).
+    /// Drives the weights: this is the capacity proxy that does not depend
+    /// on how many connections the weighting itself handed out.
+    capacity: f64,
     /// Relative share of new work (0 = quarantined).
     weight: u32,
     /// Consecutive dial failures on this link (0 = fine).
@@ -71,6 +82,11 @@ pub struct LinkStatus {
     pub default_route: bool,
     /// Smoothed measured rate, bytes/second (idle links keep their last EMA).
     pub rate_bps: u64,
+    /// Per-connection throughput EMA (bytes/s one active connection
+    /// achieves). Drives the weights; `rate_bps` stays the aggregate the
+    /// chip displays. Older frontends that never read this field keep
+    /// working (serde ignores unknown fields on their side).
+    pub capacity_bps: u64,
     /// Current relative weight (0 = quarantined / skipped).
     pub weight: u32,
     /// Connections currently using this link.
@@ -93,6 +109,7 @@ impl Link {
             ip: self.info.ip,
             default_route: self.info.default_route,
             rate_bps: inner.rate as u64,
+            capacity_bps: inner.capacity as u64,
             weight: inner.weight,
             in_use: self.in_use.load(Ordering::Relaxed),
             fails: inner.fails,
@@ -196,6 +213,7 @@ impl Bond {
                     info: info.clone(),
                     delta: AtomicU64::new(old.delta.load(Ordering::Relaxed)),
                     in_use: AtomicU32::new(old.in_use.load(Ordering::Relaxed)),
+                    conn_ms: AtomicU64::new(old.conn_ms.load(Ordering::Relaxed)),
                     inner: Mutex::new(inner),
                 }));
                 continue;
@@ -204,8 +222,10 @@ impl Bond {
                 info: info.clone(),
                 delta: AtomicU64::new(0),
                 in_use: AtomicU32::new(0),
+                conn_ms: AtomicU64::new(0),
                 inner: Mutex::new(LinkInner {
                     rate: 0.0,
+                    capacity: 0.0,
                     // A brand-new link starts at weight 1: it must get a
                     // chance to meter before any quarantine logic sees it.
                     weight: 1,
@@ -240,9 +260,12 @@ impl Bond {
     pub fn begin(&self, link: &Link) {
         link.in_use.fetch_add(1, Ordering::Relaxed);
     }
-    /// The dial is done (success or failure).
-    pub fn end(&self, link: &Link) {
+    /// The dial is done (success or failure). `active_ms` is how long the
+    /// connection was live - the denominator of the per-connection
+    /// capacity estimate, so weights track speed rather than share.
+    pub fn end(&self, link: &Link, active_ms: u64) {
         link.in_use.fetch_sub(1, Ordering::Relaxed);
+        link.conn_ms.fetch_add(active_ms, Ordering::Relaxed);
     }
 
     /// A dial through this link failed (counted for every link; only
@@ -292,9 +315,11 @@ impl Bond {
         let links = self.links.read().unwrap().clone();
         let dt = dt.max(0.1);
 
-        // EMA update first.
+        // EMA update first: the aggregate rate (what the chip displays)
+        // and the per-connection capacity (what the weights trust).
         for link in &links {
             let bytes = link.take_delta();
+            let ms = link.conn_ms.swap(0, Ordering::Relaxed);
             let mut inner = link.inner.lock().unwrap();
             let sample = bytes as f64 / dt;
             inner.rate = if inner.rate == 0.0 {
@@ -302,6 +327,14 @@ impl Bond {
             } else {
                 inner.rate * 0.6 + sample * 0.4
             };
+            if ms > 0 {
+                let per_conn = bytes as f64 / (ms as f64 / 1000.0);
+                inner.capacity = if inner.capacity == 0.0 {
+                    per_conn
+                } else {
+                    inner.capacity * 0.6 + per_conn * 0.4
+                };
+            }
         }
 
         // Explore window: everyone gets weight 1 for this round. The very
@@ -330,6 +363,10 @@ impl Bond {
             .iter()
             .map(|l| l.inner.lock().unwrap().rate)
             .fold(0.0f64, f64::max);
+        let max_capacity = links
+            .iter()
+            .map(|l| l.inner.lock().unwrap().capacity)
+            .fold(0.0f64, f64::max);
 
         for link in &links {
             let mut inner = link.inner.lock().unwrap();
@@ -348,8 +385,25 @@ impl Bond {
                 inner.weight = 1;
                 continue;
             }
-            // No comparative traffic yet: keep the current preference (a
-            // fresh link defaults to 1; an idle link keeps what it earned).
+            // Capacity is the honest ordering: what one connection achieves
+            // on this link, independent of how many connections the weights
+            // themselves steered here. Aggregate rates are self-reinforcing
+            // (more weight -> more conns -> more metered bytes -> more
+            // weight) and can crown the *wrong* link; per-conn throughput
+            // cannot - a fast link with one connection still measures fast.
+            if max_capacity > 0.0 {
+                if inner.capacity > 0.0 {
+                    let w = (inner.capacity / max_capacity * 10.0).round() as u32;
+                    inner.weight = w.clamp(1, 10);
+                }
+                // No connection-time this window: keep the earned weight
+                // (an idle link is not a slow link).
+                continue;
+            }
+            // Legacy fallback (no connection-time ever measured): order by
+            // aggregate rate. No comparative traffic yet: keep the current
+            // preference (a fresh link defaults to 1; an idle link keeps
+            // what it earned).
             if max_rate <= 0.0 || inner.rate == 0.0 {
                 continue;
             }
@@ -548,6 +602,73 @@ mod tests {
         let statuses = b.sample(5.0);
         let by_ip: HashMap<IpAddr, LinkStatus> = statuses.into_iter().map(|s| (s.ip, s)).collect();
         assert_eq!(by_ip[&addr(2)].weight, 5, "no traffic is not a slump");
+    }
+
+    #[test]
+    fn weights_follow_per_connection_capacity_not_share() {
+        // The steering trap: the aggregate rate rewards a link for the
+        // connections the weights themselves handed it. Capacity (bytes per
+        // connection-second) must not. Here the tether carries fewer bytes
+        // in total (one connection, throttled window) but each of its
+        // connections is 5x faster than a Wi-Fi connection - the tether
+        // must win the weight race.
+        let b = Bond::new();
+        b.set_links(&[link_info(1, "tether", true), link_info(2, "Wi-Fi", false)]);
+        let tether = link(&b, 1);
+        let wifi = link(&b, 2);
+        // 5 MB over 5 conn-seconds (1 MiB/s per conn) vs 8 MB over 20
+        // conn-seconds (0.4 MiB/s per conn, spread over 4 connections).
+        // The aggregate favors Wi-Fi (1.6 vs 1.0 MB/s); the per-conn
+        // capacity must favor the tether.
+        b.record(&tether, 5 * 1024 * 1024);
+        tether.conn_ms.store(5_000, Ordering::Relaxed);
+        b.record(&wifi, 8 * 1024 * 1024);
+        wifi.conn_ms.store(20_000, Ordering::Relaxed);
+        let statuses = b.sample(5.0);
+        let by_ip: HashMap<IpAddr, LinkStatus> = statuses.into_iter().map(|s| (s.ip, s)).collect();
+        assert_eq!(by_ip[&addr(1)].weight, 10, "2.5x per-conn speed saturates");
+        assert_eq!(by_ip[&addr(2)].weight, 4, "0.4/1.0 of the best scales to 4");
+        assert!(
+            by_ip[&addr(1)].rate_bps < by_ip[&addr(2)].rate_bps,
+            "the aggregate display still shows the raw shares"
+        );
+    }
+
+    #[test]
+    fn capacity_ignores_idle_connections() {
+        // A wedged connection holds conn-time with no bytes (NIC churn) -
+        // capacity must crater for the link, steering new dials away.
+        let b = Bond::new();
+        b.set_links(&[link_info(1, "fast", true), link_info(2, "wedged", false)]);
+        let fast = link(&b, 1);
+        let wedged = link(&b, 2);
+        b.record(&fast, 10 * 1024 * 1024);
+        fast.conn_ms.store(5_000, Ordering::Relaxed);
+        b.record(&wedged, 1024);
+        wedged.conn_ms.store(30_000, Ordering::Relaxed);
+        let statuses = b.sample(5.0);
+        let by_ip: HashMap<IpAddr, LinkStatus> = statuses.into_iter().map(|s| (s.ip, s)).collect();
+        assert_eq!(by_ip[&addr(1)].weight, 10);
+        assert_eq!(
+            by_ip[&addr(2)].weight,
+            1,
+            "a silent link drops to the floor"
+        );
+    }
+
+    #[test]
+    fn capacity_is_never_zero_weight() {
+        // A working-but-slow link keeps the floor (never banned), and a
+        // link with no connection-time this window keeps its earned weight.
+        let b = Bond::new();
+        b.set_links(&[link_info(1, "fast", true), link_info(2, "slow", false)]);
+        b.record(&link(&b, 1), 1024 * 1024);
+        link(&b, 1).conn_ms.store(1_000, Ordering::Relaxed);
+        link(&b, 2).inner.lock().unwrap().weight = 7;
+        let statuses = b.sample(5.0);
+        let by_ip: HashMap<IpAddr, LinkStatus> = statuses.into_iter().map(|s| (s.ip, s)).collect();
+        assert_eq!(by_ip[&addr(1)].weight, 10);
+        assert_eq!(by_ip[&addr(2)].weight, 7, "idle keeps its earned weight");
     }
 
     #[test]

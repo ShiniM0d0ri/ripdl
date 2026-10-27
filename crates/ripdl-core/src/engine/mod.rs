@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -741,12 +741,19 @@ async fn run_segment(
             Some(DialAttempt { client, link }) => (client, link),
             None => (primary.clone(), None),
         };
-        // Claim sizing wants a rate ballpark: the link this attempt just
-        // picked carries its smoothed EMA (0 before the first sample).
+        // Claim sizing wants a rate ballpark for what THIS connection will
+        // pull: the per-connection capacity EMA when the link has one (an
+        // aggregate rate would size a claim by the whole link's share, not
+        // by the bite one conn takes), falling back to the aggregate.
         if let Some(l) = link.as_ref() {
             let s = l.status();
-            if s.rate_bps > 0 {
-                rate_bps = Some(s.rate_bps as f64);
+            let rate = if s.capacity_bps > 0 {
+                s.capacity_bps
+            } else {
+                s.rate_bps
+            };
+            if rate > 0 {
+                rate_bps = Some(rate as f64);
             }
         }
         let bond_ctx = match (&dialer, link.as_ref()) {
@@ -896,22 +903,32 @@ fn steal_largest(
 /// One attempt's link credit, held from dial to stream end so `in_use`
 /// reads as "connections live on this link" (a chip's active state), not
 /// the instant of the transport send. Drop covers every exit path:
-/// pause/cancel, mid-stream transport faults, and the happy flush.
-struct BondDial<'a>(Option<(&'a bond::Bond, &'a bond::Link)>);
+/// pause/cancel, mid-stream transport faults, and the happy flush. The
+/// guard also accumulates the connection's live time so the sampler can
+/// divide metered bytes by connection-seconds - per-connection capacity,
+/// the weight basis that does not reward a link merely for receiving more
+/// connections.
+struct BondDial<'a> {
+    ctx: Option<(&'a bond::Bond, &'a bond::Link)>,
+    started: Instant,
+}
 
 impl<'a> BondDial<'a> {
     fn begin(ctx: Option<(&'a bond::Bond, &'a bond::Link)>) -> Self {
         if let Some((bond, link)) = &ctx {
             bond.begin(link);
         }
-        Self(ctx)
+        Self {
+            ctx,
+            started: Instant::now(),
+        }
     }
 }
 
 impl Drop for BondDial<'_> {
     fn drop(&mut self) {
-        if let Some((bond, link)) = self.0 {
-            bond.end(link);
+        if let Some((bond, link)) = self.ctx {
+            bond.end(link, self.started.elapsed().as_millis() as u64);
         }
     }
 }
@@ -1161,6 +1178,15 @@ async fn segment_attempt(
                 Ok(None) => break,
                 Err(_) => {
                     rollback!();
+                    // The stall is link-level evidence: the connection's
+                    // source path stopped moving (NIC churn wedges exactly
+                    // like this). Count it against the link's fail streak
+                    // so the pick steers away before the uplink scan even
+                    // notices - a wedged server would punish its own link
+                    // too, but the next successful dial resets the streak.
+                    if let Some((bond, link)) = &bond_ctx {
+                        bond.note_fail(link);
+                    }
                     return Err(Error::StreamStalled(idle.as_secs()));
                 }
             },
