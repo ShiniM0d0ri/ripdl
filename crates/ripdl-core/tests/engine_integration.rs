@@ -88,6 +88,23 @@ struct ServerState {
     /// Cloudflare-fronted hosts look exactly like this; only the planner's
     /// behavioral 2-byte probe can discover the real range support.
     head_bare: bool,
+    /// Requests whose range *starts at or beyond* this offset run at the
+    /// paired pace instead of full speed (steal test: first cells race,
+    /// freed workers must split the stragglers). `None` = everyone full
+    /// speed.
+    slow_pace: Option<(u64, Duration)>,
+}
+
+impl ServerState {
+    /// Pace override for a body served from `start`: the global pace, or
+    /// the deliberate slow one past the pillbox, or none.
+    fn pace_for(&self, start: u64) -> Option<Duration> {
+        if self.block_pace.is_some() {
+            return self.block_pace;
+        }
+        let (from, slow) = self.slow_pace?;
+        (start >= from).then_some(slow)
+    }
 }
 
 async fn spawn_server(state: Arc<ServerState>) -> String {
@@ -298,7 +315,7 @@ async fn write_body(
         }
         sock.write_all(&block[..n]).await?;
         sock.flush().await?;
-        if let Some(pace) = state.block_pace {
+        if let Some(pace) = state.pace_for(start) {
             tokio::time::sleep(pace).await;
         }
         off += n as u64;
@@ -365,6 +382,7 @@ async fn multi_segment_exact_bytes() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -394,7 +412,10 @@ async fn multi_segment_exact_bytes() {
 #[tokio::test]
 async fn rate_limited_ranges_back_off_and_finish() {
     let state = Arc::new(ServerState {
-        total: 4 * MIB,
+        // 8 cells of 256 KiB: small enough that no cell ever has >= 512 KiB
+        // un-flushed, so work stealing never adds GETs and the count below
+        // stays exact; the 429-story is unchanged.
+        total: 2 * MIB,
         ranges: true,
         drop_after_bytes: 0,
         drop_times: 0,
@@ -405,12 +426,13 @@ async fn rate_limited_ranges_back_off_and_finish() {
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
         peers_seen: Mutex::new(Vec::new()),
-        // 4 MiB / 128 KiB / max 8 => 8 segments, each refused once.
+        // 2 MiB / 256 KiB => 8 segments, each refused once.
         quota_replies: 8,
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -424,7 +446,7 @@ async fn rate_limited_ranges_back_off_and_finish() {
     .expect("quota retries finish in time")
     .expect("download ok despite 429s");
 
-    verify(&dest, 4 * MIB);
+    verify(&dest, 2 * MIB);
     let seen = state.ranges_seen.lock().unwrap();
     assert_eq!(seen.len(), 8, "all 8 ranges retried once: {seen:?}");
     assert_eq!(
@@ -458,6 +480,7 @@ async fn probe_retries_host_quota_and_starts() {
         hard_quota_replies: 3,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -501,6 +524,7 @@ async fn bonded_segments_cycle_interfaces() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -553,6 +577,7 @@ async fn bonded_single_extra_address_still_binds() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -599,6 +624,7 @@ async fn quarantined_bond_link_falls_back_unbound() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -651,6 +677,7 @@ async fn shared_bond_state_flows_into_the_engine() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -716,6 +743,7 @@ async fn dropped_connection_recovered_by_retry() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -750,6 +778,7 @@ async fn no_ranges_falls_back_to_single_stream() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -791,6 +820,7 @@ async fn bare_head_still_discovers_ranges() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -818,6 +848,72 @@ async fn bare_head_still_discovers_ranges() {
         ranged > 2,
         "expected a multi-segment download, got {} ranged GETs",
         ranged
+    );
+}
+
+/// Work stealing: the fast cells finish while a straggler is still chewing,
+/// and a freed worker must not retire - it splits the largest remaining cell
+/// and claims the tail half. The robbery is visible as a ranged GET that
+/// starts *inside* a planned cell (planned GETs only ever start on cell
+/// bases), and the file still lands byte-exact.
+#[tokio::test]
+async fn freed_worker_steals_from_the_largest_straggler() {
+    const CELL: u64 = 512 * KIB;
+    let state = Arc::new(ServerState {
+        total: 3 * MIB, // engine cfg below plans 6 cells of 512 KiB
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        // Cells 0-1 (the first GETs) race at full loopback speed; everything
+        // from cell 2 up grinds at 40 ms/block so the freed workers have
+        // stragglers to rob (their claims are paced too - a 256 KiB claim
+        // halves run ~640 ms, keeping the robbery window wide open).
+        slow_pace: Some((2 * CELL, Duration::from_millis(40))),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 6,
+        min_segment_size: 512 * KIB,
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("engine");
+    let tmp = temp_dir("steal");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("stealing download ok");
+    verify(&dest, 3 * MIB);
+
+    // A steal always claims the tail half of a planned cell's un-flushed
+    // span, so its GET starts at cell_base + 256 KiB (no rate was measured,
+    // free workers take the plain half). Work here starts only on bases.
+    let seen = state.ranges_seen.lock().unwrap().clone();
+    let robs: Vec<&String> = seen
+        .iter()
+        .filter(|r| {
+            r.split('-')
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|a| a % CELL == CELL / 2)
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !robs.is_empty(),
+        "no freed worker stole from a straggler; ranged GETs: {seen:?}"
     );
 }
 
@@ -852,6 +948,7 @@ async fn pause_resumes_from_sidecar() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -936,6 +1033,7 @@ async fn speed_limit_paces_download() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -993,6 +1091,7 @@ async fn speed_limit_applies_to_single_stream() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1047,6 +1146,7 @@ async fn legacy_unbounded_sidecar_reranges_on_resume() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1123,6 +1223,7 @@ async fn refreshed_address_resumes_from_sidecar() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let base = spawn_server(Arc::clone(&state)).await;
     let old = format!("{base}?token=old");
@@ -1210,6 +1311,7 @@ async fn stale_etag_forces_fresh_restart() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1249,18 +1351,32 @@ async fn stale_etag_forces_fresh_restart() {
     // Fresh plan: all 8 segments re-request from their aligned segment base
     // (a wrongly resumed attempt would start unaligned mid-segment, and with
     // the stale etag it would have received a terminal 412 and failed).
+    // Work stealing may add ONE claim GET on top: a cell finishes while the
+    // rank-7 segment still waits out its ramp-in stagger, and the freed
+    // worker splits that untouched 512 KiB cell - the claim starts at
+    // cell base + 256 KiB. So every fresh GET start is either a planned
+    // base (aligned to 512 KiB) or such a half-of-an-untouched-cell claim,
+    // and all 8 planned bases must appear.
     let seen = state.ranges_seen.lock().unwrap().clone();
     let fresh = &seen[seen_before..];
-    assert_eq!(fresh.len(), 8, "etag change must re-plan all 8 segments, saw {seen:?}");
-    for (k, r) in fresh.iter().enumerate() {
+    let mut planned_bases = std::collections::BTreeSet::new();
+    for r in fresh {
         let (a, _) = r.split_once('-').expect("range format");
         let start: u64 = a.parse().expect("range start");
-        assert_eq!(
-            start % 524_288,
-            0,
-            "segment {k} must restart at its aligned base, saw {r}"
-        );
+        let off = start % 524_288;
+        if off == 0 {
+            planned_bases.insert(start / 524_288);
+        } else if off == 256 * KIB {
+            // a steal claim inside an untouched cell
+        } else {
+            panic!("segment restart must keep the planned base or be a steal half, saw {r} ({off})");
+        }
     }
+    assert_eq!(
+        planned_bases.len(),
+        8,
+        "etag change must re-plan all 8 segments at their aligned bases, saw {seen:?}"
+    );
     let names = dir_names(&dest.parent().unwrap());
     assert!(
         !names.iter().any(|n| n.ends_with(".ripdl.json")),
@@ -1290,6 +1406,7 @@ async fn carries_headers_and_uses_cd_filename() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
+        slow_pace: None,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 

@@ -644,11 +644,17 @@ async fn run_segment(
     stagger: Duration,
 ) -> Result<()> {
     let mut attempt = 0u32;
+    // The cell this worker currently owns. On completion it can be split
+    // elsewhere: the loop takes what `steal_largest` deals out (work stealing).
+    let mut idx = initial.index;
+    // The currently owned link's smoothed rate, kept for the size of a steal
+    // claim (no measurement yet -> halve).
+    let mut rate_bps: Option<f64> = None;
     // Ramp-in: hold this segment's *first* dial back so the part start does
     // not open every handshake at the same instant (G1). Cancellation wins
     // over the wait.
     if stagger > Duration::ZERO {
-        tracing::debug!(index = initial.index, stagger_ms = stagger.as_millis() as u64, "ramp-in stagger");
+        tracing::debug!(index = idx, stagger_ms = stagger.as_millis() as u64, "ramp-in stagger");
         tokio::select! {
             _ = token.cancelled() => return Err(Error::Cancelled),
             _ = tokio::time::sleep(stagger) => {}
@@ -656,7 +662,7 @@ async fn run_segment(
     }
     loop {
         // Re-read state: a previous attempt may have advanced it.
-        let mut seg = cells.lock().expect("state cells")[initial.index].clone();
+        let mut seg = cells.lock().expect("state cells")[idx].clone();
 
         // Completed cell: durable before the pause (e.g. serial retries
         // finished some cells before the run was cancelled). Nothing is
@@ -664,13 +670,23 @@ async fn run_segment(
         // end. The byte counters were initialized from the sidecar.
         if seg.end != UNBOUNDED && seg.done >= seg.end + 1 - seg.start {
             tracing::debug!(index = seg.index, done = seg.done, "cell already durable at resume");
-            return Ok(());
+            match steal_largest(&cells, rate_bps) {
+                Some(claim) => {
+                    idx = claim.index;
+                    attempt = 0;
+                    tracing::info!(from = seg.index, claimed = claim.index,
+                        start = claim.start, bytes = claim.end + 1 - claim.start,
+                        "resumed worker already owned a durable cell; stole a claim");
+                    continue;
+                }
+                None => return Ok(()),
+            }
         }
         if seg.end == UNBOUNDED && seg.done > 0 {
             let undone = seg.done;
             downloaded.fetch_sub(undone, Ordering::Relaxed);
             seg.done = 0;
-            cells.lock().expect("state cells")[initial.index].done = 0;
+            cells.lock().expect("state cells")[idx].done = 0;
             std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -695,6 +711,14 @@ async fn run_segment(
             Some(DialAttempt { client, link }) => (client, link),
             None => (primary.clone(), None),
         };
+        // Claim sizing wants a rate ballpark: the link this attempt just
+        // picked carries its smoothed EMA (0 before the first sample).
+        if let Some(l) = link.as_ref() {
+            let s = l.status();
+            if s.rate_bps > 0 {
+                rate_bps = Some(s.rate_bps as f64);
+            }
+        }
         let bond_ctx = match (&dialer, link.as_ref()) {
             (Some(d), Some(l)) => Some((d.bond.clone(), Arc::clone(l))),
             _ => None,
@@ -717,7 +741,20 @@ async fn run_segment(
             Ok(()) => {
                 drop(permit);
                 gate.grow();
-                return Ok(());
+                // The cell is done. Rather than retire, this worker splits
+                // the largest cell still chewing and works the claim
+                // (IDM's "freed worker takes half the straggler").
+                match steal_largest(&cells, rate_bps) {
+                    Some(claim) => {
+                        tracing::info!(from = idx, claimed = claim.index,
+                            start = claim.start, bytes = claim.end + 1 - claim.start,
+                            "freed worker stole the largest remaining cell");
+                        idx = claim.index;
+                        attempt = 0;
+                        continue;
+                    }
+                    None => return Ok(()),
+                }
             }
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(e)
@@ -726,7 +763,7 @@ async fn run_segment(
             {
                 attempt += 1;
                 let host_pressure = retry::is_host_pressure(&e);
-                let delay = retry::delay(&retry_cfg, host_pressure, attempt, initial.index as u64);
+                let delay = retry::delay(&retry_cfg, host_pressure, attempt, idx as u64);
                 if host_pressure {
                     // Fewer connections from now on: serial retries have a
                     // chance where eight simultaneous ones re-trip the quota.
@@ -750,6 +787,68 @@ async fn run_segment(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Work stealing: a worker whose cell just finished does not retire while
+/// some other cell still has a large unclaimed span. It picks the cell with
+/// the most bytes left, carves a claim out of the *tail* of its un-flushed
+/// span and returns the new cell (the donor keeps working the head, so its
+/// flushed prefix and `done` byte stay meaningful; coverage stays contiguous
+/// because the carve happens under the same lock that hands it out).
+///
+/// Claim size: when the stealing worker knowns a link rate it takes
+/// `chunks_for(rate)` — about 2 s of that link's throughput, 256 KiB..64 MiB
+/// — so a fast link takes small bites often and the donor keeps feeding; a
+/// rate-less worker takes the plain half (IDM's split-in-two). Never smaller
+/// than [`STEAL_MIN`]: a thinner tail is all overhead (handshake, headers)
+/// and never bigger than the donor keeps.
+///
+/// `Option<usize>`-style semantics: `None` = nothing worth stealing, the
+/// caller may retire.
+const STEAL_MIN: u64 = 256 * 1024;
+
+/// Split the largest remaining cell in two and hand out its tail.
+fn steal_largest(
+    cells: &Mutex<Vec<SegmentState>>,
+    claim_rate_bps: Option<f64>,
+) -> Option<SegmentState> {
+    let mut cells = cells.lock().expect("state cells");
+    // Donor = the cell with the most un-flushed range. UNBOUNDED cells
+    // cannot be split (a second endless stream would fetch the whole body).
+    let mut donor: Option<usize> = None;
+    let mut span: u64 = 0;
+    for (i, c) in cells.iter().enumerate() {
+        if c.end == UNBOUNDED {
+            continue;
+        }
+        let left = c.end + 1 - c.start - c.done;
+        if left > span {
+            span = left;
+            donor = Some(i);
+        }
+    }
+    let donor = donor?;
+    if span < 2 * STEAL_MIN {
+        return None;
+    }
+    let claim = match claim_rate_bps.filter(|r| *r > 0.0) {
+        Some(rate) => bond::chunks_for(rate, span).clamp(STEAL_MIN, span / 2),
+        None => span / 2,
+    };
+    let donor = &mut cells[donor];
+    // The claim lives at the far end of the donor's un-flushed span; the
+    // donor keeps its flushed prefix plus the span's head.
+    let claim_start = donor.start + donor.done + span - claim;
+    let claim_end = donor.end;
+    donor.end = claim_start - 1;
+    let tail = SegmentState {
+        index: cells.len(),
+        start: claim_start,
+        end: claim_end,
+        done: 0,
+    };
+    cells.push(tail.clone());
+    Some(tail)
 }
 
 /// One attempt at fetching a segment. Bytes are buffered and written at their
@@ -842,6 +941,10 @@ async fn segment_attempt(
     // as a huge speed spike and could end in SizeMismatch).
     let mut counted: u64 = 0;
     let mut durable_added: u64 = 0;
+    // Set when this cell's tail was stolen while the attempt streamed: the
+    // attempt stops at its (now smaller) span and the claim worker fetches
+    // the rest.
+    let mut tail_stolen = false;
     macro_rules! rollback {
         () => {
             if counted > durable_added {
@@ -865,9 +968,36 @@ async fn segment_attempt(
                 // Durable counters move only when the bytes are on disk.
                 pos += flushed as u64;
                 seg_done += flushed as u64;
-                durable_added += flushed as u64;
-                cells.lock().expect("state cells")[seg.index].done = seg_done;
-
+                // Steal interaction: another freed worker may have carved
+                // this cell's tail out from under this attempt while it
+                // streamed (the local `seg` never changes). Credit only
+                // what the cell still owns and give the surplus back to
+                // the headline counter - the claim worker re-downloads
+                // that tail at the same offsets, so the same byte must
+                // not be counted twice. When the claim eats everything
+                // left, this attempt stops early.
+                {
+                    let mut state = cells.lock().expect("state cells");
+                    let cell = &mut state[seg.index];
+                    // UNBOUNDED cells (single stream) can never be overdrawn
+                    // and are never carve targets - no clamp needed.
+                    let allowed = if cell.end == UNBOUNDED {
+                        u64::MAX
+                    } else {
+                        cell.end.saturating_sub(cell.start) + 1
+                    };
+                    let credit = allowed.saturating_sub(cell.done).min(flushed as u64);
+                    let gave = flushed as u64 - credit;
+                    if gave > 0 {
+                        downloaded.fetch_sub(gave, Ordering::Relaxed);
+                        counted = counted.saturating_sub(gave);
+                    }
+                    durable_added += credit;
+                    cell.done += credit;
+                    if cell.done >= allowed {
+                        tail_stolen = true;
+                    }
+                }
                 file = Some(handle);
                 bufs[1 - cur] = block;
                 bufs[1 - cur].clear();
@@ -915,8 +1045,26 @@ async fn segment_attempt(
                         if flushed == block.len() {
                             pos += flushed as u64;
                             seg_done += flushed as u64;
-                            durable_added += flushed as u64;
-                            cells.lock().expect("state cells")[seg.index].done = seg_done;
+                            // Same steal clamp as the happy path: a carver
+                            // may have shortened this cell mid-attempt.
+                            {
+                                let mut state = cells.lock().expect("state cells");
+                                let cell = &mut state[seg.index];
+                                let allowed = if cell.end == UNBOUNDED {
+                                    u64::MAX
+                                } else {
+                                    cell.end.saturating_sub(cell.start) + 1
+                                };
+                                let credit =
+                                    allowed.saturating_sub(cell.done).min(flushed as u64);
+                                let gave = flushed as u64 - credit;
+                                if gave > 0 {
+                                    downloaded.fetch_sub(gave, Ordering::Relaxed);
+                                    counted = counted.saturating_sub(gave);
+                                }
+                                durable_added += credit;
+                                cell.done += credit;
+                            }
                             file = Some(handle);
                             let _ = &file;
                         }
@@ -970,6 +1118,16 @@ async fn segment_attempt(
         if bufs[cur].len() >= flush_at {
             flush!();
         }
+        if tail_stolen {
+            // A freed worker carved this cell's tail off mid-attempt: the
+            // attempt's span is empty from here on. Flush the remainder so
+            // the pre-cut prefix lands durable (the join clamps the credit,
+            // the surplus of the tail is given back), then leave - the claim
+            // worker fetches everything past the cut.
+            flush!();
+            await_write!();
+            return Ok(());
+        }
     }
     flush!();
     // The final block may still be writing: wait for it before reporting the
@@ -977,7 +1135,9 @@ async fn segment_attempt(
     await_write!();
 
     // Server ended the stream early: count as a retryable transport fault.
-    if seg.end != UNBOUNDED && seg_done < seg.end + 1 - seg.start {
+    // (A stolen tail also leaves the raw `seg_done` short of the stale
+    // local range on purpose - the claim owns the rest.)
+    if seg.end != UNBOUNDED && !tail_stolen && seg_done < seg.end + 1 - seg.start {
         return Err(Error::ShortSegment {
             index: seg.index,
             expected: seg.end + 1 - seg.start,

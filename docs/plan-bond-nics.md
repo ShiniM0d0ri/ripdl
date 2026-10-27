@@ -35,7 +35,7 @@ give the fast link more work. Fix: work-stealing by cell splitting (C13)
 replaces land-grab partitioning; fallback accounting stays as an
 instrumentation item so a genuinely dead link is still observable.
 
-### G4. (added) work-stealing
+### G4. (added) work-stealing - LANDED 2026-10-27, test `freed_worker_steals_from_the_largest_straggler`
 A finished segment worker does not retire while any cell still has
 remaining bytes: it splits the slowest-remaining cell's tail into a new
 cell and claims it (cell = sidecar-iq piece, offsets durable). Every new
@@ -176,11 +176,24 @@ state churn. Rules, in priority order:
   unblocks after one probe wave. Legacy UNBOUNDED sidecar re-range
   LANDED (carried prefix -> first cell, ranged re-plan; test covers
   mid-cell resume + multi-cell + byte-exact).
-- Slice 2 remainder: work-stealing (G4): freed worker splits the
-  largest remaining cell (`chunks_for` sizes claims by its link's own
-  measured rate) instead of retiring; sidecar cells already support
-  it. This is the piece that stops "fast parts done, slow part grinds
-  alone" (G3's production anatomy).
+- Slice 2 remainder - work-stealing (G4) LANDED 2026-10-27: a freed
+  worker splits the largest remaining cell and claims its tail
+  (`chunks_for` sizes the claim by its link's own measured rate when
+  one exists - about 2 s of throughput, 256 KiB..64 MiB; rate-less
+  workers take the plain half, IDM's split-in-two) instead of
+  retiring; a resumed worker that finds its own cell already durable
+  steals too. Live donors are cut-safe by protocol: the carve happens
+  under the board lock, the donor's join credits only up to the cell's
+  (possibly shrunk) current span and gives the surplus back to the
+  headline counter, then stops streaming - the claim worker refetches
+  the tail, every byte is counted exactly once, and the resumed-slow
+  part is carried by whichever link is free. Test:
+  `freed_worker_steals_from_the_largest_straggler` (robbery = a ranged
+  GET judged *inside* a planned cell) plus clamped-donor coverage in
+  the pause/resume and etag suites. Still open from this slice:
+  stalled-segment cancel + rerun from durable done (aria2
+  `lowest-speed-limit`-style, deferred - the steal itself already
+  rescues a stalled uplink's cell once any other worker frees).
 - Slice 3: status-bar NIC chips (GUI, screenshot-verified).
 - Slice 4: NIC settings cards + exclude list + docs/ROADMAP.
 
