@@ -57,7 +57,7 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
             continue;
         }
 
-        let accept_ranges = resp
+        let mut accept_ranges = resp
             .headers()
             .get(ACCEPT_RANGES)
             .and_then(|v| v.to_str().ok())
@@ -65,7 +65,32 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
             .unwrap_or(false)
             || resp.headers().get(CONTENT_RANGE).is_some();
 
-        let total = total_from(&resp);
+        let mut total = total_from(&resp);
+
+        // Some frontends answer HEAD without either range signal even when
+        // ranged GETs work (a Cloudflare-proxied host observed live: HEAD has
+        // no Accept-Ranges and no Content-Length, while Range: bytes=0-0
+        // answers 206 with the true total). Never trust the header check
+        // alone: when HEAD left a question open, ask two bytes and look.
+        // A failed follow-up is tolerated - HEAD is a sufficient plan.
+        if status == StatusCode::OK && (!accept_ranges || total.is_none()) {
+            match client
+                .get(parsed.clone())
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    accept_ranges = accept_ranges
+                        || r.status() == StatusCode::PARTIAL_CONTENT
+                        || r.headers().get(CONTENT_RANGE).is_some();
+                    if total.is_none() {
+                        total = total_from(&r);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
         let filename = filename_from(&resp)
             .or_else(|| filename_from_url(&parsed))
             .unwrap_or_else(|| "download.bin".to_string());
@@ -88,10 +113,15 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
 
 fn total_from(resp: &reqwest::Response) -> Option<u64> {
     let headers = resp.headers();
-    if let Some(len) = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()) {
-        if let Ok(n) = len.parse::<u64>() {
-            if n > 1 {
-                return Some(n);
+    // A 206 is a ranged answer: its Content-Length is the slice's length
+    // ("Content-Length: 2" for a bytes=0-0 probe), never the file total. The
+    // real total lives in Content-Range ("bytes 0-0/2097152000").
+    if resp.status() != StatusCode::PARTIAL_CONTENT {
+        if let Some(len) = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()) {
+            if let Ok(n) = len.parse::<u64>() {
+                if n > 1 {
+                    return Some(n);
+                }
             }
         }
     }

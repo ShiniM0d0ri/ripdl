@@ -83,6 +83,11 @@ struct ServerState {
     /// a fresh task retries the probe instead of failing before it starts.
     hard_quota_replies: usize,
     hard_quota_served: AtomicUsize,
+    /// HEAD answers without any range signal (no Accept-Ranges, no
+    /// Content-Length) while ranged GETs still answer 206 - some
+    /// Cloudflare-fronted hosts look exactly like this; only the planner's
+    /// behavioral 2-byte probe can discover the real range support.
+    head_bare: bool,
 }
 
 async fn spawn_server(state: Arc<ServerState>) -> String {
@@ -171,16 +176,25 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
     }
 
     // HEAD = engine probe: advertise size + range support, send no body.
+    // The bare shape (some Cloudflare hosts) carries neither range signal.
     if is_head {
-        let ranges_hdr = if state.ranges { "accept-ranges: bytes\r\n" } else { "" };
+        let ranges_hdr = if state.ranges && !state.head_bare {
+            "accept-ranges: bytes\r\n"
+        } else {
+            ""
+        };
+        let len_hdr = if state.head_bare {
+            String::new()
+        } else {
+            format!("content-length: {}\r\n", state.total)
+        };
         let cd_hdr = state
             .content_disposition
             .as_deref()
             .map(|cd| format!("content-disposition: {cd}\r\n"))
             .unwrap_or_default();
         let resp = format!(
-            "HTTP/1.1 200 OK\r\netag: {etag}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n{cd_hdr}{ranges_hdr}connection: close\r\n\r\n",
-            state.total
+            "HTTP/1.1 200 OK\r\netag: {etag}\r\ncontent-type: application/octet-stream\r\n{len_hdr}{cd_hdr}{ranges_hdr}connection: close\r\n\r\n"
         );
         sock.write_all(resp.as_bytes()).await?;
         return Ok(());
@@ -225,8 +239,14 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
             if let Ok(peer) = sock.peer_addr() {
                 state.peers_seen.lock().unwrap().push(peer.ip().to_string());
             }
+            let admit_hdr = if state.head_bare {
+                // Bare 206: range support discoverable only from Content-Range.
+                String::new()
+            } else {
+                "accept-ranges: bytes\r\n".to_string()
+            };
             let resp = format!(
-                "HTTP/1.1 206 Partial Content\r\netag: {etag}\r\naccept-ranges: bytes\r\ncontent-range: bytes {a}-{b}/{}\r\ncontent-length: {len}\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\netag: {etag}\r\n{admit_hdr}content-range: bytes {a}-{b}/{}\r\ncontent-length: {len}\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\n",
                 state.total
             );
             sock.write_all(resp.as_bytes()).await?;
@@ -344,6 +364,7 @@ async fn multi_segment_exact_bytes() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -389,6 +410,7 @@ async fn rate_limited_ranges_back_off_and_finish() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -435,6 +457,7 @@ async fn probe_retries_host_quota_and_starts() {
         // HEAD + fallback GET on attempt 1, HEAD on attempt 2.
         hard_quota_replies: 3,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -477,6 +500,7 @@ async fn bonded_segments_cycle_interfaces() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -528,6 +552,7 @@ async fn bonded_single_extra_address_still_binds() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -573,6 +598,7 @@ async fn dropped_connection_recovered_by_retry() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -606,6 +632,7 @@ async fn no_ranges_falls_back_to_single_stream() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -620,6 +647,60 @@ async fn no_ranges_falls_back_to_single_stream() {
     assert!(
         state.ranges_seen.lock().unwrap().is_empty(),
         "no-range server must not receive ranged GETs"
+    );
+}
+
+/// Some frontends (Cloudflare, observed live) answer HEAD with neither
+/// Accept-Ranges nor Content-Length even when ranged GETs work: the planner
+/// must follow up with a 2-byte behavioral probe, discover ranges and the
+/// true total, and plan real segments - otherwise every download from such a
+/// host crawls on a single connection (and NIC bonding has nothing to spread).
+#[tokio::test]
+async fn bare_head_still_discovers_ranges() {
+    let state = Arc::new(ServerState {
+        total: 2 * MIB,
+        ranges: true,
+        head_bare: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let engine = test_engine();
+    let tmp = temp_dir("barehead");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download ok");
+
+    verify(&dest, 2 * MIB);
+    // The behavioral probe itself went out as bytes=0-0.
+    assert!(
+        state
+            .ranges_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r == "0-0"),
+        "planner must send the behavioral bytes=0-0 probe after a bare HEAD"
+    );
+    // And the plan must have chosen multiple segments, not one stream.
+    let ranged = state.ranges_seen.lock().unwrap().len();
+    assert!(
+        ranged > 2,
+        "expected a multi-segment download, got {} ranged GETs",
+        ranged
     );
 }
 
@@ -648,6 +729,7 @@ async fn pause_resumes_from_sidecar() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -732,6 +814,7 @@ async fn speed_limit_paces_download() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -788,6 +871,7 @@ async fn speed_limit_applies_to_single_stream() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -841,6 +925,7 @@ async fn refreshed_address_resumes_from_sidecar() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let base = spawn_server(Arc::clone(&state)).await;
     let old = format!("{base}?token=old");
@@ -927,6 +1012,7 @@ async fn stale_etag_forces_fresh_restart() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1006,6 +1092,7 @@ async fn carries_headers_and_uses_cd_filename() {
         quota_served: AtomicUsize::new(0),
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
