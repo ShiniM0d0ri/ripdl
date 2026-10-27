@@ -93,6 +93,13 @@ struct ServerState {
     /// freed workers must split the stragglers). `None` = everyone full
     /// speed.
     slow_pace: Option<(u64, Duration)>,
+    /// Connections whose body stalls after `stall_after_bytes` (socket left
+    /// OPEN, no bytes, no close - the silent-wedge shape). `stall_times`
+    /// budget of such connections; later requests serve normally. The idle
+    /// watchdog clears a stalled attempt, so the engine must recover.
+    stall_after_bytes: u64,
+    stall_times: usize,
+    stalled: AtomicUsize,
 }
 
 impl ServerState {
@@ -273,7 +280,8 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
             sock.write_all(resp.as_bytes()).await?;
 
             let dropping = state.dropped.fetch_add(1, Ordering::SeqCst) < state.drop_times;
-            write_body(&mut sock, &state, a, len, dropping).await?;
+            let stalling = state.stalled.fetch_add(1, Ordering::SeqCst) < state.stall_times;
+            write_body(&mut sock, &state, a, len, dropping, stalling).await?;
             Ok(())
         }
         // Plain GET -> the whole body (no-range fallback path).
@@ -283,7 +291,7 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
                 state.total
             );
             sock.write_all(resp.as_bytes()).await?;
-            write_body(&mut sock, &state, 0, state.total, false).await?;
+            write_body(&mut sock, &state, 0, state.total, false, false).await?;
             Ok(())
         }
     }
@@ -298,6 +306,7 @@ async fn write_body(
     start: u64,
     len: u64,
     dropping: bool,
+    stalling: bool,
 ) -> std::io::Result<()> {
     const BLOCK: usize = 16 * 1024;
     let mut block = vec![0u8; BLOCK];
@@ -309,6 +318,15 @@ async fn write_body(
         if dropping && sent >= state.drop_after_bytes {
             // Hard kill mid-body: the client sees a truncated response.
             return Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted));
+        }
+        if stalling && sent >= state.stall_after_bytes {
+            // Silent wedge: hold the socket open with no bytes and no close,
+            // so the client's stalled read is a *live* connection that just
+            // never progresses (the shape NIC churn produces). Waiting well
+            // past the engine's watchdog guarantees the watchdog fires
+            // first instead of a clean close doing the work.
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            return Ok(());
         }
         let mut n = (remaining as usize).min(BLOCK);
         if dropping {
@@ -387,6 +405,9 @@ async fn multi_segment_exact_bytes() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -437,6 +458,9 @@ async fn rate_limited_ranges_back_off_and_finish() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -485,6 +509,9 @@ async fn probe_retries_host_quota_and_starts() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -529,6 +556,9 @@ async fn bonded_segments_cycle_interfaces() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -582,6 +612,9 @@ async fn bonded_single_extra_address_still_binds() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -629,6 +662,9 @@ async fn quarantined_bond_link_falls_back_unbound() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -682,6 +718,9 @@ async fn shared_bond_state_flows_into_the_engine() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -749,6 +788,9 @@ async fn bonded_stream_credit_releases_on_cancel() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -821,6 +863,9 @@ async fn bonded_no_range_single_stream_meters_one_link() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -867,6 +912,9 @@ async fn bonded_ipv6_loopback_ranges_bind() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server_on("[::1]:0", Arc::clone(&state)).await;
 
@@ -916,6 +964,9 @@ async fn bonded_speed_limit_holds() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -968,6 +1019,9 @@ async fn bonded_engine_serves_two_tasks_concurrently() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1006,6 +1060,63 @@ async fn bonded_engine_serves_two_tasks_concurrently() {
     }
 }
 
+/// A connection that goes *silently* dead - alive TCP, zero progress, the
+/// shape produced when a source address disappears mid-session - must not
+/// park its worker forever. The stream watchdog errors the stalled attempt
+/// after a bounded silence; the retry redials (a fresh link or the OS
+/// route) and the task still lands byte-exact. On the pre-watchdog engine
+/// this task hung at the stalled byte count until process death.
+#[tokio::test]
+async fn stalled_connection_recovers_via_watchdog() {
+    let state = Arc::new(ServerState {
+        total: MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        // Every worker's first ranged GET stalls after 64 KiB, mid-body,
+        // with the socket kept open; the *second* request a worker makes
+        // gets the full body. The watchdog (250 ms) must free each worker
+        // for its healthy retry.
+        stall_after_bytes: 64 * KIB,
+        stall_times: 8,
+        stalled: AtomicUsize::new(0),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 128 * KIB,
+        retry: RetryConfig::default(),
+        stream_idle: Some(Duration::from_millis(250)),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("engine");
+    let tmp = temp_dir("stalled-watchdog");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download recovered from every stalled connection");
+    verify(&dest, MIB);
+    let stalled = state.stalled.load(Ordering::SeqCst);
+    assert!(
+        stalled >= 1,
+        "the server actually wedged {stalled} connections - test would not prove the watchdog"
+    );
+}
+
 /// One segment connection is killed 16 KiB in. The engine must recover via
 /// its internal retry (ShortSegment / transport error path) and still serve
 /// every byte exactly.
@@ -1029,6 +1140,9 @@ async fn dropped_connection_recovered_by_retry() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1064,6 +1178,9 @@ async fn no_ranges_falls_back_to_single_stream() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1106,6 +1223,9 @@ async fn bare_head_still_discovers_ranges() {
         hard_quota_replies: 0,
         hard_quota_served: AtomicUsize::new(0),
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1166,6 +1286,9 @@ async fn freed_worker_steals_from_the_largest_straggler() {
         // stragglers to rob (their claims are paced too - a 256 KiB claim
         // halves run ~640 ms, keeping the robbery window wide open).
         slow_pace: Some((2 * CELL, Duration::from_millis(40))),
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1234,6 +1357,9 @@ async fn pause_resumes_from_sidecar() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1319,6 +1445,9 @@ async fn speed_limit_paces_download() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1377,6 +1506,9 @@ async fn speed_limit_applies_to_single_stream() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1432,6 +1564,9 @@ async fn legacy_unbounded_sidecar_reranges_on_resume() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1509,6 +1644,9 @@ async fn refreshed_address_resumes_from_sidecar() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let base = spawn_server(Arc::clone(&state)).await;
     let old = format!("{base}?token=old");
@@ -1597,6 +1735,9 @@ async fn stale_etag_forces_fresh_restart() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1692,6 +1833,9 @@ async fn carries_headers_and_uses_cd_filename() {
         hard_quota_served: AtomicUsize::new(0),
         head_bare: false,
         slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 

@@ -123,6 +123,15 @@ pub struct EngineConfig {
     /// engine builds a private authority at construction (standalone
     /// CLI/tests).
     pub bond_state: Option<Arc<bond::Bond>>,
+    /// Stream watchdog: a connection that delivers no bytes for this long
+    /// errors as [`Error::StreamStalled`] instead of parking the worker
+    /// forever. This happens without a transport fault when a source
+    /// address dies under the session (NIC churn) or an intermediary wedges:
+    /// the TCP stream stays alive, every packet dies inside the kernel, and
+    /// `await read` would wait for a terminator that never comes. Long-slow
+    /// links are safe: the window only needs *some* progress. `None`
+    /// disables the watchdog (tests only).
+    pub stream_idle: Option<std::time::Duration>,
 }
 
 impl Default for EngineConfig {
@@ -136,6 +145,7 @@ impl Default for EngineConfig {
             headers: std::collections::HashMap::new(),
             bond: Bond::Off,
             bond_state: None,
+            stream_idle: Some(std::time::Duration::from_secs(30)),
         }
     }
 }
@@ -324,6 +334,7 @@ impl Engine {
             let limiter = self.limiter.clone();
             let primary = self.client.clone();
             let dialer = dialer.clone();
+            let stream_idle = self.cfg.stream_idle;
             // Ramp-in (the part-start lag spike): every segment used to
             // open its first handshake at the same moment, which read as a
             // hard CPU/AV hitch at every part start. First dials are spaced
@@ -347,6 +358,7 @@ impl Engine {
                     token,
                     &gate,
                     stagger,
+                    stream_idle,
                 )
                 .await;
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -656,6 +668,7 @@ async fn run_segment(
     token: CancellationToken,
     gate: &gate::Gate,
     stagger: Duration,
+    stream_idle: Option<Duration>,
 ) -> Result<()> {
     let mut attempt = 0u32;
     // The cell this worker currently owns. On completion it can be split
@@ -752,6 +765,7 @@ async fn run_segment(
             &downloaded,
             &limiter,
             &token,
+            stream_idle,
         )
         .await
         {
@@ -903,7 +917,8 @@ impl Drop for BondDial<'_> {
 }
 
 #[allow(unused_assignments)] // final-flush stores are intentionally dead
-async fn segment_attempt(    client: &reqwest::Client,
+async fn segment_attempt(
+    client: &reqwest::Client,
     bond_ctx: Option<(&bond::Bond, &bond::Link)>,
     url: &str,
     etag: Option<&str>,
@@ -913,6 +928,7 @@ async fn segment_attempt(    client: &reqwest::Client,
     downloaded: &Arc<AtomicU64>,
     limiter: &limiter::Limiter,
     token: &CancellationToken,
+    stream_idle: Option<Duration>,
 ) -> Result<()> {
     let mut file: Option<std::fs::File> = Some(
         std::fs::OpenOptions::new()
@@ -939,8 +955,21 @@ async fn segment_attempt(    client: &reqwest::Client,
     // throttling, not the uplink); a transport failure counts against the
     // link's fail streak. The Drop guard releases the credit on every exit
     // path, including pause/cancel and mid-stream transport faults.
+    //
+    // The watchdog window covers the send too: a connect an intermediary
+    // accepts and then silently never commits parks the worker the same way
+    // a silent body would (see the chunk loop).
+    //
+    // tokio's timer runs on milliseconds, so the "no watchdog" stand-in is
+    // years, not Duration::MAX (which panics there).
+    const NO_IDLE: Duration = Duration::from_secs(31_536_000);
+    let idle = stream_idle.unwrap_or(NO_IDLE);
     let _dial = BondDial::begin(bond_ctx);
-    let sent = req.send().await;
+    let sent: Result<reqwest::Response> = match tokio::time::timeout(idle, req.send()).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(Error::StreamStalled(idle.as_secs())),
+    };
     if let Some((bond, link)) = &bond_ctx {
         match &sent {
             Ok(_) => bond.note_ok(link),
@@ -1114,15 +1143,26 @@ async fn segment_attempt(    client: &reqwest::Client,
                 rollback!();
                 return Err(Error::Cancelled);
             }
-            chunk = stream.next() => match chunk {
-                Some(Ok(c)) => c,
-                Some(Err(e)) => {
-                    // Retry resumes from cells.done: give back the bytes that
-                    // were parked but never became durable.
+            chunk = tokio::time::timeout(idle, stream.next()) => match chunk {
+                // Watchdog wrapped: a connection alive-but-silent (lost
+                // source address during NIC churn, a wedged proxy) must
+                // error like any transport fault, not park the worker on a
+                // read that never returns - one stalled worker froze whole
+                // tasks at a partial byte count when the churn test found
+                // it. The rollback hands the parked bytes back and the
+                // retry redials through whatever link still works.
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(e))) => {
+                    // Retry resumes from cells.done: give back the bytes
+                    // that were parked but never became durable.
                     rollback!();
                     return Err(e.into());
                 }
-                None => break,
+                Ok(None) => break,
+                Err(_) => {
+                    rollback!();
+                    return Err(Error::StreamStalled(idle.as_secs()));
+                }
             },
         };
 

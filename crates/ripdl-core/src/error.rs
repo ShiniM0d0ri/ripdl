@@ -32,6 +32,14 @@ pub enum Error {
         got: u64,
     },
 
+    /// A segment connection went *silent*: alive TCP, zero progress for the
+    /// stream-idle watchdog window (a lost source address does exactly this -
+    /// every packet dies inside the kernel and the session never terminates).
+    /// Retryable: the rollback hands parked bytes back and the redial goes
+    /// through whatever link is still alive.
+    #[error("stream stalled: no bytes for {0}s")]
+    StreamStalled(u64),
+
     #[error("state file error: {0}")]
     State(String),
 

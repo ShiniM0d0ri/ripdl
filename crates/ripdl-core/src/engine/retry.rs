@@ -50,6 +50,7 @@ pub fn is_retryable(e: &Error) -> bool {
             None => true,
         },
         Error::ShortSegment { .. } => true,
+        Error::StreamStalled(_) => true,
         _ => false,
     }
 }
@@ -64,6 +65,12 @@ pub fn is_rate_limited(e: &Error) -> bool {
 /// short segment or a size mismatch never will.
 pub fn is_host_pressure(e: &Error) -> bool {
     if is_rate_limited(e) {
+        return true;
+    }
+    // A stalled connection shares the pressure semantics: it clears on its
+    // own or not at all, so the segments get the long jittered leash instead
+    // of failing the task after the plain budget.
+    if matches!(e, Error::StreamStalled(_)) {
         return true;
     }
     matches!(
