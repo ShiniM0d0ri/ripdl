@@ -254,19 +254,42 @@ state churn. Rules, in priority order:
     pressure; offline regression `stalled_connection_recovers_via_watchdog`
     wedges 8 mock connections mid-body with the socket left open).
     Note: loopback Wi-Fi-bound dials always fail, so local-server churn
-    is single-link; the honest churn pull is a real URL.
+    is single-link; the honest churn pull is a real URL. Also: the local
+    "throttled" mock does not actually throttle (res.write without
+    backpressure drains into Node's buffer), so local-run rate numbers
+    are buffer bursts, not link truth - do not calibrate on them.
   - With the watchdog (run 06b9d6, 100 MB proof.ovh pull, cable cue):
     eviction on unplug at t=42, handoff to Wi-Fi kept progressing
-    (83.6 -> 88.6 MB), replug re-adopted in ~25 s (t=67). Two residual
-    defects the run exposed - task still did not complete (93/100 MB at
-    the 300 s cap):
-    1. post-replug pick starvation: the re-adopted link ended the run
-       with `x0` (never picked again; cold weight 1 vs Wi-Fi 10 gave it
-       no dial), so it cannot re-earn metered traffic;
-    2. StreamStalled's host-pressure classification grouds recovery:
-       wedged-then-redialed attempts take the long leash and halve the
-       in-flight cap (`engine/gate.rs`), so post-churn recovery creeps
-       at ~1 dial per ~12 s.
+    (83.6 -> 88.6 MB), replug re-adopted in ~25 s (t=67). The run still
+    did not finish by the cap, but the two suspected defects were partly
+    confounded: proof.ovh.net is an OVH per-IP-quota host (429s to
+    ranged GETs after ~37 MiB, the v0.3.9 degradation path), which both
+    slowed the tail and polluted the per-link fail counters.
+  - Fixed in `9c1c97e` - both defects, root-caused by the retest:
+    1. pick starvation / wrong-crown: weights derived from each link's
+       AGGREGATE metered rate, which is proportional to the connection
+       share the weights themselves steered there (rich-get-richer; the
+       Hetzner run crowned Wi-Fi w10 while the user's ground truth says
+       the tether is fastest). Weights now follow a per-connection
+       capacity EMA (metered bytes / connection-seconds accumulated by
+       the dial guard): a fast link with one connection still measures
+       fast, a wedged connection craters its link's capacity, and claim
+       sizing uses the same per-conn figure. `rate_bps` stays the
+       aggregate the chip displays; `capacity_bps` is new on
+       `LinkStatus` (older frontends ignore it).
+    2. StreamStalled no longer counts as host pressure - a stalled path
+       must not take the long leash and halve the in-flight gate exactly
+       when recovery needs to fan out over the surviving links. It now
+       strikes the link's fail streak instead (note_fail on stall).
+  - Retest (run f9e212, full Ubuntu 26.04 live-server ISO, 2783 MB,
+    releases.ubuntu.com via Fastly, both uplinks, no cap): completed in
+    ~100 s, average ~28 MiB/s, peak total 66.1 MiB/s. Ethernet 2
+    (tether) measured 13.4-37.0 MiB/s at w10 with 2-4 connections;
+    Wi-Fi 7.2-9.8 MiB/s at w1-w3 with 4-6 - the weighting now ranks the
+    links the way the user's ground truth says they perform, and the
+    split followed it (early: both x4 with Eth2 w10/w4; late: Eth2 x2
+    carrying 2-3x Wi-Fi's rate). 18 bond unit tests + 24 engine
+    integration tests green offline.
   Offline edge tests added (`engine_integration.rs`): credit drains to
   zero after cancel, no-range single stream meters through the bond,
   IPv6 loopback bind (fixed follow-up from the earlier gap list - a

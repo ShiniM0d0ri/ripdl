@@ -528,17 +528,27 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       chips read as live connections instead of always-zero, and the
       first dials of a task starting inside the uplink-scan window wait
       up to 3 s for the link set instead of stranding the whole cell on
-      the OS route. Churn-verified live (plan doc): unplugging the
-      tether mid-download evicts the link on the scan (25 s round trip
-      with re-adoption on replug) and the task hands off to Wi-Fi - the
+      the OS route. Churn-verified live (plan doc): unplugging the tether
+      mid-download evicts the link on the scan (25 s round trip with
+      re-adoption on replug) and the task hands off to Wi-Fi - the
       pre-watchdog runs froze forever at a partial byte count (a
       connection whose source address died stays alive-but-silent), now
       bounded by the stream-idle watchdog (`stream_idle` 30 s, retryable
-      `Error::StreamStalled` + offline regression). Residual churn
-      defects recorded in the plan doc: post-replug pick starvation
-      (re-adopted link never picked again, `x0` to run end) and
-      StreamStalled's host-pressure treatment grounding recovery (long
-      leash + gate halving); plus the known slow-tail follow-up
+      `Error::StreamStalled` + offline regression). Weight basis fixed
+      (`9c1c97e`) after the full Ubuntu 26.04 ISO pull (2783 MB,
+      releases.ubuntu.com, both uplinks, ~100 s, peak 66 MiB/s) showed
+      the old aggregate-rate weights can crown the wrong link
+      (rich-get-richer: they rewarded whichever link the weights
+      themselves steered connections to) - weights now follow a
+      per-connection capacity EMA (bytes / connection-seconds), which
+      ranked the tether first (w10, 13-37 MiB/s) above Wi-Fi (w1-w3,
+      7-10 MiB/s) exactly as the links really perform, and
+      StreamStalled no longer counts as host pressure (no long leash,
+      no gate halving; it strikes the link's fail streak instead). The
+      earlier churn-tail slowness was partly an OVH per-IP-quota
+      artifact (proof.ovh.net 429s ranged GETs after ~37 MiB). Known
+      follow-up: the task tail (last ~2%) drains as one slow stream
+      before work-stealing helps.
 
 ## P7 - core control (engine power features)
 
