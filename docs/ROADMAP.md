@@ -522,7 +522,13 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       (CLI `ripdl config bond_exclude=Adapter1,Adapter2`, empty clears), and
       the Settings save now merges its edits over the snapshot taken at
       open, so keys the dialog does not show (lan_*, extension_dir)
-      survive the full-replace protocol
+      survive the full-replace protocol. Live-verified on a real
+      dual-uplink pull (plan doc, slice 5): the bond credit (`in_use`)
+      is held from dial to stream end (Drop guard, every exit path), so
+      chips read as live connections instead of always-zero, and the
+      first dials of a task starting inside the uplink-scan window wait
+      up to 3 s for the link set instead of stranding the whole cell on
+      the OS route
 
 ## P7 - core control (engine power features)
 
