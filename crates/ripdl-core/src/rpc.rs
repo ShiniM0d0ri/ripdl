@@ -38,6 +38,11 @@ pub struct DaemonSettings {
     /// bandwidth. Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bond_interfaces: Option<bool>,
+    /// Adapter names kept OUT of bonding (case-insensitive exact match),
+    /// e.g. a metered phone tether that must never carry download traffic.
+    /// An empty list = every working uplink participates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond_exclude: Option<Vec<String>>,
     /// Check GitHub for updates at GUI startup. Default on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
@@ -140,6 +145,18 @@ impl DaemonSettings {
         self.bond_interfaces.unwrap_or(false)
     }
 
+    /// Adapter names kept out of bonding, normalized for an exact
+    /// case-insensitive match against discovery's names.
+    pub fn bond_excludes(&self) -> Vec<String> {
+        self.bond_exclude
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|n| n.trim().to_lowercase())
+            .filter(|n| !n.is_empty())
+            .collect()
+    }
+
     /// Startup update checks on/off (default on).
     pub fn update_check(&self) -> bool {
         self.update_check.unwrap_or(true)
@@ -207,6 +224,9 @@ impl DaemonSettings {
         }
         if patch.bond_interfaces.is_some() {
             self.bond_interfaces = patch.bond_interfaces;
+        }
+        if patch.bond_exclude.is_some() {
+            self.bond_exclude = patch.bond_exclude;
         }
         if patch.update_check.is_some() {
             self.update_check = patch.update_check;
@@ -860,6 +880,31 @@ mod tests {
         let open: Request = serde_json::from_str(r#"{"id":3,"cmd":{"type":"open","id":"t1"}}"#)
             .expect("open parses");
         assert!(matches!(open.cmd, Command::Open { ref id, folder: false } if id == "t1"));
+    }
+
+    #[test]
+    fn bond_exclude_round_trips_and_normalizes() {
+        let mut cfg = DaemonSettings::default();
+        // Absent = every uplink participates.
+        assert!(cfg.bond_excludes().is_empty());
+        cfg.bond_exclude = Some(vec![
+            "  Tether ".to_string(),
+            "Wi-Fi".to_string(),
+            String::new(),
+        ]);
+        // Trimmed, lowercased, empty names dropped; exact case-insensitive
+        // match against discovery's names is what the daemon filters with.
+        assert_eq!(cfg.bond_excludes(), vec!["tether", "wi-fi"]);
+        // A patch replaces (an explicit empty list clears the exclusion).
+        let mut live = cfg.clone();
+        live.apply(DaemonSettings {
+            bond_exclude: Some(Vec::new()),
+            ..DaemonSettings::default()
+        });
+        assert!(live.bond_excludes().is_empty());
+        // Absent on the wire stays out of the JSON (older frontends unaware).
+        let json = serde_json::to_string(&DaemonSettings::default()).expect("serialize");
+        assert!(!json.contains("bond_exclude"));
     }
 
     #[test]

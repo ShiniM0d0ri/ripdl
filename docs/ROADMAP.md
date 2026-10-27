@@ -479,9 +479,17 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       ~60 s / 29 GB pass to <1 s and straight back to downloading. Boot
       prunes bitfields for tasks no longer queued, `rm` drops the task's
       bitfield, and the loopback test asserts the file is written
-- [ ] Bonding health: keep the default-route uplink and drop candidates that
+- [x] Bonding health: keep the default-route uplink and drop candidates that
       fail a reachability probe, so one dead-end adapter can never halve
-      the peer connection success rate
+      the peer connection success rate (the engine-level piece of this is
+      the "living bond" item below: only dead dials skip a link, a working
+      link is never banned)
+- [x] Status-bar uplink chips: one chip per bonded NIC (`name rate spark
+      state`) sampled every 2 s - state is a word, never color-only
+      (active/idle/flaky/dead), the tooltip carries name+IP+default route,
+      now/avg over the 80 s window, connections, dial fails and weight;
+      hidden while bonding is off; a chip click opens Settings > Network
+      with the bond row flashed (e2e C4 screenshots it)
 - [x] Segment visibility in the GUI: double-click (or Details) on an HTTP /
       video row opens its own dialog - address, output file, resume ETag and
       the live byte-range map from the sidecar (per-segment durable bytes and
@@ -494,6 +502,27 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       address, refuses it unless it serves the same file (name + size) with
       byte ranges, then swaps url+ETag in the sidecar and resumes; GUI
       dialog + context entry, CLI `ripdl refresh <id> <url> [--resume]`
+- [x] Living bond, HTTP side (plan: `docs/plan-bond-nics.md`): each download
+      re-picks a link on every dial - soft self-measured preferences
+      (1..10 from EMA rates, no hard ratios), retries leave a failing link
+      immediately, a dead-dial streak quarantines a link and `note_ok`
+      restores it at once (the default route is never skippable), 429/5xx
+      never count as link failures, and the link set / weights / warm
+      per-address client pool follow the daemon's 5 s uplink scan with no
+      restart. First dials ramp in (400 ms steps, capped ~3.2 s) so a task
+      start does not stampede the GUI; rate-adaptive write batches track
+      ~250 ms of each link's measured rate (256 KiB..4 MiB) so a slow link
+      stops grinding the disk; a freed worker steals the tail of the largest
+      remaining cell (claim sized ~2 s of its own link's rate), cut-safe
+      against a live donor on both the completion and cancel paths. Legacy
+      UNBOUNDED sidecars re-range to a fresh ranged plan at resume; bundles
+      probe every part's total up front so bundle progress reads from the
+      first byte. Settings > Network grew per-NIC cards (checkbox = include
+      in bonding, live rate/connection badge) backed by `bond_exclude`
+      (CLI `ripdl config bond_exclude=Adapter1,Adapter2`, empty clears), and
+      the Settings save now merges its edits over the snapshot taken at
+      open, so keys the dialog does not show (lan_*, extension_dir)
+      survive the full-replace protocol
 
 ## P7 - core control (engine power features)
 

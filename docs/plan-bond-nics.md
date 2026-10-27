@@ -206,7 +206,27 @@ state churn. Rules, in priority order:
   appear after the private daemon's bonding toggle turns on late in the
   run (early phases' loopback engine flows untouched), state word +
   tooltip shape, chip click -> Network panel.
-- Slice 4: NIC settings cards + exclude list + docs/ROADMAP.
+- Slice 4 - LANDED 2026-10-27 (e2e C4, screenshot c4-gui-settings-network):
+  `bond_exclude` end to end + NIC settings cards. Core: config key
+  `bond_exclude` (case-insensitive exact adapter names; empty clears),
+  accessor `bond_excludes()`. Daemon: `bond_allowed()` filters both the
+  HTTP bond's link set (`feed_http_bond`) and the torrent bind list
+  (`uplink_addrs`); unit test for the match rules. CLI:
+  `ripdl config bond_exclude=A,B` (empty value clears) and the
+  `uplinks:` line marks `(excluded)`. GUI: Settings > Network renders one
+  card per detected uplink - checkbox (uncheck = excluded, row dims +
+  strike-through) and a live badge (rate - connections - state word)
+  refreshed every 2 s while the Network tab shows; Save writes the
+  draft. Bonus fix: the Settings save now merges edited fields over the
+  snapshot taken at open, so the full-replace protocol can no longer
+  reset keys the dialog never showed (lan_*, extension_dir, the pairing
+  code) - previously every GUI save silently wiped the LAN drop box
+  config. e2e C4 grew the card-save check: uncheck first card, save,
+  CLI read-back shows bond_exclude AND default_download_dir still
+  pointing at the run folder (14/14 GUI checks pass).
+- Slice 5 (live): dual-NIC verification on a real run - G1 ramp-in
+  against `research/resolve-page/spike-watch.log`, G4 steal on the slow
+  uplink's parts, chips showing both uplinks; then tag + release notes.
 
 Debug daemon for live testing: private pipe + data dir, CDP-attached GUI,
 screenshots through run-in-session harness only (elevated shell cannot

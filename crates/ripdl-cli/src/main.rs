@@ -196,6 +196,7 @@ enum Cmd {
         /// just show the current settings. Valid keys: max_concurrent,
         /// max_segments, min_segment_size, max_speed_bytes (0 = uncapped),
         /// default_download_dir, ytdlp_path, hide_to_tray, bond_interfaces,
+        /// bond_exclude (comma-separated adapter names, empty = clear),
         /// update_check, update_auto_install, seed_enabled (true|false),
         /// seed_ratio (0 = unlimited), seed_time_min (0 = never),
         /// lan_enabled, lan_port, lan_dir, lan_open.
@@ -572,6 +573,16 @@ async fn main() -> anyhow::Result<()> {
                         settings.bond_interfaces =
                             Some(val.parse().context("bond_interfaces needs true|false")?)
                     }
+                    "bond_exclude" => {
+                        // Comma-separated adapter names; an empty value clears.
+                        let names: Vec<String> = val
+                            .split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .collect();
+                        settings.bond_exclude = Some(names);
+                    }
                     "update_check" => {
                         settings.update_check =
                             Some(val.parse().context("update_check needs true|false")?)
@@ -876,22 +887,32 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             // discovery the daemon uses). One uplink = a no-op; a second
             // dead-end adapter is the classic "combining got slower" cause.
             let nics = ripdl_core::engine::bonded_nics();
+            let excludes = settings.bond_excludes();
             let list = if nics.is_empty() {
                 "(none detected)".to_string()
             } else {
                 nics.iter()
                     .map(|n| {
+                        let excluded =
+                            excludes.iter().any(|x| x.trim().to_lowercase() == n.name.to_lowercase());
                         format!(
-                            "{} ({}{})",
+                            "{} ({}{}{})",
                             n.name,
                             n.addr,
-                            if n.is_default_route { ", default route" } else { "" }
+                            if n.is_default_route { ", default route" } else { "" },
+                            if excluded { ", excluded" } else { "" },
                         )
                     })
                     .collect::<Vec<_>>()
                     .join(" \u{b7} ")
             };
             println!("uplinks:              {list}");
+            if !excludes.is_empty() {
+                println!(
+                    "bond_exclude:         {} (these never carry download traffic)",
+                    excludes.join(", ")
+                );
+            }
             if !torrent_unreachable.is_empty() {
                 // Discovery found them, the daemon's live check rejected them:
                 // say so, or "my second connection is ignored" repeats.

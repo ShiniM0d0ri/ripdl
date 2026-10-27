@@ -161,6 +161,14 @@ fn adoption_jump(prev_bytes: u64, prev_tool_bps: Option<f64>, new_bytes: u64, dt
 /// fastest link, 1..=10; a link under 5% of the best is quarantined (0) so new
 /// peer connections stop landing on a dying tether. With no meaningful traffic
 /// yet (a quiet swarm) everything stays even: 1.
+/// Adapter names kept out of bonding (config `bond_exclude`): exact,
+/// case-insensitive match against discovery's names, so a Settings checkbox
+/// and a typed CLI value agree. Pure for tests.
+fn bond_allowed(excludes: &[String], name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    !excludes.iter().any(|x| x.trim().to_lowercase() == n)
+}
+
 fn weights_from_rates(rates: &[(std::net::IpAddr, f64)]) -> Vec<(std::net::IpAddr, u32)> {
     let best = rates.iter().map(|(_, r)| *r).fold(0.0, f64::max);
     rates
@@ -1712,8 +1720,12 @@ impl Daemon {
     /// one IPv4 per interface plus its global IPv6 when it has one, so v6
     /// peers are bonded and metered too instead of taking the OS route.
     fn uplink_addrs(&self) -> Vec<std::net::IpAddr> {
+        let excludes = self.conf().bond_excludes();
         let mut out: Vec<std::net::IpAddr> = Vec::new();
         for n in self.uplinks.lock().unwrap().iter() {
+            if !bond_allowed(&excludes, &n.name) {
+                continue;
+            }
             out.push(std::net::IpAddr::V4(n.addr));
             if let Some(v6) = n.v6 {
                 out.push(std::net::IpAddr::V6(v6));
@@ -1833,17 +1845,20 @@ impl Daemon {
             *self.bond_links.lock().unwrap() = Vec::new();
             return;
         }
-        let links: Vec<ripdl_core::bond::LinkInfo> = self
-            .uplinks
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|n| ripdl_core::bond::LinkInfo {
-                ip: std::net::IpAddr::V4(n.addr),
-                name: n.name.clone(),
-                default_route: n.is_default_route,
-            })
-            .collect();
+        let links: Vec<ripdl_core::bond::LinkInfo> = {
+            let excludes = self.conf().bond_excludes();
+            self.uplinks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|n| bond_allowed(&excludes, &n.name))
+                .map(|n| ripdl_core::bond::LinkInfo {
+                    ip: std::net::IpAddr::V4(n.addr),
+                    name: n.name.clone(),
+                    default_route: n.is_default_route,
+                })
+                .collect()
+        };
         self.bond.set_links(&links);
         let status = self.bond.sample(dt);
         *self.bond_links.lock().unwrap() = status
@@ -5409,6 +5424,18 @@ mod tests {
         assert!(adoption_jump(0, None, 2_252_154_753, dt), "no tool rate yet");
         // A stalled task that suddenly gains 40 MiB in a tick.
         assert!(adoption_jump(1_000, Some(0.0), 42_000_000, dt));
+    }
+
+    #[test]
+    fn bond_exclude_matches_a_settings_checkbox_and_typed_cli_value() {
+        let excludes = vec!["tether".to_string(), "ethernet 2".to_string()];
+        assert!(bond_allowed(&excludes, "Wi-Fi"), "unlisted uplink stays in");
+        assert!(bond_allowed(&excludes, "  Wi-Fi  "), "discovery names trim");
+        assert!(!bond_allowed(&excludes, "Ethernet 2"), "case-insensitive exact");
+        assert!(!bond_allowed(&excludes, "TETHER"), "the checkbox is lowercase");
+        assert!(bond_allowed(&excludes, "Ethernet 20"), "prefix must not match");
+        assert!(bond_allowed(&[], "anything"), "empty list excludes nothing");
+        assert!(!bond_allowed(&excludes, " tether "), "typed CLI values trim");
     }
 
     #[test]

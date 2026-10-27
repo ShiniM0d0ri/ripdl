@@ -1228,7 +1228,30 @@ async function guiPhase() {
     );
     check("C4 clicking a chip opens Settings > Network", netVisible === true);
     await shotOf(ws, "c4-gui-settings-network.png");
-    await evaluate(ws, `(() => { document.querySelector('#set-close').click(); return true; })()`);
+
+    // The NIC cards write bond_exclude: uncheck the first card and save.
+    // The CLI read-back proves the exclusion landed AND that the
+    // full-replace save rode the snapshot (default_download_dir still points
+    // at the run folder - a naive save would have reset it to defaults).
+    const toggled = await evaluate(
+        ws,
+        `(() => { const b = document.querySelector('.bond-nic input[type=checkbox]'); if (!b) return false; b.click(); return true; })()`,
+    );
+    check("C4 a NIC card checkbox exists", toggled === true);
+    if (toggled) {
+        await sleep(300);
+        await evaluate(ws, `(() => { document.querySelector('#set-ok').click(); return true; })()`);
+        await sleep(900);
+        const cfg = await runRipdl(["config"], 20000);
+        check(
+            "C4 card save wrote bond_exclude and kept the rest of the config",
+            cfg.code === 0 &&
+                /bond_exclude:/i.test(cfg.out) &&
+                cfg.out.includes(DIR.downloads),
+            cfg.out.split("\n").filter((l) => /bond_exclude|default_download_dir/.test(l)).join(" | ").slice(0, 200),
+        );
+    }
+    await evaluate(ws, `(() => { const c = document.querySelector('#set-close'); if (c && !document.querySelector('#set-backdrop').classList.contains('hidden')) c.click(); return true; })()`);
     await sleep(400);
     ws.close();
     killTree(gui1.pid);

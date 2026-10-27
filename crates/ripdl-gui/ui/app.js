@@ -1760,6 +1760,10 @@ async function openSettings(tab) {
     $("#set-seedtime").value = "0";
     try {
         const s = await invokeSafe("get_config");
+        // Save is a full-struct replace: keep the values this dialog does not
+        // edit (lan_*, extension_dir, bond_exclude...) so a save can never
+        // reset them to defaults, and the edited fields are merged on top.
+        settingsAtOpen = s;
         $("#set-conc").value = s.max_concurrent ?? "";
         $("#set-segs").value = s.max_segments ?? "";
         $("#set-minseg").value = bytesForEdit(s.min_segment_size);
@@ -1770,6 +1774,10 @@ async function openSettings(tab) {
         $("#set-tray").checked = s.hide_to_tray ?? true;
         $("#set-bond").checked = s.bond_interfaces ?? false;
         bondAtOpen = s.bond_interfaces ?? false;
+        // NIC card draft: names left out of bonding until Save. Local, so
+        // unchecking a card then cancelling loses the change, matching every
+        // other field in this dialog.
+        bondExcludeDraft = new Set((s.bond_exclude ?? []).map((n) => String(n).toLowerCase()));
         $("#set-update").checked = s.update_check ?? true;
         $("#set-auto").checked = s.update_auto_install ?? false;
         // serde skips None on the wire: absent = built-in default.
@@ -1779,6 +1787,7 @@ async function openSettings(tab) {
         renderBondNics();
         renderExtInfo();
         renderBrowserExtension();
+        startBondLive();
         if (extensionStatusTimer === null) {
             extensionStatusTimer = setInterval(() => {
                 if (!$("#set-backdrop").classList.contains("hidden")) renderBrowserExtension();
@@ -1798,6 +1807,8 @@ function closeSettings() {
         clearInterval(extensionStatusTimer);
         extensionStatusTimer = null;
     }
+    clearInterval(bondLiveTimer);
+    bondLiveTimer = null;
 }
 
 // Bonding value when the dialog opened: changing it only affects the
@@ -1805,16 +1816,28 @@ function closeSettings() {
 // restart instead of pretending it applied.
 let bondAtOpen = false;
 
+// Full settings snapshot taken when the dialog opened (the save merges the
+// edited fields over this, full-replace protocol).
+let settingsAtOpen = null;
+// Names currently excluded on the NIC cards (lowercase; Set of strings).
+let bondExcludeDraft = new Set();
+// 2 s refresher for the NIC cards' live rate/state, while the dialog is open.
+let bondLiveTimer = null;
+
 // Show exactly which uplinks bonding would spread connections across: one
 // uplink cannot add bandwidth, and a dead-end adapter is the classic
-// "combining made it slower" trap.
+// "combining made it slower" trap. Each detected uplink is a card with a
+// checkbox (uncheck = this adapter never carries download traffic; a
+// metered tether is the user here) and a live rate/state badge.
 async function renderBondNics() {
     const el = $("#set-bond-info");
     const live = $("#set-bond-state");
+    const cards = $("#set-bond-nics");
     try {
         const nics = await invokeSafe("bond_nics");
         if (!nics.length) {
             el.textContent = "No internet uplink detected.";
+            cards.replaceChildren();
         } else {
             const list = nics
                 .map((n) => `${n.name} (${n.addr}${n.default ? ", default route" : ""})`)
@@ -1822,6 +1845,40 @@ async function renderBondNics() {
             el.textContent = nics.length === 1
                 ? `Only one uplink found: ${list}. Bonding needs at least two.`
                 : `${nics.length} uplinks found: ${list}.`;
+            cards.replaceChildren(
+                ...nics.map((n) => {
+                    const row = document.createElement("label");
+                    row.className = "bond-nic";
+                    const box = document.createElement("input");
+                    box.type = "checkbox";
+                    const on = !bondExcludeDraft.has(n.name.toLowerCase());
+                    box.checked = on;
+                    if (!on) row.classList.add("is-excluded");
+                    box.onchange = () => {
+                        const key = n.name.toLowerCase();
+                        if (box.checked) bondExcludeDraft.delete(key);
+                        else bondExcludeDraft.add(key);
+                        row.classList.toggle("is-excluded", !box.checked);
+                    };
+                    row.appendChild(box);
+                    const name = document.createElement("span");
+                    name.className = "nic-name";
+                    name.textContent = n.name;
+                    row.appendChild(name);
+                    const addr = document.createElement("span");
+                    addr.className = "nic-addr";
+                    addr.textContent = `${n.addr}${n.default ? " \u00b7 default route" : ""}`;
+                    row.appendChild(addr);
+                    const badge = document.createElement("span");
+                    badge.className = "nic-live";
+                    badge.dataset.ip = n.addr;
+                    badge.textContent = "\u2026";
+                    row.appendChild(badge);
+                    row.title = "Unchecked: excluded from bonding. Checked: this uplink carries its share of download traffic.";
+                    return row;
+                }),
+            );
+            await refreshBondBadges();
         }
     } catch (e) {
         el.textContent = "";
@@ -1836,6 +1893,40 @@ async function renderBondNics() {
     } catch (e) {
         live.textContent = "";
     }
+}
+
+// Live half of the NIC cards: rate + connections + state word per uplink.
+// Updates badges only - the checkboxes are the user's interaction surface
+// and must not be rebuilt under a click.
+async function refreshBondBadges() {
+    const cards = $("#set-bond-nics");
+    if (!cards.children.length) return;
+    let links;
+    try {
+        links = await invokeSafe("bond_links");
+    } catch (_) {
+        return; // daemon briefly unreachable: keep the last badges
+    }
+    const byIp = new Map(links.map((l) => [l.ip, l]));
+    for (const badge of cards.querySelectorAll(".nic-live")) {
+        const l = byIp.get(badge.dataset.ip);
+        badge.textContent = l
+            ? [
+                l.rate_bps > 0 ? `${humans(l.rate_bps)}/s` : "idle",
+                `${l.in_use} conn`,
+                l.weight === 0 ? "dead" : l.fails > 0 ? "flaky" : l.in_use > 0 ? "active" : "idle",
+            ].join(" \u00b7 ")
+            : "-";
+    }
+}
+
+function startBondLive() {
+    clearInterval(bondLiveTimer);
+    bondLiveTimer = setInterval(() => {
+        // Only while the Network tab of an open settings dialog shows.
+        const panel = $("#set-panel-network");
+        if (panel && !panel.classList.contains("hidden")) refreshBondBadges();
+    }, 2000);
 }
 
 // The Extension folder's manifest version against this app. Only the folder
@@ -1963,8 +2054,13 @@ async function saveSettings() {
     const seedTime = num($("#set-seedtime"));
     if (Number.isNaN(ratio) || ratio < 0) return reject("Seed ratio must be 0 (no limit) or a positive number.");
     if (Number.isNaN(seedTime) || seedTime < 0) return reject("Seed time must be 0 (no limit) or a positive number of minutes.");
-    // Full-replace semantics: cleared fields become absent -> daemon defaults.
+    // Full-replace protocol: the save merges the dialog's edited fields over
+    // the snapshot taken at open. Cleared edited fields become absent ->
+    // daemon defaults; the values this dialog does not edit (lan_*, the
+    // pairing code, seeds config...) ride along unchanged instead of being
+    // reset by the replace.
     const payload = {
+        ...(settingsAtOpen ?? {}),
         max_concurrent: conc,
         max_segments: segs,
         min_segment_size: minseg,
@@ -1974,6 +2070,8 @@ async function saveSettings() {
         extension_dir: $("#set-ext").value.trim() || undefined,
         hide_to_tray: $("#set-tray").checked,
         bond_interfaces: $("#set-bond").checked,
+        bond_exclude: bondExcludeDraft.size ? [...bondExcludeDraft] : [],
+        bond_links: undefined, // not settings; never let a reply field loop back in
         update_check: $("#set-update").checked,
         update_auto_install: $("#set-auto").checked,
         seed_enabled: $("#set-seed").checked,

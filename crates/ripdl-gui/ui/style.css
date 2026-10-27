@@ -273,6 +273,22 @@ td.prog-cell .parts { margin-left: 8px; color: var(--amber); }
 .uplink-chip.st-warn { background: #f8eedb; color: #8a6116; border-color: var(--line); }
 .uplink-chip.st-off { background: #fae9e6; color: var(--red); border-color: var(--line); }
 
+/* Settings > Network: one card per detected uplink. Unchecking a card adds
+   the adapter to bond_exclude (a metered tether's lever). */
+.bond-nics { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; }
+.bond-nic {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 3px 8px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--surface); cursor: pointer; font-size: 12px;
+    align-items: center; flex-wrap: wrap;
+}
+.bond-nic:hover { background: #f2f7f4; }
+.bond-nic .nic-name { font-weight: 650; color: var(--ink); }
+.bond-nic .nic-addr { color: var(--muted); }
+.bond-nic .nic-live { margin-left: auto; font-variant-numeric: tabular-nums; color: #42554d; }
+.bond-nic.is-excluded { opacity: 0.55; }
+.bond-nic.is-excluded .nic-name { text-decoration: line-through; }
+
 /* Empty hint */
 #empty-hint { text-align: center; color: var(--muted); padding: 42px 20px; }
 #empty-hint .empty-ico { width: 32px; height: 32px; color: #8aa99b; margin-bottom: 8px; }
