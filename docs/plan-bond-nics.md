@@ -224,9 +224,23 @@ state churn. Rules, in priority order:
   config. e2e C4 grew the card-save check: uncheck first card, save,
   CLI read-back shows bond_exclude AND default_download_dir still
   pointing at the run folder (14/14 GUI checks pass).
-- Slice 5 (live): dual-NIC verification on a real run - G1 ramp-in
-  against `research/resolve-page/spike-watch.log`, G4 steal on the slow
-  uplink's parts, chips showing both uplinks; then tag + release notes.
+- Slice 5 (live) - VERIFIED 2026-10-27, `research/bond-live/watch.mjs`
+  (private daemon, 1 s RPC sampling, log in `research/bond-live/log-*.jsonl`):
+  Hetzner 100 MB over Ethernet 2 (tether, default route) + Wi-Fi
+  completed in 33 s. Ramp 0 -> 0.4 -> 30.4 MiB/s (no startup-spike
+  artifact; first bytes ~6 s in - the pick-wait covers the uplink scan).
+  Both links metered and steered: peaks Ethernet 2 5.0 MiB/s w6,
+  Wi-Fi 8.6 MiB/s w10 - the faster link earned the top weight. Two
+  defects the live run exposed, both fixed:
+  - the bond credit (`in_use`) only bracketed the transport *send*, so
+    a link streamed for minutes while its chip read `x0`/idle - credit
+    now lives in a Drop guard from dial to stream end;
+  - tasks starting inside the uplink-scan window stranded every first
+    dial on the OS route for the whole (minutes-long) cell - `Dialer::
+    attempt` now waits up to 3 s for a published link set.
+  Known follow-up: the tail (last ~2%) drained as a single slow stream
+  for ~18 s; work-stealing only helps when other workers free up first.
+  Then tag + release notes.
 
 Debug daemon for live testing: private pipe + data dir, CDP-attached GUI,
 screenshots through run-in-session harness only (elevated shell cannot
