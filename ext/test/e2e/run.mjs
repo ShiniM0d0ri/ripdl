@@ -1253,6 +1253,39 @@ async function guiPhase() {
     }
     await evaluate(ws, `(() => { const c = document.querySelector('#set-close'); if (c && !document.querySelector('#set-backdrop').classList.contains('hidden')) c.click(); return true; })()`);
     await sleep(400);
+
+    // C5: Help > About. The brand mark must be the real SVG tile (not a
+    // text glyph), the version badge filled from the running build, and
+    // the flat design language intact.
+    await evaluate(ws, `(() => { document.querySelector('#menubar span[data-menu=help]').click(); return true; })()`);
+    await sleep(300);
+    const aboutClicked = await evaluate(
+        ws,
+        `(() => { const mi = [...document.querySelectorAll('#menudrop .menu-item')].find((m) => m.textContent.includes('About')); if (!mi) return false; mi.click(); return true; })()`,
+    );
+    await sleep(500);
+    const about = await evaluate(
+        ws,
+        `(() => {
+            const abt = document.querySelector('#abt');
+            const open = !!abt && !document.querySelector('#abt-backdrop').classList.contains('hidden');
+            return {
+                open,
+                mark: !!abt.querySelector('.abt-mark'),
+                ver: abt.querySelector('.abt-ver').textContent,
+                chips: abt.querySelectorAll('.abt-chip').length,
+                links: abt.querySelectorAll('.abt-links button').length,
+            };
+        })()`,
+    );
+    check(
+        "C5 About opens with the brand mark and version badge",
+        aboutClicked === true && about.open === true && about.mark && about.ver.length > 0 && about.chips >= 3 && about.links >= 3,
+        JSON.stringify(about),
+    );
+    await shotOf(ws, "c5-gui-about.png");
+    await evaluate(ws, `(() => { document.querySelector('#abt-close').click(); return true; })()`);
+    await sleep(300);
     ws.close();
     killTree(gui1.pid);
 }

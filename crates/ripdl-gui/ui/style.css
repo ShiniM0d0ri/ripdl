@@ -518,10 +518,11 @@ body.drop-target::after {
 }
 #hdt-actions .hdt-gap { flex: 1; }
 #hdt-actions button {
-    padding: 5px 12px; border-radius: 4px; border: 1px solid #c3c9cf;
-    background: linear-gradient(#fdfdfd, #eef0f2); cursor: pointer; font: inherit;
+    padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--surface); cursor: pointer; font: inherit;
     display: inline-flex; align-items: center; gap: 6px;
 }
+#hdt-actions button:hover { background: var(--teal-wash); border-color: #b8d6ca; }
 #hdt-actions button .ico { width: 14px; height: 14px; }
 #hdt-actions button:disabled { opacity: 0.45; }
 #hdt-actions button:disabled .ico { color: #9aa0a6; }
@@ -574,22 +575,37 @@ body.drop-target::after {
 #abt {
     background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
     box-shadow: 0 16px 44px #17252229;
-    width: min(400px, 90vw);
+    width: min(440px, 90vw);
     display: flex; flex-direction: column;
-    padding: 14px 16px; gap: 10px;
+    padding: 14px 16px; gap: 12px;
 }
-#abt-body { display: flex; flex-direction: column; gap: 4px; }
-.abt-head { display: flex; align-items: baseline; gap: 7px; }
-.abt-logo { color: #0b6e5f; font-size: 17px; font-weight: 700; }
-.abt-name { font-size: 16px; font-weight: 600; color: #22303c; }
-.abt-ver { color: #66717b; font-size: 12px; }
-.abt-tag { color: #39424c; }
-.abt-meta { color: #66717b; font-size: 11.5px; line-height: 1.5; }
+#abt-body { display: flex; flex-direction: column; gap: 10px; padding-top: 4px; }
+.abt-head { display: flex; align-items: center; gap: 12px; }
+/* The brand tile, inline (docs/logo.svg is the source of truth). */
+.abt-mark { width: 58px; height: 58px; border-radius: 12px; flex: none; }
+.abt-name { display: flex; align-items: center; gap: 8px; font-size: 19px; font-weight: 700; color: var(--ink); line-height: 1.2; }
+/* Version as a wash badge: read at a glance, not buried in grey. */
+.abt-ver {
+    color: var(--teal-dark); font-size: 11.5px; font-weight: 600;
+    background: var(--teal-wash); border-radius: 8px; padding: 1px 8px;
+}
+.abt-tag { color: var(--muted); font-size: 12.5px; }
+.abt-desc { color: var(--ink); font-size: 12.5px; line-height: 1.5; }
+/* Feature chips answer "what does it do" without a wall of text. */
+.abt-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.abt-chip {
+    padding: 2px 10px; border-radius: 8px; font-size: 11.5px;
+    background: var(--wash); border: 1px solid var(--line); color: #42554d;
+}
+.abt-meta { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
 .abt-links { display: flex; gap: 8px; flex-wrap: wrap; }
 .abt-links button {
-    padding: 5px 12px; border-radius: 4px; border: 1px solid #c3c9cf;
-    background: linear-gradient(#fdfdfd, #eef0f2); cursor: pointer; font: inherit;
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 6px 12px; border-radius: 8px; cursor: pointer; font: inherit;
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink);
 }
+.abt-links button .ico { width: 15px; height: 15px; color: var(--teal); }
+.abt-links button:hover { background: var(--teal-wash); border-color: #b8d6ca; }
 .set-title {
     display: flex; align-items: center;
     font-weight: 650; font-size: 15px; color: var(--ink);
@@ -713,14 +729,13 @@ body.drop-target::after {
     font: 12px "Segoe UI", sans-serif; color: inherit; user-select: text;
 }
 .lan-row button, .lan-head button {
-    padding: 4px 10px; border-radius: 4px; border: 1px solid #c3c9cf;
-    background: linear-gradient(#fdfdfd, #eef0f2); cursor: pointer; font: inherit;
+    padding: 4px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--surface); cursor: pointer; font: inherit;
     white-space: nowrap; display: inline-flex; align-items: center; gap: 5px;
 }
-.lan-row button.primary {
-    background: var(--teal); color: #fff; border-color: var(--teal);
-    font-weight: 600;
-}
+.lan-row button:hover, .lan-head button:hover { background: var(--teal-wash); border-color: #b8d6ca; }
+.lan-row button.primary, .lan-head button.primary { background: var(--teal); color: #fff; border-color: var(--teal); font-weight: 600; }
+.lan-row button.primary:hover, .lan-head button.primary:hover { background: var(--teal-dark); border-color: var(--teal-dark); }
 .lan-row button .ico, .lan-head button .ico { width: 13px; height: 13px; }
 .lan-code {
     font: 12px "Consolas", monospace; background: #f2f5f8; border-radius: 4px;

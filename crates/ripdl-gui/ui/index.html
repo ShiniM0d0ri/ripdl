@@ -117,7 +117,7 @@
 
   <!-- Add URL dialog -->
   <div id="dlg-backdrop" class="hidden">
-    <div id="dlg">
+    <div id="dlg" role="dialog" aria-modal="true" aria-label="Add new download">
       <div class="dlg-title">Add new download</div>
       <input id="dlg-url" type="text" placeholder="https://example.com/file.zip" autofocus />
       <div class="dlg-row">
@@ -158,7 +158,7 @@
 
   <!-- Add multi-part (bundle) dialog: several direct links, one folder -->
   <div id="bdlg-backdrop" class="hidden">
-    <div id="bdlg">
+    <div id="bdlg" role="dialog" aria-modal="true" aria-label="Add multi-part download">
       <div class="dlg-title">Add multi-part download</div>
       <div class="dlg-hint">One link per line. Links that share a base name (x.part01.rar, x.part02.rar, x.part03.rar) become <b>one</b> task that owns a folder named after that base.</div>
       <textarea id="bdlg-urls" rows="7" spellcheck="false" placeholder="https://example.com/x.part01.rar&#10;https://example.com/x.part02.rar&#10;https://example.com/x.part03.rar"></textarea>
@@ -180,23 +180,39 @@
     </div>
   </div>
 
-  <!-- About dialog (Help > About ripdl) -->
+  <!-- About dialog (Help > About ripdl). The brand tile is inlined from
+       docs/logo.svg (the mark stays one source of truth). -->
   <div id="abt-backdrop" class="hidden">
-    <div id="abt">
+    <div id="abt" role="dialog" aria-label="About ripdl">
       <div class="set-title">About ripdl<button id="abt-close">&times;</button></div>
       <div id="abt-body">
         <div class="abt-head">
-          <span class="abt-logo">&#8681;</span>
-          <span class="abt-name">ripdl</span>
-          <span id="abt-ver" class="abt-ver"></span>
+          <svg class="abt-mark" viewBox="0 0 512 512" aria-hidden="true">
+            <rect width="512" height="512" rx="112" fill="#0b3230"/>
+            <g fill="#4ee0b5">
+              <rect x="104" y="176" width="86" height="20" rx="10" opacity="0.55"/>
+              <rect x="104" y="242" width="64" height="20" rx="10" opacity="0.75"/>
+              <rect x="104" y="308" width="42" height="20" rx="10"/>
+            </g>
+            <path d="M222 132h68v122h62L256 384 160 254h62z" fill="#ffffff"/>
+          </svg>
+          <div class="abt-caps">
+            <div class="abt-name">ripdl <span id="abt-ver" class="abt-ver"></span></div>
+            <div class="abt-tag">Download manager</div>
+          </div>
         </div>
-        <div class="abt-tag">Free, ad-free multi-segment download manager.</div>
-        <div class="abt-meta">No telemetry, no ads, forever. License: MIT OR Apache-2.0.</div>
+        <div class="abt-desc">Splits files across your internet connections for speed, keeps torrents healthy, and hands files between devices on your network.</div>
+        <div class="abt-chips">
+          <span class="abt-chip">Multi-segment + resume</span>
+          <span class="abt-chip">Torrents &amp; seeding</span>
+          <span class="abt-chip">LAN drop box</span>
+        </div>
+        <div class="abt-meta">Free, open source &mdash; no telemetry, no ads, forever.<br>Licence: MIT OR Apache-2.0.</div>
       </div>
       <div class="abt-links">
-        <button id="abt-repo">Source code</button>
-        <button id="abt-releases">Releases</button>
-        <button id="abt-issues">Report an issue</button>
+        <button id="abt-repo"><svg class="ico" aria-hidden="true"><use href="#i-external"/></svg>Source code</button>
+        <button id="abt-releases"><svg class="ico" aria-hidden="true"><use href="#i-download"/></svg>Releases</button>
+        <button id="abt-issues"><svg class="ico" aria-hidden="true"><use href="#i-alert"/></svg>Report an issue</button>
       </div>
       <div class="dlg-actions">
         <button id="abt-check">Check for updates</button>
@@ -207,7 +223,7 @@
 
   <!-- Send / receive on the local network -->
   <div id="lan-backdrop" class="hidden">
-    <div id="lan">
+    <div id="lan" role="dialog" aria-modal="true" aria-label="Send and receive">
       <div class="set-title">Send &amp; receive<em> files between devices on this network</em><button id="lan-close">&times;</button></div>
       <div id="lan-body">
         <div class="lan-card">
@@ -277,7 +293,7 @@
 
   <!-- Torrent details dialog -->
   <div id="tdg-backdrop" class="hidden">
-    <div id="tdg">
+    <div id="tdg" role="dialog" aria-modal="true" aria-label="Torrent details">
       <div class="tdg-title"><span id="tdg-name"></span><button id="tdg-close">&times;</button></div>
       <div class="tdg-summary" id="tdg-summary"></div>
       <div id="tdg-tabs">
@@ -294,7 +310,7 @@
 
   <!-- Details for plain HTTP/video tasks: address, file, segment map -->
   <div id="hdt-backdrop" class="hidden">
-    <div id="hdt">
+    <div id="hdt" role="dialog" aria-modal="true" aria-label="Task details">
       <div class="tdg-title"><span id="hdt-name"></span><button id="hdt-close">&times;</button></div>
       <div class="tdg-summary" id="hdt-summary"></div>
       <div id="hdt-body"></div>
@@ -311,7 +327,7 @@
 
   <!-- Refresh download address (expired signed link, same file) -->
   <div id="rdlg-backdrop" class="hidden">
-    <div id="rdlg">
+    <div id="rdlg" role="dialog" aria-modal="true" aria-label="Refresh download address">
       <div class="dlg-title"><span id="rdlg-title">Refresh download address</span><em> same file, fresh link</em></div>
       <div class="rdlg-hint" id="rdlg-hint"></div>
       <textarea id="rdlg-url" rows="3" spellcheck="false" placeholder="https://example.com/file.zip?token=..."></textarea>
@@ -325,7 +341,7 @@
 
   <!-- Add missing parts to an existing bundle -->
   <div id="apdlg-backdrop" class="hidden">
-    <div id="apdlg">
+    <div id="apdlg" role="dialog" aria-modal="true" aria-label="Add parts">
       <div class="dlg-title">Add parts<em> append links to this bundle</em></div>
       <div class="rdlg-hint">One link per line. Each link must name a part of this bundle (same base name plus a part number, e.g. <b>x.part03.rar</b>); links the bundle already carries are skipped. The bundle restarts afterwards and finished parts never re-download.</div>
       <textarea id="apdlg-urls" rows="6" spellcheck="false" placeholder="https://example.com/x.part03.rar"></textarea>
