@@ -165,11 +165,22 @@ state churn. Rules, in priority order:
   before the pause). 16/16 engine integration + 120/120 lib tests.
   G3 fallback accounting becomes skip-list behavior (2 dead dials;
   note_ok restores instantly) - quiesced as instrumentation.
-- Slice 2: `watch_bonding` feeds the HTTP bond (set_links + 5 s
-  sample) beside the torrent path; `Reply::Config.bond_links`; CLI/
-  GUI parity; IP-change subscription + work-stealing
-  (cell-split + largest-cell steal, `chunks_for`) + legacy
-  UNBOUNDED sidecar re-range on resume + G2 progress fix.
+- Slice 2 - LANDED 2026-10-27 (commit c0ec4f6): watcher feeds the HTTP
+  bond (`set_links` from proved uplinks + `sample` every 5 s, beside
+  the torrent path); `Reply::Config.bond_links`; `ripdl config`
+  prints `http uplinks:` and the GUI appends `downloads: ...` to the
+  bonding line every engine picks from this one instance.
+  G2 LANDED: bundle runner probes every never-run part's total
+  upfront (concurrently; `Attempted` marker keeps it off already-run
+  parts so a resumed failed part is not double-probed) - the bar
+  unblocks after one probe wave. Legacy UNBOUNDED sidecar re-range
+  LANDED (carried prefix -> first cell, ranged re-plan; test covers
+  mid-cell resume + multi-cell + byte-exact).
+- Slice 2 remainder: work-stealing (G4): freed worker splits the
+  largest remaining cell (`chunks_for` sizes claims by its link's own
+  measured rate) instead of retiring; sidecar cells already support
+  it. This is the piece that stops "fast parts done, slow part grinds
+  alone" (G3's production anatomy).
 - Slice 3: status-bar NIC chips (GUI, screenshot-verified).
 - Slice 4: NIC settings cards + exclude list + docs/ROADMAP.
 
