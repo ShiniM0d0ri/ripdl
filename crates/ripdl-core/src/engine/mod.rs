@@ -576,7 +576,21 @@ impl Dialer {
     /// links are skipped, all-skipped or no links falls back unattributed).
     /// The OS-default-route link stays unbound - OS routing already directs
     /// it - but its connection still meters so its weight can scale.
-    fn attempt(&self) -> DialAttempt {
+    async fn attempt(&self, token: &CancellationToken) -> DialAttempt {
+        // The authority may not be populated yet: the daemon discovers and
+        // probes uplinks a moment after boot/first enable, and a task that
+        // starts inside that window would strand every first dial on the
+        // OS route - a worker then streams its whole (often minutes-long)
+        // cell unattributed and the bond never engages for it. Give the
+        // authority a bounded moment; cancellation wins.
+        const PICK_WAIT: Duration = Duration::from_secs(3);
+        let mut waited = Duration::ZERO;
+        while self.bond.links().is_empty() && waited < PICK_WAIT {
+            tokio::select! {
+                _ = token.cancelled() => return DialAttempt { client: self.primary.clone(), link: None },
+                _ = tokio::time::sleep(Duration::from_millis(200)) => waited += Duration::from_millis(200),
+            }
+        }
         match self.bond.pick() {
             Some(link) if link.info.default_route => DialAttempt {
                 client: self.primary.clone(),
@@ -706,7 +720,10 @@ async fn run_segment(
         // This attempt's dial: a bond pick when bonding is on, or the plain
         // unbound client. The pick re-runs per attempt, so a link that has
         // started to fail is abandoned by the retry loop itself.
-        let pick = dialer.as_ref().map(|d| d.attempt());
+        let pick = match dialer.as_ref() {
+            Some(d) => Some(d.attempt(&token).await),
+            None => None,
+        };
         let (client, link) = match pick {
             Some(DialAttempt { client, link }) => (client, link),
             None => (primary.clone(), None),
@@ -857,11 +874,36 @@ fn steal_largest(
 /// so a retry (or a crash) resumes from the last durable offset.
 ///
 /// `bond_ctx` (present when this attempt dialed through a bond link) meters
-/// the connection: `begin/end` around the dial, `note_ok`/`note_fail` on the
-/// outcome, and per-chunk `record` so the link's rate EMA self-measures.
+/// the connection: `begin/end` around the whole attempt - `in_use` then
+/// counts a link's *live* connections (what a status chip shows), not the
+/// millisecond the transport send takes - and per-chunk `record` so the
+/// link's rate EMA self-measures. `note_ok`/`note_fail` stay at response
+/// arrival (a 429/5xx is host throttling, not the uplink).
+/// One attempt's link credit, held from dial to stream end so `in_use`
+/// reads as "connections live on this link" (a chip's active state), not
+/// the instant of the transport send. Drop covers every exit path:
+/// pause/cancel, mid-stream transport faults, and the happy flush.
+struct BondDial<'a>(Option<(&'a bond::Bond, &'a bond::Link)>);
+
+impl<'a> BondDial<'a> {
+    fn begin(ctx: Option<(&'a bond::Bond, &'a bond::Link)>) -> Self {
+        if let Some((bond, link)) = &ctx {
+            bond.begin(link);
+        }
+        Self(ctx)
+    }
+}
+
+impl Drop for BondDial<'_> {
+    fn drop(&mut self) {
+        if let Some((bond, link)) = self.0 {
+            bond.end(link);
+        }
+    }
+}
+
 #[allow(unused_assignments)] // final-flush stores are intentionally dead
-async fn segment_attempt(
-    client: &reqwest::Client,
+async fn segment_attempt(    client: &reqwest::Client,
     bond_ctx: Option<(&bond::Bond, &bond::Link)>,
     url: &str,
     etag: Option<&str>,
@@ -891,16 +933,15 @@ async fn segment_attempt(
         req = req.header(reqwest::header::IF_MATCH, etag);
     }
 
-    // Bond bookkeeping: the dial (transport send) is the metered event. A
-    // response that arrives - whatever its status - proves the link works
-    // (a 429/5xx is the *host* throttling, not the uplink); a transport
-    // failure counts against the link's fail streak.
-    if let Some((bond, link)) = &bond_ctx {
-        bond.begin(link);
-    }
+    // Bond bookkeeping: the connection holds the link credit from its dial
+    // until its stream ends (see BondDial below); the response arriving -
+    // whatever its status - proves the link works (a 429/5xx is the *host*
+    // throttling, not the uplink); a transport failure counts against the
+    // link's fail streak. The Drop guard releases the credit on every exit
+    // path, including pause/cancel and mid-stream transport faults.
+    let _dial = BondDial::begin(bond_ctx);
     let sent = req.send().await;
     if let Some((bond, link)) = &bond_ctx {
-        bond.end(link);
         match &sent {
             Ok(_) => bond.note_ok(link),
             Err(_) => bond.note_fail(link),

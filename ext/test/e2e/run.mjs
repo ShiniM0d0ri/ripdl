@@ -490,7 +490,12 @@ async function cliPhase() {
         const id = parseId(r.out);
         await waitTask(id, (t) => (t.downloaded || 0) > 64 * KiB, 60000);
         await runRipdl(["pause", id]);
-        const parked = await waitTask(id, (t) => t.state === "paused", 30000);
+        await waitTask(id, (t) => t.state === "paused", 30000);
+        // Pause folds the runner's last buffered-durable bytes into the record
+        // one progress tick later; baseline AFTER the flush-quiesce settles,
+        // or the exact-equality check below measures the daemon's own fold.
+        await sleep(2000);
+        const parked = await taskById(id);
         check("A5 paused task keeps partial bytes", parked.downloaded > 0 && parked.downloaded < parked.total, `${parked.downloaded} of ${parked.total}`);
         await sleep(1500);
         const still = await taskById(id);
@@ -1313,6 +1318,29 @@ async function main() {
         WEBVIEW2_USER_DATA_FOLDER: DIR.guiProfile,
     };
     console.log(`run ${RUN}: ${RUN_DIR}`);
+    // A previous harness run killed mid-phase (timeout, exception) can leave
+    // its daemon or GUI alive: it holds a pipe/port this run may allocate by
+    // chance and would then answer a foreign token file at best. Sweep any
+    // ripdl process living under this repo's target tree first (the
+    // installed app lives elsewhere and is never touched).
+    if (process.platform === "win32") {
+        const list = spawnSync("tasklist", ["/FO", "CSV", "/NH"], { encoding: "utf8" });
+        for (const m of String(list.stdout ?? "").matchAll(/"(ripdl-(?:daemon|gui)\.exe)","(\d+)"/g)) {
+            const pid = m[2];
+            try {
+                const wmi = spawnSync(
+                    "powershell",
+                    ["-NoProfile", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).Path`],
+                    { encoding: "utf8" },
+                );
+                const exePath = String(wmi.stdout ?? "").trim();
+                if (exePath.startsWith(path.join(ROOT, "target"))) {
+                    console.log(`sweeping stale ${exePath} (pid ${pid})`);
+                    spawnSync("taskkill", ["/F", "/PID", pid, "/T"]);
+                }
+            } catch (_) { /* already gone */ }
+        }
+    }
     const before = await userDaemonState();
     const downloadsBefore = downloadsSnapshot();
 
