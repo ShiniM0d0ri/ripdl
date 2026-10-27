@@ -242,6 +242,37 @@ state churn. Rules, in priority order:
   for ~18 s; work-stealing only helps when other workers free up first.
   Then tag + release notes.
 
+- Churn (live, manual) - 2026-10-27, `research/bond-live/churn.mjs`
+  (cues the user to unplug/replug the tether mid-download; adapter
+  toggling from the agent shell is denied - the shell runs a filtered
+  UAC token, Administrators deny-only). Two phases:
+  - Pre-watchdog runs froze permanently at a partial byte count
+    (46-65 MiB) with a live TCP connection whose source address died
+    with the adapter: alive-but-silent, `await read` parked the worker
+    forever (3 reproductions). Fixed by the stream-idle watchdog
+    (`stream_idle`, 30 s, `Error::StreamStalled` retryable + host-
+    pressure; offline regression `stalled_connection_recovers_via_watchdog`
+    wedges 8 mock connections mid-body with the socket left open).
+    Note: loopback Wi-Fi-bound dials always fail, so local-server churn
+    is single-link; the honest churn pull is a real URL.
+  - With the watchdog (run 06b9d6, 100 MB proof.ovh pull, cable cue):
+    eviction on unplug at t=42, handoff to Wi-Fi kept progressing
+    (83.6 -> 88.6 MB), replug re-adopted in ~25 s (t=67). Two residual
+    defects the run exposed - task still did not complete (93/100 MB at
+    the 300 s cap):
+    1. post-replug pick starvation: the re-adopted link ended the run
+       with `x0` (never picked again; cold weight 1 vs Wi-Fi 10 gave it
+       no dial), so it cannot re-earn metered traffic;
+    2. StreamStalled's host-pressure classification grouds recovery:
+       wedged-then-redialed attempts take the long leash and halve the
+       in-flight cap (`engine/gate.rs`), so post-churn recovery creeps
+       at ~1 dial per ~12 s.
+  Offline edge tests added (`engine_integration.rs`): credit drains to
+  zero after cancel, no-range single stream meters through the bond,
+  IPv6 loopback bind (fixed follow-up from the earlier gap list - a
+  real non-loopback v6 uplink remains live-only), speed cap paces bonded
+  traffic, two tasks share one bonded engine.
+
 Debug daemon for live testing: private pipe + data dir, CDP-attached GUI,
 screenshots through run-in-session harness only (elevated shell cannot
 open WebView2 windows directly).

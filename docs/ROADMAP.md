@@ -528,7 +528,17 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       chips read as live connections instead of always-zero, and the
       first dials of a task starting inside the uplink-scan window wait
       up to 3 s for the link set instead of stranding the whole cell on
-      the OS route
+      the OS route. Churn-verified live (plan doc): unplugging the
+      tether mid-download evicts the link on the scan (25 s round trip
+      with re-adoption on replug) and the task hands off to Wi-Fi - the
+      pre-watchdog runs froze forever at a partial byte count (a
+      connection whose source address died stays alive-but-silent), now
+      bounded by the stream-idle watchdog (`stream_idle` 30 s, retryable
+      `Error::StreamStalled` + offline regression). Residual churn
+      defects recorded in the plan doc: post-replug pick starvation
+      (re-adopted link never picked again, `x0` to run end) and
+      StreamStalled's host-pressure treatment grounding recovery (long
+      leash + gate halving); plus the known slow-tail follow-up
 
 ## P7 - core control (engine power features)
 
