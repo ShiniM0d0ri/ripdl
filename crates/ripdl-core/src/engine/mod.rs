@@ -4,6 +4,7 @@ mod nic;
 mod planner;
 pub mod retry;
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,15 +17,30 @@ use tokio_util::sync::CancellationToken;
 pub use nic::{bonded_nics, live_bonded_nics, scan_uplinks, UplinkNic, UplinkScan};
 pub use planner::{percent_decode_lossy, PlanInfo};
 
+use crate::bond;
 use crate::error::{Error, Result};
 use crate::task::{Progress, SegmentState, TaskState, TaskStateFile};
 
 /// Sentinel end offset for "unknown total size, stream to the end".
 const UNBOUNDED: u64 = u64::MAX;
 
-/// Write buffer per segment: syscalls drop ~64x and disks can't stall the
-/// network pipeline.
-const SEGMENT_BUF: usize = 256 * 1024;
+/// Write batching, self-tuned by the throughput the link actually delivers
+/// (target ~250 ms of network data per disk write event, bounded): it
+/// starts small so the first durability checkpoint arrives fast and the
+/// rate estimate has something to measure, then grows with the measured
+/// rate and caps at 4 MiB. Each write event is one Defender minifilter
+/// interception - batching fewer, bigger writes is the whole disk-toll
+/// trick; the OS TCP window, not this buffer, carries the throughput.
+/// Interruption cost is bounded: an unflushed batch at a hard kill costs
+/// at most its own size of re-download (graceful pauses join their write,
+/// so they lose nothing).
+const BATCH_MIN: usize = 256 * 1024;
+const BATCH_CAP: usize = 4 * 1024 * 1024;
+
+/// Sidecar persistence cadence in steady state: the atomic rename + minifilter
+/// rescan cost more than the 200 bytes it writes, so <= 2 s is plenty in
+/// steady state; every pause/finish/first-tick flushes immediately.
+const SIDECAR_CADENCE: Duration = Duration::from_secs(2);
 
 /// How download segments choose their local (source) network interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +115,14 @@ pub struct EngineConfig {
     pub headers: std::collections::HashMap<String, String>,
     /// NIC bonding (see [`Bond`]). Default [`Bond::Off`].
     pub bond: Bond,
+    /// An external, already-live bond authority (typically the daemon's
+    /// shared one). When `Some`, the engine saves its known links and
+    /// records bytes through it instead of discovering its own set - the
+    /// daemon's watcher feeds discovery + sampling, so NIC events and
+    /// weight updates apply to every task at once, live. `None` = the
+    /// engine builds a private authority at construction (standalone
+    /// CLI/tests).
+    pub bond_state: Option<Arc<bond::Bond>>,
 }
 
 impl Default for EngineConfig {
@@ -111,21 +135,38 @@ impl Default for EngineConfig {
             max_speed: None,
             headers: std::collections::HashMap::new(),
             bond: Bond::Off,
+            bond_state: None,
         }
     }
 }
 
 pub struct Engine {
     client: reqwest::Client,
-    cfg: EngineConfig,
+    cfg: Arc<EngineConfig>,
     limiter: std::sync::Arc<limiter::Limiter>,
+    /// HTTP dial authority when bonding is configured (see [`Dialer`]).
+    dialer: Option<Arc<Dialer>>,
 }
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self> {
         let limiter = std::sync::Arc::new(limiter::Limiter::new(cfg.max_speed));
+        let cfg = Arc::new(cfg);
         let client = Self::http_client(&cfg, None)?;
-        Ok(Self { client, cfg, limiter })
+        let dialer = Dialer::new(cfg.clone(), client.clone()).map(Arc::new);
+        Ok(Self {
+            client,
+            cfg,
+            limiter,
+            dialer,
+        })
+    }
+
+    /// The HTTP bond authority, when bonding is configured. The daemon
+    /// reaches the same instance through its own `bond_state` handle; this
+    /// accessor is for frontends (CLI readouts, tests).
+    pub fn bond(&self) -> Option<&Arc<bond::Bond>> {
+        self.dialer.as_ref().map(|d| &d.bond)
     }
 
     /// Build a reqwest client with the engine's identity (user agent,
@@ -241,8 +282,15 @@ impl Engine {
                     .truncate(true)
                     .open(&dest)?
             };
+            // Pre-allocate once (planned size known): every later write lands
+            // in place - no per-write grow/metadata events, contiguous
+            // allocation on NTFS (disk-toll rule C9b). Never truncate a
+            // resumed file: only extend when it is shorter than planned.
+            let len = f.metadata()?.len();
             if let Some(total) = info.total {
-                f.set_len(total)?;
+                if len < total {
+                    f.set_len(total)?;
+                }
             }
         }
 
@@ -256,22 +304,14 @@ impl Engine {
         let gate = gate::Gate::new(segments.len());
 
         // Spawn one task per segment; each writes at its own file offset.
-        // NIC bonding (see `Bond`): when active, segments cycle through
-        // per-interface clients; a segment whose interface ultimately
-        // fails gets one last-ditch attempt over the OS default route.
-        let segment_clients = self.bond_clients();
+        // Bonding: every attempt dials through a link picked from the live
+        // bond authority (smooth weighted RR over measured rates); a link
+        // whose dials fail is skipped on the spot, and when nothing can be
+        // picked the OS default route carries the attempt.
+        let dialer = self.dialer.clone();
 
         let mut handles = Vec::with_capacity(segments.len());
-        for seg in segments {
-            let (client, os_route_fallback) = if segment_clients.is_empty() {
-                (self.client.clone(), None)
-            } else {
-                let (c, is_primary) = &segment_clients[seg.index % segment_clients.len()];
-                (
-                    c.clone(),
-                    (!is_primary).then(|| self.client.clone()),
-                )
-            };
+        for (rank, seg) in segments.into_iter().enumerate() {
             let url = url.to_string();
             let etag = info.etag.clone();
             let retry_cfg = self.cfg.retry.clone();
@@ -281,49 +321,36 @@ impl Engine {
             let token = token.clone();
             let active = active.clone();
             let gate = gate.clone();
+            let limiter = self.limiter.clone();
+            let primary = self.client.clone();
+            let dialer = dialer.clone();
+            // Ramp-in (the part-start lag spike): every segment used to
+            // open its first handshake at the same moment, which read as a
+            // hard CPU/AV hitch at every part start. First dials are spaced
+            // RAMP_STEP apart; later attempts (and their segments) dial
+            // freely. Capped so huge plans never wait more than a few
+            // seconds for full parallelism.
+            let stagger = RAMP_STEP * (rank as u32).min(RAMP_STAGGER_MAX);
 
-            handles.push(tokio::spawn({
-                let limiter = self.limiter.clone();
-                async move {
-                    let mut r = run_segment(
-                        &client,
-                        &url,
-                        etag.as_deref(),
-                        seg.clone(),
-                        retry_cfg.clone(),
-                        cells.clone(),
-                        dest.clone(),
-                        downloaded.clone(),
-                        limiter.clone(),
-                        token.clone(),
-                        &gate,
-                    )
-                    .await;
-                    if r.is_err() && !matches!(r, Err(Error::Cancelled)) {
-                        if let Some(primary) = os_route_fallback {
-                            tracing::warn!(
-                                index = seg.index,
-                                "bonded interface failed; one attempt over the OS default route"
-                            );
-                            r = run_segment(
-                                &primary,
-                                &url,
-                                etag.as_deref(),
-                                seg,
-                                retry_cfg,
-                                cells,
-                                dest,
-                                downloaded,
-                                limiter,
-                                token,
-                                &gate,
-                            )
-                            .await;
-                        }
-                    }
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    r
-                }
+            handles.push(tokio::spawn(async move {
+                let r = run_segment(
+                    &primary,
+                    dialer.clone(),
+                    &url,
+                    etag.as_deref(),
+                    seg,
+                    retry_cfg,
+                    cells,
+                    dest,
+                    downloaded,
+                    limiter,
+                    token,
+                    &gate,
+                    stagger,
+                )
+                .await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                r
             }));
         }
 
@@ -355,6 +382,7 @@ impl Engine {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // Sentinel != any real value: force one write on the first tick.
                 let mut persisted_downloaded = u64::MAX;
+                let mut persist_at = tokio::time::Instant::now();
                 loop {
                     tick.tick().await;
                     let drained = active.load(Ordering::SeqCst) == 0;
@@ -373,12 +401,15 @@ impl Engine {
                         break;
                     }
                     let downloaded_now = downloaded.load(Ordering::Relaxed);
-                    // Skip the disk write when no bytes landed since last tick
-                    // (retry backoff, limiter throttle, stalled server):
-                    // downloaded is the only sidecar field that moves between
-                    // ticks, so an unchanged counter means an unchanged file.
-                    if downloaded_now != persisted_downloaded {
+                    // Disk-toll rule: the progress callback fires every tick,
+                    // but the sidecar (atomic rename + minifilter rescan)
+                    // lands at most once per SIDECAR_CADENCE, plus the forced
+                    // first write and every state transition (pause/finish).
+                    if downloaded_now != persisted_downloaded
+                        && tokio::time::Instant::now() >= persist_at
+                    {
                         persisted_downloaded = downloaded_now;
+                        persist_at = tokio::time::Instant::now() + SIDECAR_CADENCE;
                         let segments = cells.lock().expect("state cells").clone();
                         let file = TaskStateFile {
                             segments,
@@ -462,53 +493,130 @@ impl Engine {
         let _ = std::fs::remove_file(&state_path);
         Ok(dest)
     }
+}
 
-    /// Per-interface segment clients according to `cfg.bond`. Empty result
-    /// = every segment uses the unbound primary client (plain mode).
-    ///
-    /// Binding is best-effort: an interface whose client fails to build is
-    /// skipped with a warning, and if *nothing* binds, plain mode wins.
-    ///
-    /// `Auto` keeps the OS-default interface on the unbound client and
-    /// binds one client per additional interface; with fewer than two
-    /// discovered paths there is nothing to combine, so this returns empty.
-    fn bond_clients(&self) -> Vec<(reqwest::Client, bool)> {
-        let mut out: Vec<(reqwest::Client, bool)> = Vec::new();
-        match &self.cfg.bond {
-            Bond::Off => {}
-            Bond::Addresses(addrs) => {
-                for ip in addrs {
-                    match Self::http_client(&self.cfg, Some(*ip)) {
-                        Ok(c) => out.push((c, false)),
-                        Err(e) => tracing::warn!(ip = %ip, error = %e, "cannot bind to address"),
-                    }
-                }
+/// Spacing between a download's first segment dials (ramp-in, see the
+/// spawn site in `download_named`).
+const RAMP_STEP: Duration = Duration::from_millis(400);
+/// Cap on how long the last segment waits for its first dial.
+const RAMP_STAGGER_MAX: u32 = 8;
+
+/// One attempt's dial decision: the client to send through and the bond
+/// link the connection should be attributed to (`None` for unattributed
+/// OS-routed dials - bond off, or a fallback after every link skipped).
+struct DialAttempt {
+    client: reqwest::Client,
+    link: Option<Arc<bond::Link>>,
+}
+
+/// The HTTP dial authority: turns [`bond::Bond`] picks into address-bound
+/// reqwest clients, one warm pool **per link address** (a reqwest `Client`
+/// maintains its own keep-alive connection pool, so established sockets and
+/// their TCP congestion windows survive between a link's segment attempts -
+/// dialing again only on failure or pool close; `SO_RCVBUF` is never
+/// touched so the OS autotuner keeps the throughput).
+///
+/// Byte attribution happens in the segment attempts (per-chunk `record`);
+/// outcomes at dial time (`note_ok`/`note_fail`).
+struct Dialer {
+    bond: Arc<bond::Bond>,
+    /// Identity source (UA, cookies...) for each per-link client.
+    cfg: Arc<EngineConfig>,
+    /// The unbound client: the OS-default-route dial and the fallback when
+    /// every link is skipped.
+    primary: reqwest::Client,
+    clients: Mutex<HashMap<IpAddr, reqwest::Client>>,
+}
+
+impl Dialer {
+    /// Built when bonding is configured; `None` in plain mode (`Bond::Off`).
+    /// The link set is seeded only when the engine owns the authority - a
+    /// daemon-provided one is fed by the daemon's own watcher
+    /// (`set_links`/`sample`), which keeps NIC events live across tasks.
+    fn new(cfg: Arc<EngineConfig>, primary: reqwest::Client) -> Option<Self> {
+        if cfg.bond.is_off() {
+            return None;
+        }
+        let bond = match &cfg.bond_state {
+            Some(shared) => Arc::clone(shared),
+            None => {
+                let links: Vec<bond::LinkInfo> = match &cfg.bond {
+                    Bond::Auto => nic::bonded_nics()
+                        .iter()
+                        .map(|n| bond::LinkInfo {
+                            ip: IpAddr::V4(n.addr),
+                            name: n.name.clone(),
+                            default_route: n.is_default_route,
+                        })
+                        .collect(),
+                    Bond::Addresses(addrs) => addrs
+                        .iter()
+                        .map(|ip| bond::LinkInfo {
+                            ip: *ip,
+                            name: ip.to_string(),
+                            default_route: false,
+                        })
+                        .collect(),
+                    Bond::Off => unreachable!("checked above"),
+                };
+                let bond = Arc::new(bond::Bond::new());
+                bond.set_links(&links);
+                bond
             }
-            Bond::Auto => {
-                let nics = nic::bonded_nics();
-                out.push((self.client.clone(), true));
-                for n in nics.iter().filter(|n| !n.is_default_route) {
-                    match Self::http_client(&self.cfg, Some(IpAddr::V4(n.addr))) {
-                        Ok(c) => {
-                            tracing::info!(name = %n.name, addr = %n.addr, "bonding extra uplink");
-                            out.push((c, false));
-                        }
-                        Err(e) => {
-                            tracing::warn!(name = %n.name, addr = %n.addr, error = %e, "cannot bind to interface")
-                        }
-                    }
-                }
-                let extra = out.len() - 1;
-                if extra == 0 {
-                    tracing::info!(
-                        uplinks = nics.len(),
-                        "bonding: no extra interfaces besides the default route; OS routing only"
-                    );
-                    out.clear();
-                }
+        };
+        Some(Self {
+            bond,
+            cfg,
+            primary,
+            clients: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Pick a link for one attempt (smooth weighted round-robin; weight-0
+    /// links are skipped, all-skipped or no links falls back unattributed).
+    /// The OS-default-route link stays unbound - OS routing already directs
+    /// it - but its connection still meters so its weight can scale.
+    fn attempt(&self) -> DialAttempt {
+        match self.bond.pick() {
+            Some(link) if link.info.default_route => DialAttempt {
+                client: self.primary.clone(),
+                link: Some(link),
+            },
+            Some(link) => DialAttempt {
+                client: self.client_for(link.info.ip),
+                link: Some(link),
+            },
+            None => DialAttempt {
+                client: self.primary.clone(),
+                link: None,
+            },
+        }
+    }
+
+    /// The warm client bound to a link address: built once, then pooled.
+    /// A `Client`'s internal keep-alive pool carries established sockets
+    /// across attempts, so a link's next attempt hops on an existing TCP
+    /// window instead of re-handshaking.
+    fn client_for(&self, ip: IpAddr) -> reqwest::Client {
+        if let Some(pooled) = self.clients.lock().unwrap().get(&ip) {
+            return pooled.clone();
+        }
+        // Built outside the lock (construction does DNS-free but non-trivial
+        // work); the entry insert only wins if another attempt got there first.
+        match Engine::http_client(&self.cfg, Some(ip)) {
+            Ok(built) => {
+                let mut clients = self.clients.lock().unwrap();
+                clients.entry(ip).or_insert_with(|| built.clone()).clone()
+            }
+            Err(e) => {
+                // Binding can fail when the address left the interface
+                // between discovery and dial: best-effort - this attempt
+                // goes out over the OS route, attributed to the link, and
+                // the dial-failure path marks the link for skipping.
+                tracing::warn!(ip = %ip, error = %e, "cannot bind segment client");
+                self.primary.clone()
             }
         }
-        out
     }
 }
 
@@ -517,9 +625,12 @@ impl Engine {
 /// offset already written; if the server cannot serve ranges, the stream
 /// restarts from zero.
 ///
-/// TODO(perf): move sync writes into `spawn_blocking` once we profile.
+/// When `dialer` is present, every attempt dials through a freshly picked
+/// bond link (the retry loop re-picks, so a dead link is left behind on the
+/// spot); `stagger` delays the first dial by rank×RAMP_STEP (ramp-in).
 async fn run_segment(
-    client: &reqwest::Client,
+    primary: &reqwest::Client,
+    dialer: Option<Arc<Dialer>>,
     url: &str,
     etag: Option<&str>,
     initial: SegmentState,
@@ -530,14 +641,31 @@ async fn run_segment(
     limiter: std::sync::Arc<limiter::Limiter>,
     token: CancellationToken,
     gate: &gate::Gate,
+    stagger: Duration,
 ) -> Result<()> {
     let mut attempt = 0u32;
+    // Ramp-in: hold this segment's *first* dial back so the part start does
+    // not open every handshake at the same instant (G1). Cancellation wins
+    // over the wait.
+    if stagger > Duration::ZERO {
+        tracing::debug!(index = initial.index, stagger_ms = stagger.as_millis() as u64, "ramp-in stagger");
+        tokio::select! {
+            _ = token.cancelled() => return Err(Error::Cancelled),
+            _ = tokio::time::sleep(stagger) => {}
+        }
+    }
     loop {
         // Re-read state: a previous attempt may have advanced it.
         let mut seg = cells.lock().expect("state cells")[initial.index].clone();
 
-        // Server without range support: partial progress is unusable, roll
-        // back the counter and restart the stream from zero.
+        // Completed cell: durable before the pause (e.g. serial retries
+        // finished some cells before the run was cancelled). Nothing is
+        // left to dial - a request here would carry a Range start past its
+        // end. The byte counters were initialized from the sidecar.
+        if seg.end != UNBOUNDED && seg.done >= seg.end + 1 - seg.start {
+            tracing::debug!(index = seg.index, done = seg.done, "cell already durable at resume");
+            return Ok(());
+        }
         if seg.end == UNBOUNDED && seg.done > 0 {
             let undone = seg.done;
             downloaded.fetch_sub(undone, Ordering::Relaxed);
@@ -559,8 +687,30 @@ async fn run_segment(
             p = gate.acquire() => p,
         };
 
+        // This attempt's dial: a bond pick when bonding is on, or the plain
+        // unbound client. The pick re-runs per attempt, so a link that has
+        // started to fail is abandoned by the retry loop itself.
+        let pick = dialer.as_ref().map(|d| d.attempt());
+        let (client, link) = match pick {
+            Some(DialAttempt { client, link }) => (client, link),
+            None => (primary.clone(), None),
+        };
+        let bond_ctx = match (&dialer, link.as_ref()) {
+            (Some(d), Some(l)) => Some((d.bond.clone(), Arc::clone(l))),
+            _ => None,
+        };
+
         match segment_attempt(
-            client, url, etag, &seg, &cells, &dest, &downloaded, &limiter, &token,
+            &client,
+            bond_ctx.as_ref().map(|(b, l)| (b.as_ref(), l.as_ref())),
+            url,
+            etag,
+            &seg,
+            &cells,
+            &dest,
+            &downloaded,
+            &limiter,
+            &token,
         )
         .await
         {
@@ -606,9 +756,14 @@ async fn run_segment(
 /// absolute file positions via the blocking pool, so slow disks cannot stall
 /// the network pipeline; `cells[index].done` advances only for flushed bytes,
 /// so a retry (or a crash) resumes from the last durable offset.
+///
+/// `bond_ctx` (present when this attempt dialed through a bond link) meters
+/// the connection: `begin/end` around the dial, `note_ok`/`note_fail` on the
+/// outcome, and per-chunk `record` so the link's rate EMA self-measures.
 #[allow(unused_assignments)] // final-flush stores are intentionally dead
 async fn segment_attempt(
     client: &reqwest::Client,
+    bond_ctx: Option<(&bond::Bond, &bond::Link)>,
     url: &str,
     etag: Option<&str>,
     seg: &SegmentState,
@@ -637,16 +792,47 @@ async fn segment_attempt(
         req = req.header(reqwest::header::IF_MATCH, etag);
     }
 
-    let mut stream = req.send().await?.error_for_status()?.bytes_stream();
+    // Bond bookkeeping: the dial (transport send) is the metered event. A
+    // response that arrives - whatever its status - proves the link works
+    // (a 429/5xx is the *host* throttling, not the uplink); a transport
+    // failure counts against the link's fail streak.
+    if let Some((bond, link)) = &bond_ctx {
+        bond.begin(link);
+    }
+    let sent = req.send().await;
+    if let Some((bond, link)) = &bond_ctx {
+        bond.end(link);
+        match &sent {
+            Ok(_) => bond.note_ok(link),
+            Err(_) => bond.note_fail(link),
+        }
+    }
+    let mut stream = sent?.error_for_status()?.bytes_stream();
     let mut pos = seg.start + seg.done;
     let mut seg_done = seg.done;
     // Ping-pong buffers: one fills from the network while the other is being
     // written on the blocking pool. Network and disk overlap instead of
     // serialize ("read 256 KiB, wait for the disk, repeat").
     let mut bufs: [Vec<u8>; 2] = [
-        Vec::with_capacity(SEGMENT_BUF + 1024),
-        Vec::with_capacity(SEGMENT_BUF + 1024),
+        Vec::with_capacity(BATCH_MIN + 1024),
+        Vec::with_capacity(BATCH_MIN + 1024),
     ];
+    // Flush ceiling per cell: the full batch only when the cell is big
+    // enough to feed it; a small cell flushes proportionally, so progress
+    // counters (and pause granularity) stay honest at any file size. For
+    // UNBOUNDED cells the batch cap is the ceiling.
+    let cell_len = if seg.end == UNBOUNDED {
+        u64::MAX
+    } else {
+        seg.end + 1 - seg.start
+    };
+    let cell_cap = ((cell_len / 4).clamp(64 * 1024, BATCH_CAP as u64)) as usize;
+    // Self-tuned write batch (see BATCH_MIN): the target starts small -
+    // the first durability checkpoint arrives fast and the rate estimate
+    // gets something to measure - then tracks the link's throughput
+    // once it shows up.
+    let started = tokio::time::Instant::now();
+    let mut flush_at = BATCH_MIN.min(cell_cap);
     let mut cur = 0;
     let mut inflight: Option<tokio::task::JoinHandle<(std::fs::File, Vec<u8>, usize)>> = None;
     // Byte accounting for this attempt: parking a block adds to `counted`,
@@ -753,14 +939,35 @@ async fn segment_attempt(
 
         // Pace consumption: all segments draw from one shared budget.
         limiter.acquire(chunk.len() as u64).await;
+        // Attribute the bytes to the link this connection dialed through;
+        // the sampler folds deltas into per-link rate EMAs.
+        if let Some((bond, link)) = &bond_ctx {
+            bond.record(link, chunk.len() as u64);
+        }
 
-        // Flush before an extension that would exceed the preallocated
-        // capacity: a realloc here would memcpy the whole ~256 KiB block.
+        // Retune the batch target from this attempt's own throughput:
+        // one disk write event per ~250 ms of network data. Bounded so
+        // slow links still batch meaningfully (floor) and the un-durable
+        // window plus memory stay sane (cap); the cell cap keeps small
+        // cells flushing proportionally.
+        let rate = {
+            let dt = started.elapsed().as_secs_f64().max(0.05);
+            (counted + bufs[cur].len() as u64) as f64 / dt
+        };
+        flush_at = ((rate * 0.25) as usize).clamp(BATCH_MIN, BATCH_CAP).min(cell_cap);
+        // Grow the buffer capacity to hold the evolving batch: an
+        // amortized realloc, and the flush-check below still catches
+        // per-chunk overflow.
+        if bufs[cur].capacity() < flush_at {
+            bufs[cur].reserve(flush_at);
+        }
+        // Flush before an extension that would exceed the capacity:
+        // a realloc here would memcpy the whole block.
         if bufs[cur].capacity() - bufs[cur].len() < chunk.len() {
             flush!();
         }
         bufs[cur].extend_from_slice(&chunk);
-        if bufs[cur].len() >= SEGMENT_BUF {
+        if bufs[cur].len() >= flush_at {
             flush!();
         }
     }

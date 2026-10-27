@@ -577,6 +577,123 @@ async fn bonded_single_extra_address_still_binds() {
     );
 }
 
+/// A bond link whose dials fail twice in a row is skipped on the spot: the
+/// retry loop's next pick leaves it behind, and when it is the only link the
+/// dial falls back to the unattributed OS route. Bytes stay exact either way.
+#[tokio::test]
+async fn quarantined_bond_link_falls_back_unbound() {
+    let state = Arc::new(ServerState {
+        total: 256 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![std::net::IpAddr::from([127, 0, 0, 2])]),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("engine");
+    let bond = engine.bond().expect("engine-owned bond").clone();
+    let links = bond.links();
+    assert_eq!(links.len(), 1);
+    bond.note_fail(&links[0]);
+    bond.note_fail(&links[0]);
+    assert_eq!(bond.status()[0].weight, 0, "two fails quarantine the link");
+
+    let tmp = temp_dir("bonded-dead");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download must survive a dead bond link via the OS route");
+    verify(&dest, 256 * KIB);
+    let peers = state.peers_seen.lock().unwrap().clone();
+    assert!(
+        !peers.is_empty() && peers.iter().all(|p| p == "127.0.0.1"),
+        "fell back unattributed (source = server loopback), saw {peers:?}"
+    );
+}
+
+/// A daemon-provided bond authority flows through `bond_state`: the engine
+/// uses exactly that instance (no private link-set discovery) and its dial
+/// metering lands there, so the daemon's sampler sees the traffic.
+#[tokio::test]
+async fn shared_bond_state_flows_into_the_engine() {
+    let state = Arc::new(ServerState {
+        total: 256 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let shared = Arc::new(ripdl_core::bond::Bond::new());
+    shared.set_links(&[ripdl_core::bond::LinkInfo {
+        ip: std::net::IpAddr::from([127, 0, 0, 2]),
+        name: "test link".into(),
+        default_route: false,
+    }]);
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![std::net::IpAddr::from([127, 0, 0, 1])]),
+        // The Addresses list above is deliberately *not* the live link set:
+        // the provided authority overrides it entirely.
+        bond_state: Some(Arc::clone(&shared)),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("engine");
+    assert!(
+        std::sync::Arc::ptr_eq(engine.bond().unwrap(), &shared),
+        "engine must adopt the externally provided bond"
+    );
+
+    let tmp = temp_dir("bonded-shared");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("download ok");
+    verify(&dest, 256 * KIB);
+    let peers = state.peers_seen.lock().unwrap().clone();
+    assert!(
+        !peers.is_empty() && peers.iter().all(|p| p == "127.0.0.2"),
+        "dials must follow the shared bond's link set, saw {peers:?}"
+    );
+    let status = shared.status();
+    assert_eq!(status[0].in_use, 0, "no connection left dangling");
+    assert!(
+        status[0].weight >= 1,
+        "metered traffic kept the link pickable"
+    );
+}
+
 /// One segment connection is killed 16 KiB in. The engine must recover via
 /// its internal retry (ShortSegment / transport error path) and still serve
 /// every byte exactly.
@@ -704,15 +821,20 @@ async fn bare_head_still_discovers_ranges() {
     );
 }
 
-/// Pause at ~256 KiB of durable progress (deterministic thanks to pacing),
-/// then a fresh engine call resumes the same file from the sidecar and
-/// finishes it. The server must observe ranged GETs that start mid-file.
+/// Pause once every segment has parked its first 256 KiB block
+/// (deterministic thanks to pacing + the ramp-in stagger), then a fresh
+/// engine call resumes the same file from the sidecar and finishes it.
+/// The server must observe ranged GETs that start mid-file.
 #[tokio::test]
 async fn pause_resumes_from_sidecar() {
-    // 4 MiB / 8 segments = 512 KiB each. At 40 ms per 16 KiB block a
-    // connection flushes its first 256 KiB block at ~640 ms and finishes at
-    // ~1280 ms; the reporter's second tick (~1000 ms) sits safely between
-    // those, so the guard below always sees ~2 MiB of durable progress.
+    // 4 MiB / 8 segments = 512 KiB each. Ramp-in spaces the first dials
+    // 400 ms apart, and at 220 ms per 16 KiB block each connection parks
+    // its first 128 KiB at 400ms*rank + 1.76 s (segment 7 lands ~4.56 s in)
+    // while the first completion only arrives at ~5.3 s. The cancel fires
+    // at 12 x 128 KiB: the sum can only cross that once every segment has
+    // parked at least one block (earlier segments double-park, so 8 is not
+    // enough of a threshold), and a reporter tick lands before the first
+    // completion - every segment is mid-cell at the pause.
     let state = Arc::new(ServerState {
         total: 4 * MIB,
         ranges: true,
@@ -720,7 +842,7 @@ async fn pause_resumes_from_sidecar() {
         drop_times: 0,
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
-        block_pace: Some(Duration::from_millis(40)),
+        block_pace: Some(Duration::from_millis(220)),
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
@@ -735,7 +857,6 @@ async fn pause_resumes_from_sidecar() {
 
     let engine = test_engine();
     let tmp = temp_dir("resume");
-
     let token = CancellationToken::new();
     let killer = token.clone();
     let res = engine
@@ -744,7 +865,7 @@ async fn pause_resumes_from_sidecar() {
             Some(tmp.clone()),
             token.clone(),
             move |p| {
-                if p.downloaded >= 300_000 {
+                if p.downloaded >= 12 * 131_072 {
                     killer.cancel();
                 }
             },
@@ -908,7 +1029,9 @@ async fn speed_limit_applies_to_single_stream() {
 /// byte-exact.
 #[tokio::test]
 async fn refreshed_address_resumes_from_sidecar() {
-    // Same pacing/size as the resume test: 4 MiB / 8 segments of 512 KiB.
+    // Same pacing/size as the resume test: 4 MiB / 8 segments of 512 KiB,
+    // slow blocks (220 ms) so no cell completes before the cancel tick, and
+    // the cancel waits until all 8 ramp-staggered segments have parked.
     let state = Arc::new(ServerState {
         total: 4 * MIB,
         ranges: true,
@@ -916,7 +1039,7 @@ async fn refreshed_address_resumes_from_sidecar() {
         drop_times: 0,
         dropped: AtomicUsize::new(0),
         etag_version: AtomicUsize::new(100),
-        block_pace: Some(Duration::from_millis(40)),
+        block_pace: Some(Duration::from_millis(220)),
         content_disposition: None,
         headers_seen: Mutex::new(Vec::new()),
         ranges_seen: Mutex::new(Vec::new()),
@@ -938,7 +1061,7 @@ async fn refreshed_address_resumes_from_sidecar() {
     let killer = token.clone();
     let res = engine
         .download(&old, Some(tmp.clone()), token, move |p| {
-            if p.downloaded >= 300_000 {
+            if p.downloaded >= 12 * 131_072 {
                 killer.cancel();
             }
         })

@@ -5,6 +5,7 @@
 //! once here and every frontend gets them.
 
 pub mod bridge;
+pub mod bond;
 pub mod bundle;
 pub mod categories;
 pub mod engine;
