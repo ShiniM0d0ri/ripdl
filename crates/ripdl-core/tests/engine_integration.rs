@@ -1023,6 +1023,80 @@ async fn speed_limit_applies_to_single_stream() {
     );
 }
 
+/// A legacy sidecar (pre-behavioral-probe daemons stored the UNBOUNDED
+/// single-stream layout) is re-ranged on resume when the fresh probe proves
+/// ranged support: the durable contiguous prefix carries into the first
+/// cell, the rest re-plan over cells - visible to the server as the first
+/// resumed GET starting mid-cell (the carried offset), not at 0.
+#[tokio::test]
+async fn legacy_unbounded_sidecar_reranges_on_resume() {
+    let state = Arc::new(ServerState {
+        total: 512 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let tmp = temp_dir("legacy-rerange");
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let sidecar = tmp.join("file.bin.ripdl.json");
+    let legacy = ripdl_core::task::TaskStateFile {
+        id: "legacy".into(),
+        url: url.clone(),
+        etag: Some(etag_of(&state)),
+        total: None, // UNBOUNDED probes never learned the size
+        state: ripdl_core::TaskState::Paused,
+        segments: vec![ripdl_core::task::SegmentState {
+            index: 0,
+            start: 0,
+            end: u64::MAX,
+            done: 64 * KIB,
+        }],
+    };
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&legacy).expect("sidecar json"),
+    )
+    .expect("sidecar written");
+    // The sidecar says 64 KiB are durable: the file must carry them (that
+    // is what a real paused single-stream download left behind).
+    let partial: Vec<u8> = (0..64 * KIB).map(|o| pattern_byte(o)).collect();
+    std::fs::write(tmp.join("file.bin"), &partial).expect("partial file written");
+
+    let engine = test_engine();
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("resumed from the legacy sidecar");
+    verify(&dest, 512 * KIB);
+
+    let seen = state.ranges_seen.lock().unwrap().clone();
+    // (`0-0` is the planner's behavioral probe; every other entry is a cell.)
+    assert!(
+        seen.iter().any(|r| r.starts_with("65536-")),
+        "the carried prefix must resume mid-cell, saw {seen:?}"
+    );
+    let cells = seen.iter().filter(|r| r.as_str() != "0-0").count();
+    assert!(
+        cells > 1,
+        "the resumed layout must be multi-cell, saw {seen:?}"
+    );
+}
+
+
 /// Refresh download address (IDM's "refresh download address"): a paused
 /// task retargeted at a fresh URL - the expired-signed-link case - must
 /// continue from the durable offsets instead of restarting, and finish

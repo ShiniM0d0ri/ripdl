@@ -213,6 +213,7 @@ async fn add_bundle(
             total: None,
             seq: None,
             error: None,
+            attempted: false,
         })
         .collect();
     if parts.is_empty() {
@@ -250,6 +251,7 @@ async fn add_bundle_parts(id: String, urls: Vec<String>) -> Result<usize, String
             total: None,
             seq: None,
             error: None,
+            attempted: false,
         })
         .collect();
     if parts.is_empty() {
@@ -279,6 +281,7 @@ async fn preview_bundle(urls: Vec<String>) -> Result<Vec<ripdl_core::bundle::Gro
             total: None,
             seq: None,
             error: None,
+            attempted: false,
         })
         .collect();
     match rpc(Command::PreviewBundle { links }).await? {

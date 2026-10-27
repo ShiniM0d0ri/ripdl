@@ -535,6 +535,13 @@ pub enum Reply {
         /// explained rather than silently ignored.
         #[serde(default)]
         torrent_unreachable: Vec<String>,
+        /// The HTTP engine's live bond: per uplink, its measured rate EMA,
+        /// current weight, in-use connection count and dial-fail streak. The
+        /// daemon feeds it (`set_links` + `sample`) every 5 s and every HTTP
+        /// task picks dials from it, so this is the same truth the segments
+        /// act on. Empty when bonding is off or no older daemon feeds it.
+        #[serde(default)]
+        bond_links: Vec<BondLink>,
         /// Capability flag: this daemon understands `AddBundle`/`PreviewBundle`
         /// (multi-part tasks). Frontends check it instead of probing with an
         /// unknown command - an older daemon simply omits the field, which
@@ -577,6 +584,24 @@ pub enum Reply {
 pub struct ExtensionStatus {
     pub version: String,
     pub last_seen: i64,
+}
+
+/// One live HTTP-bond uplink as the daemon publishes it (a deserializable
+/// mirror of `bond::LinkStatus`, whose `IpAddr` RPC convention here is a
+/// string like every other address field).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BondLink {
+    pub name: String,
+    pub ip: String,
+    pub default_route: bool,
+    /// Smoothed measured rate, bytes/s (idle links keep the last EMA).
+    pub rate_bps: u64,
+    /// Relative preference of new dials (0 = quarantined).
+    pub weight: u32,
+    /// Connections currently using this link.
+    pub in_use: u32,
+    /// Consecutive dial failures (0 = healthy).
+    pub fails: u32,
 }
 
 /// Receiver status shown by every frontend.
@@ -719,6 +744,13 @@ pub struct BundlePart {
     pub seq: Option<u32>,
     #[serde(default)]
     pub error: Option<String>,
+    /// A runner has taken this part to its engine at least once. Lets the
+    /// `run_bundle` upfront probe wave target exactly the never-run parts:
+    /// a reset-to-queued Failed part gets probed by its own runner on resume
+    /// (a second probe would double-count on request-counting hosts) while
+    /// fresh parts get their sizes before any slot frees up.
+    #[serde(default)]
+    pub attempted: bool,
 }
 
 /// One task's engine view behind the details dialog: where it writes, the
@@ -765,22 +797,35 @@ mod tests {
             r#"{"id":7,"cmd":{"type":"propose","proposal":"dl-1","url":"https://files.example/a.zip","headers":{"Referer":"https://files.example/"},"expected_bytes":42}}"#,
         )
         .expect("propose parses");
-        assert!(matches!(propose.cmd, Command::Propose { expected_bytes: Some(42), .. }));
+        assert!(matches!(
+            propose.cmd,
+            Command::Propose {
+                expected_bytes: Some(42),
+                ..
+            }
+        ));
 
         // The extension sends null when the browser did not know the size.
         let no_size: Request = serde_json::from_str(
             r#"{"id":8,"cmd":{"type":"propose","proposal":"dl-2","url":"https://files.example/b.zip","expected_bytes":null}}"#,
         )
         .expect("null-size propose parses");
-        assert!(matches!(no_size.cmd, Command::Propose { expected_bytes: None, .. }));
+        assert!(matches!(
+            no_size.cmd,
+            Command::Propose {
+                expected_bytes: None,
+                ..
+            }
+        ));
 
         let abandon: Request =
             serde_json::from_str(r#"{"id":9,"cmd":{"type":"abandon","proposal":"dl-1"}}"#)
                 .expect("abandon parses");
         assert!(matches!(abandon.cmd, Command::Abandon { ref proposal } if proposal == "dl-1"));
 
-        let reply: Reply = serde_json::from_str(r#"{"type":"proposed","outcome":"duplicate","id":"t1"}"#)
-            .expect("proposed parses");
+        let reply: Reply =
+            serde_json::from_str(r#"{"type":"proposed","outcome":"duplicate","id":"t1"}"#)
+                .expect("proposed parses");
         assert!(matches!(
             reply,
             Reply::Proposed { outcome: ProposalOutcome::Duplicate, id: Some(ref id), reason: None, task: None } if id == "t1"
@@ -795,7 +840,10 @@ mod tests {
         .expect("add parses");
         assert!(matches!(
             plain.cmd,
-            Command::Add { on_duplicate: DuplicatePolicy::Share, .. }
+            Command::Add {
+                on_duplicate: DuplicatePolicy::Share,
+                ..
+            }
         ));
 
         for (word, want) in [
@@ -827,6 +875,7 @@ mod tests {
                 torrent_bind,
                 torrent_rates,
                 torrent_unreachable,
+                bond_links,
                 bundles,
                 version,
                 extension,
@@ -839,6 +888,8 @@ mod tests {
                 assert!(torrent_bind.is_empty());
                 assert!(torrent_rates.is_empty());
                 assert!(torrent_unreachable.is_empty());
+                // A pre-bond daemon omits the field entirely and reads empty.
+                assert!(bond_links.is_empty());
                 // A pre-bundle daemon answers the same way, so the extension
                 // reads this as "no bundle support" instead of probing.
                 assert!(!bundles);
@@ -855,6 +906,15 @@ mod tests {
             torrent_bind: vec!["10.0.0.2".to_string()],
             torrent_rates: vec![("10.0.0.2".to_string(), 7.0e6)],
             torrent_unreachable: vec!["Ethernet 2 (10.99.0.5)".to_string()],
+            bond_links: vec![BondLink {
+                name: "Ethernet 2".to_string(),
+                ip: "10.99.0.5".to_string(),
+                default_route: true,
+                rate_bps: 7_340_032,
+                weight: 10,
+                in_use: 4,
+                fails: 0,
+            }],
             bundles: true,
             version: "0.4.1".to_string(),
             extension: ExtensionStatus {
@@ -869,6 +929,7 @@ mod tests {
                 torrent_bind,
                 torrent_rates,
                 torrent_unreachable,
+                bond_links,
                 ..
             } => {
                 assert!(torrent_session);
@@ -877,6 +938,18 @@ mod tests {
                 assert_eq!(
                     torrent_unreachable,
                     vec!["Ethernet 2 (10.99.0.5)".to_string()]
+                );
+                assert_eq!(
+                    bond_links,
+                    vec![BondLink {
+                        name: "Ethernet 2".to_string(),
+                        ip: "10.99.0.5".to_string(),
+                        default_route: true,
+                        rate_bps: 7_340_032,
+                        weight: 10,
+                        in_use: 4,
+                        fails: 0,
+                    }]
                 );
             }
             other => panic!("unexpected reply: {other:?}"),

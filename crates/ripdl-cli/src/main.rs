@@ -426,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
                     total: None,
                     seq: None,
                     error: None,
+                    attempted: false,
                 })
                 .collect();
             if preview {
@@ -497,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
                     total: None,
                     seq: None,
                     error: None,
+                    attempted: false,
                 })
                 .collect();
             let reply = rpc_reply(Command::AddBundleParts { id: id.clone(), parts }).await?;

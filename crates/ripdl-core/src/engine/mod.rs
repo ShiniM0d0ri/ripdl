@@ -265,7 +265,7 @@ impl Engine {
                     && prev.etag == info.etag
                     && prev.state != TaskState::Completed =>
             {
-                (prev.segments, true)
+                (upgrade_legacy_layout(&prev, &info, &self.cfg), true)
             }
             _ => (plan_fresh(&info, &self.cfg), false),
         };
@@ -1017,6 +1017,44 @@ fn plan_fresh(info: &PlanInfo, cfg: &EngineConfig) -> Vec<SegmentState> {
             done: 0,
         }],
     }
+}
+
+/// One-cell UNBOUNDED layout, as the pre-behavioral-probe daemons stored
+/// whenever a bare HEAD hid `accept-ranges`.
+fn legacy_unbounded(prev: &TaskStateFile) -> bool {
+    prev.segments.len() == 1 && prev.segments[0].end == UNBOUNDED
+}
+
+/// Resume a legacy sidecar against what the fresh probe now proves. If the
+/// old layout is UNBOUNDED single-stream but the server clearly serves
+/// ranges, upgrade to a fresh ranged plan and carry the durable prefix into
+/// its first cell: those bytes were written contiguously from offset 0, so
+/// the first cell resumes mid-stream and the rest re-download their (already
+/// written, identical) spans in parallel. Replaying the old layout would
+/// re-download the whole tail on one connection forever.
+fn upgrade_legacy_layout(prev: &TaskStateFile, info: &PlanInfo, cfg: &EngineConfig) -> Vec<SegmentState> {
+    if !legacy_unbounded(prev) {
+        return prev.segments.clone();
+    }
+    let ranged_now =
+        matches!((info.accept_ranges, info.total), (true, Some(total)) if total >= cfg.min_segment_size);
+    if !ranged_now {
+        return prev.segments.clone();
+    }
+    let mut fresh = plan_fresh(info, cfg);
+    let carried = prev
+        .segments
+        .first()
+        .map(|s| s.done)
+        .unwrap_or(0)
+        .min(fresh[0].end + 1 - fresh[0].start);
+    fresh[0].done = carried;
+    tracing::info!(
+        carried,
+        cells = fresh.len(),
+        "legacy UNBOUNDED sidecar re-ranged into cells"
+    );
+    fresh
 }
 
 /// Resume sidecar path for a partial download (`<file>.ripdl.json`).

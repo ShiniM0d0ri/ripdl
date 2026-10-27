@@ -1,4 +1,4 @@
-﻿use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -103,7 +103,7 @@ struct TaskRuntime {
 }
 
 /// One active seeding watcher. The generation makes stale watchers harmless:
-/// stopâ†’start can overlap, and only the newest watcher may publish state.
+/// stop→start can overlap, and only the newest watcher may publish state.
 struct SeedWatch {
     token: CancellationToken,
     gen: u64,
@@ -141,7 +141,7 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 /// flap between 0 and peak on every 2 s tick.
 const TORRENT_RATE_WINDOW: Duration = Duration::from_secs(4);
 /// Above this a byte jump in one tick cannot be network traffic (200 MiB/s
-/// per tick â‰ˆ 1.6 Gbps), it is librqbit adopting data already on disk.
+/// per tick ≈ 1.6 Gbps), it is librqbit adopting data already on disk.
 const MAX_PLAUSIBLE_BPS: f64 = 200.0 * 1024.0 * 1024.0;
 /// A stalled task (tool rate ~0) that suddenly gains this much in one tick is
 /// a resume adoption, not a burst.
@@ -254,6 +254,15 @@ struct Daemon {
     bind_weights: std::sync::Mutex<Vec<(std::net::IpAddr, u32)>>,
     /// When the weights were last reset so a quarantined link can retry.
     bind_explore: std::sync::Mutex<Instant>,
+    /// The HTTP engine's bond authority, created once at boot and shared with
+    /// every task engine through `EngineConfig.bond_state`; this watcher feeds
+    /// it (`feed_http_bond`), so NIC events and weight shifts apply to all
+    /// downloads live, the same way the torrent session's bind set follows the
+    /// machine here.
+    bond: std::sync::Arc<ripdl_core::bond::Bond>,
+    /// Latest `sample()` snapshot for `Reply::Config.bond_links` (plain RPC
+    /// mirror; the authority itself is not serializable-lockable cheaply).
+    bond_links: std::sync::Mutex<Vec<ripdl_core::rpc::BondLink>>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
     /// Set during an install fetch (concurrent ones would share a .part).
@@ -351,6 +360,8 @@ impl Daemon {
     bind_weights: std::sync::Mutex::new(Vec::new()),
     bind_explore: std::sync::Mutex::new(Instant::now()),
             shutdown: tokio::sync::Notify::new(),
+            bond: std::sync::Arc::new(ripdl_core::bond::Bond::new()),
+            bond_links: std::sync::Mutex::new(Vec::new()),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
             lan: tokio::sync::Mutex::new(None),
@@ -617,7 +628,7 @@ impl Daemon {
         };
         let (token, generation) = {
             let mut seeders = self.seeders.lock().unwrap();
-            // Replace a winding-down watcher: stopâ†’start can overlap, and the
+            // Replace a winding-down watcher: stop→start can overlap, and the
             // stale one must never clear the new one's state (generation).
             if let Some(old) = seeders.remove(id) {
                 old.token.cancel();
@@ -773,7 +784,7 @@ impl Daemon {
                 }
             }
 
-            // Only the newest watcher may publish the exit state: stopâ†’start
+            // Only the newest watcher may publish the exit state: stop→start
             // can overlap, and a stale watcher must not clear the new one.
             let current = this
                 .seeders
@@ -1356,6 +1367,7 @@ impl Daemon {
                 .iter()
                 .map(|n| format!("{} ({})", n.name, n.addr))
                 .collect(),
+            bond_links: self.bond_links.lock().unwrap().clone(),
             bundles: true,
             version: env!("CARGO_PKG_VERSION").to_string(),
             extension: self.extension_status.lock().unwrap().clone(),
@@ -1633,6 +1645,10 @@ impl Daemon {
             } else {
                 ripdl_core::Bond::Off
             },
+            // The one bond authority the watcher feeds; every HTTP task dials
+            // from this same link set, so measured weights and skips are
+            // shared across tasks instead of re-discovered per engine.
+            bond_state: Some(self.bond.clone()),
             ..EngineConfig::default()
         }
     }
@@ -1793,12 +1809,55 @@ impl Daemon {
             self.refresh_uplinks().await;
             self.sync_torrent_binding().await;
             self.apply_bind_weights().await;
+            self.feed_http_bond().await;
             if ticks % 3 == 0 {
                 self.reconcile_torrent_records().await;
             }
             ticks += 1;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
+    }
+
+    /// Feed the HTTP engine's bond authority: the link set follows the proved
+    /// uplinks (same truth the torrent binding uses) and the sampler folds
+    /// each link's metered bytes into its rate EMA + weights every tick. The
+    /// task engines dial from this instance, so a link that just left (or got
+    /// fast) is acted on at the next engine pick - no restart, no re-probe.
+    ///
+    /// Bonding off: keep the link set empty, so a pick never lands on a
+    /// stale link after the toggle; engine `bond` config is Off anyway.
+    async fn feed_http_bond(&self) {
+        let dt = Duration::from_secs(5).as_secs_f64();
+        if !self.conf().bond_interfaces() {
+            self.bond.set_links(&[]);
+            *self.bond_links.lock().unwrap() = Vec::new();
+            return;
+        }
+        let links: Vec<ripdl_core::bond::LinkInfo> = self
+            .uplinks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| ripdl_core::bond::LinkInfo {
+                ip: std::net::IpAddr::V4(n.addr),
+                name: n.name.clone(),
+                default_route: n.is_default_route,
+            })
+            .collect();
+        self.bond.set_links(&links);
+        let status = self.bond.sample(dt);
+        *self.bond_links.lock().unwrap() = status
+            .iter()
+            .map(|s| ripdl_core::rpc::BondLink {
+                name: s.name.clone(),
+                ip: s.ip.to_string(),
+                default_route: s.default_route,
+                rate_bps: s.rate_bps,
+                weight: s.weight,
+                in_use: s.in_use,
+                fails: s.fails,
+            })
+            .collect();
     }
 
     /// Weight new peer connections by what each bonded uplink actually
@@ -2273,6 +2332,7 @@ impl Daemon {
                 total: None,
                 seq: p.seq,
                 error: None,
+                attempted: false,
             })
             .collect();
 
@@ -2442,6 +2502,7 @@ impl Daemon {
                         total: None,
                         seq: p.seq,
                         error: None,
+                        attempted: false,
                     });
                 }
                 r.parts.sort_by_key(|p| p.seq.unwrap_or(u32::MAX));
@@ -3173,6 +3234,15 @@ impl Daemon {
         std::fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
         self.set_state(&rec.id, TaskState::Running, None);
 
+        // G2: the row's bar is summed part bytes / summed part totals, and
+        // the all-known rule (deliberate: a half-known sum paints a
+        // percentage that drops as the rest are probed) needs every size
+        // first. Parts used to learn theirs only when their own runner
+        // started, so with a few download slots the bar stayed empty until
+        // completions made slots - and probes - trickle through. One probe
+        // wave upfront paints the bar from the first real tick.
+        self.probe_part_totals(&rec.id).await;
+
         let mut workers = tokio::task::JoinSet::new();
         for index in 0..rec.parts.len() {
             let this = Arc::clone(self);
@@ -3205,6 +3275,93 @@ impl Daemon {
 
     /// One part of a bundle: take a normal download slot, run the engine with
     /// this part's own name and headers, publish its state.
+    /// Probe the sizes of this bundle's not-yet-known parts, all at once.
+    /// The probe is the same `engine.plan` a part's own runner does; it can
+    /// only move `total` fields, never bytes. A failed probe leaves the part
+    /// unknown - its runner probes again anyway, the aggregate just keeps
+    /// the all-known rule a little longer.
+    async fn probe_part_totals(self: &Arc<Self>, id: &str) {
+        let parts: Vec<(usize, String, std::collections::HashMap<String, String>)> = {
+            let records = self.records.lock().unwrap();
+            let Some(rec) = records.iter().find(|r| r.id == id) else {
+                return;
+            };
+            rec.parts
+                .iter()
+                .enumerate()
+                // Only parts no runner has ever taken: a Failed/Paused part
+                // that re-runs gets probed by its own runner on resume (its
+                // probed flag stays set), so the wave would double-count on
+                // a request-counting host.
+                .filter(|(_, p)| p.total.is_none() && !p.attempted)
+                .map(|(i, p)| (i, p.url.clone(), p.headers.clone()))
+                .collect()
+        };
+        // Computation only: the plan cannot change what the server answers.
+        let mut probes = tokio::task::JoinSet::new();
+        for (index, url, headers) in parts {
+            let this = Arc::clone(self);
+            probes.spawn(async move {
+                let info = match Engine::new(this.engine_config(&headers, false)) {
+                    Ok(engine) => match engine.plan(&url).await {
+                        Ok(info) => info.total,
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
+                (index, info)
+            });
+        }
+        while let Some(joined) = probes.join_next().await {
+            if let Ok((index, Some(total))) = joined {
+                self.set_part_total(id, index, total);
+            }
+        }
+    }
+
+    /// Record one part's probed size and re-publish the bundle aggregate
+    /// (the row's "x / total" bytes and bar are sums, so they unblock as
+    /// soon as the last unknown total lands).
+    fn set_part_total(&self, id: &str, index: usize, total: u64) {
+        let (downloaded, known_total) = {
+            let mut records = self.records.lock().unwrap();
+            let Some(rec) = records.iter_mut().find(|r| r.id == id) else {
+                return;
+            };
+            let Some(part) = rec.parts.get_mut(index) else {
+                return;
+            };
+            if part.total.is_some() {
+                return;
+            }
+            part.total = Some(total);
+            let (downloaded, total) = Self::bundle_totals(&rec.parts);
+            rec.downloaded = downloaded;
+            rec.total = total;
+            (rec.downloaded, rec.total)
+        };
+        // Mirror into the live sample so the row shows the total from its
+        // next repaint, not only after the first part's progress tick. The
+        // byte count is left alone: it moves with the running parts.
+        let mut progress = self.progress.lock().unwrap();
+        progress.entry(id.to_string()).or_insert_with(|| ProgressTrack {
+            last: Progress {
+                id: id.to_string(),
+                downloaded,
+                total: known_total,
+                ..Progress::default()
+            },
+            speed: None,
+            window: std::collections::VecDeque::new(),
+            at: Instant::now(),
+        });
+        if let Some(entry) = progress.get_mut(id) {
+            if known_total.is_some() {
+                entry.last.total = known_total;
+            }
+        }
+    }
+
     async fn run_bundle_part(
         self: &Arc<Self>,
         id: &str,
@@ -3360,6 +3517,11 @@ impl Daemon {
             };
             part.state = state;
             part.error = error;
+            // A runner taking the part counts as "its engine has probed this
+            // URL at least once" - the upfront probe wave must not repeat it.
+            if state == TaskState::Running {
+                part.attempted = true;
+            }
             if let Some(bytes) = bytes {
                 part.downloaded = bytes;
                 part.total = Some(bytes);
@@ -4756,6 +4918,7 @@ mod tests {
                 total: None,
                 seq: None,
                 error: None,
+                attempted: false,
             })
             .collect()
     }
@@ -4906,6 +5069,7 @@ mod tests {
             total: None,
             seq: None,
             error: None,
+            attempted: false,
         };
         let parts = vec![
             part(format!("{}/f1", fx.base), "x.part01.rar"),
@@ -4939,9 +5103,12 @@ mod tests {
         assert!(rec.parts.iter().all(|p| p.state == TaskState::Completed));
         assert!(root.join("x.part02.rar").exists());
         // Resume only fetched what was missing: no part was downloaded twice.
+        // For /flaky the count is 3, not 2: the *add-time* wave probes every
+        // never-run part, and on a 404 host the planner falls back from HEAD
+        // to a `bytes=0-0` GET (counted). The resume itself fetched it once.
         assert_eq!(fx.gets.lock().unwrap().get("/f1").copied(), Some(1));
         assert_eq!(fx.gets.lock().unwrap().get("/f3").copied(), Some(1));
-        assert_eq!(fx.gets.lock().unwrap().get("/flaky").copied(), Some(2));
+        assert_eq!(fx.gets.lock().unwrap().get("/flaky").copied(), Some(3));
         assert_eq!(rec.downloaded, 3 * 64 * 1024);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -4969,6 +5136,7 @@ mod tests {
             total: None,
             seq: None,
             error: None,
+            attempted: false,
         };
         let parts = vec![
             part(format!("{}/f1", fx.base), "x.part01.rar"),
@@ -5045,6 +5213,7 @@ mod tests {
             total: None,
             seq: None,
             error: None,
+            attempted: false,
         };
         let parts = vec![
             part(format!("{}/f1", fx.base), "x.part01.rar"),
