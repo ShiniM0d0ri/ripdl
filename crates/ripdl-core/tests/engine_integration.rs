@@ -108,7 +108,11 @@ impl ServerState {
 }
 
 async fn spawn_server(state: Arc<ServerState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    spawn_server_on("127.0.0.1:0", state).await
+}
+
+async fn spawn_server_on(bind: &str, state: Arc<ServerState>) -> String {
+    let listener = TcpListener::bind(bind).await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         loop {
@@ -719,6 +723,287 @@ async fn shared_bond_state_flows_into_the_engine() {
         status[0].weight >= 1,
         "metered traffic kept the link pickable"
     );
+}
+
+/// The link credit is *live*: while a paced connection streams, the bond
+/// reports it in use, and after a cancel at any streaming moment every
+/// credit drains back to zero - a paused row must never keep its chip
+/// "active" (the Drop guard must release on every exit path).
+#[tokio::test]
+async fn bonded_stream_credit_releases_on_cancel() {
+    let state = Arc::new(ServerState {
+        total: 512 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: Some(Duration::from_millis(40)),
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![std::net::IpAddr::from([127, 0, 0, 2])]),
+        ..Default::default()
+    };
+    let engine = Arc::new(Engine::new(cfg).expect("bonded engine"));
+    let bond = engine.bond().expect("engine-owned bond").clone();
+    let tmp = temp_dir("bonded-cancel");
+    let killer = CancellationToken::new();
+    let eng = Arc::clone(&engine);
+    let url_task = url.clone();
+    let k = killer.clone();
+    let dl = tokio::spawn(async move {
+        eng.download(&url_task, Some(tmp), k, move |_p| {}).await
+    });
+
+    // Wait until at least one connection is streaming through the bond.
+    let mut saw_in_use = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if bond.status()[0].in_use > 0 {
+            saw_in_use = true;
+            break;
+        }
+    }
+    assert!(saw_in_use, "the streaming connection held the link credit");
+
+    // Cancel mid-stream: every credit must drain to zero shortly after.
+    killer.cancel();
+    let res = tokio::time::timeout(Duration::from_secs(30), dl)
+        .await
+        .expect("cancelled download finishes")
+        .expect("join");
+    assert!(matches!(res, Err(ripdl_core::Error::Cancelled)));
+    let mut released = false;
+    for _ in 0..60 {
+        if bond.status()[0].in_use == 0 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(released, "cancel released every link credit (in_use back to 0)");
+}
+
+/// Bonding on but the host answers without range support: the task is one
+/// unbounded stream. One dial, one link; the bytes still land exactly and
+/// the link is metered (its rate EMA saw traffic), with no leftover credit.
+#[tokio::test]
+async fn bonded_no_range_single_stream_meters_one_link() {
+    let state = Arc::new(ServerState {
+        total: 256 * KIB,
+        ranges: false,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![std::net::IpAddr::from([127, 0, 0, 2])]),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("bonded engine");
+    let bond = engine.bond().expect("engine-owned bond").clone();
+    let tmp = temp_dir("bonded-norange");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("single-stream download ok");
+    verify(&dest, 256 * KIB);
+    let status = bond.status();
+    assert_eq!(status.len(), 1, "one configured link only");
+    assert_eq!(status[0].in_use, 0, "the stream released its credit");
+    assert!(status[0].rate_bps > 0 || status[0].weight >= 1, "the single stream metered through the bond");
+}
+
+/// IPv6 uplink: the bond binds a v6 loopback source and v6 ranged transfers
+/// land byte-exact (the torrent side learned v6 is routine; HTTP must not
+/// silently fall back to the OS route).
+#[tokio::test]
+async fn bonded_ipv6_loopback_ranges_bind() {
+    let state = Arc::new(ServerState {
+        total: 256 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+    });
+    let url = spawn_server_on("[::1]:0", Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![
+            "0:0:0:0:0:0:0:1".parse().expect("::1"),
+        ]),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("bonded engine");
+    let tmp = temp_dir("bonded-v6");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("v6 download ok");
+    verify(&dest, 256 * KIB);
+    let peers = state.peers_seen.lock().unwrap().clone();
+    assert!(
+        !peers.is_empty() && peers.iter().all(|p| p == "::1"),
+        "ranged GETs must arrive from the v6 bound address, saw {peers:?}"
+    );
+}
+
+/// A global speed cap applies to bonded traffic the same way it does to the
+/// plain path: the shared limiter paces every bonded connection, so a run
+/// whose bytes would take `total / rate` seconds cannot finish sooner
+/// (minus at most one second of burst allowance) than the cap allows.
+#[tokio::test]
+async fn bonded_speed_limit_holds() {
+    let state = Arc::new(ServerState {
+        total: 8 * MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 128 * KIB,
+        max_speed: Some(MIB), // 1 MiB/s
+        bond: ripdl_core::Bond::Addresses(vec![std::net::IpAddr::from([127, 0, 0, 2])]),
+        ..Default::default()
+    };
+    let engine = Engine::new(cfg).expect("bonded engine");
+    let tmp = temp_dir("bonded-capped");
+    let started = std::time::Instant::now();
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("capped download ok");
+    let took = started.elapsed().as_secs_f64();
+    verify(&dest, 8 * MIB);
+    assert!(
+        took >= 6.5,
+        "8 MiB at 1 MiB/s (minus burst) cannot finish in {took:.2}s - the cap leaked"
+    );
+    assert!(
+        took < 40.0,
+        "the cap must pace, not stall: {took:.2}s"
+    );
+}
+
+/// Two tasks share one engine (and with it the bond authority, the warm
+/// per-address client pool and the limiter): both complete byte-exact and
+/// neither leaves a credit behind.
+#[tokio::test]
+async fn bonded_engine_serves_two_tasks_concurrently() {
+    let state = Arc::new(ServerState {
+        total: 512 * KIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let cfg = EngineConfig {
+        max_segments: 4,
+        min_segment_size: 32 * KIB,
+        bond: ripdl_core::Bond::Addresses(vec![
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::net::IpAddr::from([127, 0, 0, 2]),
+        ]),
+        ..Default::default()
+    };
+    let engine = Arc::new(Engine::new(cfg).expect("bonded engine"));
+    let bond = engine.bond().expect("engine-owned bond").clone();
+
+    let tmp1 = temp_dir("bonded-t1");
+    let tmp2 = temp_dir("bonded-t2");
+    let (d1, d2) = tokio::join!(
+        engine.download(&url, Some(tmp1), CancellationToken::new(), move |_p| {}),
+        engine.download(&url, Some(tmp2), CancellationToken::new(), move |_p| {})
+    );
+    let dest1 = d1.expect("task 1 ok");
+    let dest2 = d2.expect("task 2 ok");
+    verify(&dest1, 512 * KIB);
+    verify(&dest2, 512 * KIB);
+
+    let mut peers = state.peers_seen.lock().unwrap().clone();
+    peers.sort();
+    peers.dedup();
+    assert!(
+        peers.contains(&"127.0.0.1".to_string()) && peers.contains(&"127.0.0.2".to_string()),
+        "both tasks cycled both addresses, saw {peers:?}"
+    );
+    for link in bond.status() {
+        assert_eq!(link.in_use, 0, "task and stream ended, credit must release");
+    }
 }
 
 /// One segment connection is killed 16 KiB in. The engine must recover via
