@@ -6,14 +6,16 @@ production findings from the first real dual-NIC run on v0.4.7.
 
 ## G. New production findings -> concrete work items
 
-### G1. Lag spike whenever a NEW part starts (then normal)
+### G1. Lag spike whenever a NEW part starts (then normal) - STAGGER LANDED (pending live verification)
 Observed live 2026-10-27: each part start stalls the desktop for a few
 seconds. Suspects, to be proven by the 1 s spike watcher (armed):
 burst of 8 TLS connects at once, sparse-file grow + Defender WriteFile
 interception x8, runner semaphore stampede, GUI polling burst on state
 flip. Fix direction (choose by evidence):
 - stagger segment spawns (~150-300 ms apart) and warm the first byte range
-  before spawning the rest;
+  before spawning the rest; - LANDED as RAMP_STEP 400 ms in run_segment,
+  `ramp-in stagger` log line; verify against spike-watch.log on the next
+  live bundle run.
 - open/extend the dest file once before spawning (already single fd - verify);
 - GUI: batch task-list refreshes around start/stop events instead of a burst.
 
@@ -153,10 +155,21 @@ state churn. Rules, in priority order:
 
 ## F. Delivery slices
 
-- Slice 1: bond module + live pool + pick-per-attempt + G3
-  instrumented fallback accounting.
-- Slice 2: IP-change subscription + rebalancer + legacy re-range
-  + G1 stagger + G2 progress fix.
+- Slice 1 - LANDED 2026-10-27 (commit 1910e2b): `bond` module +
+  engine Dialer (per-attempt smooth-RR pick, warm per-address client
+  pools, dial note_ok/note_fail + per-chunk byte metering, shared
+  daemon authority via `EngineConfig.bond_state`) + G1 ramp-in
+  stagger (400 ms between first dials) + rate-adaptive write batches
+  (250 ms target, 256 KiB..4 MiB) + completed-cell skip at resume
+  (degenerate out-of-order Range when serial retries finished cells
+  before the pause). 16/16 engine integration + 120/120 lib tests.
+  G3 fallback accounting becomes skip-list behavior (2 dead dials;
+  note_ok restores instantly) - quiesced as instrumentation.
+- Slice 2: `watch_bonding` feeds the HTTP bond (set_links + 5 s
+  sample) beside the torrent path; `Reply::Config.bond_links`; CLI/
+  GUI parity; IP-change subscription + work-stealing
+  (cell-split + largest-cell steal, `chunks_for`) + legacy
+  UNBOUNDED sidecar re-range on resume + G2 progress fix.
 - Slice 3: status-bar NIC chips (GUI, screenshot-verified).
 - Slice 4: NIC settings cards + exclude list + docs/ROADMAP.
 
