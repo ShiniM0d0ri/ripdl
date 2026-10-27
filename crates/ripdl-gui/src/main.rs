@@ -884,6 +884,16 @@ async fn get_config() -> Result<DaemonSettings, String> {
     }
 }
 
+/// Live HTTP-bond uplinks for the status-bar chips. Empty while bonding is
+/// off (the chips stay hidden; the Settings sentence is the "off" story).
+#[tauri::command]
+async fn bond_links() -> Result<Vec<ripdl_core::rpc::BondLink>, String> {
+    match rpc(Command::GetConfig).await? {
+        Reply::Config { bond_links, .. } => Ok(bond_links),
+        other => Err(format!("unexpected daemon reply: {other:?}")),
+    }
+}
+
 /// One internet uplink bonding would spread connections across. Shown in
 /// Settings so a single-uplink machine can see the toggle is a no-op.
 #[derive(serde::Serialize)]
@@ -1110,6 +1120,7 @@ fn main() {
             open_path,
             download_root_path,
             get_config,
+            bond_links,
             set_config,
             bond_nics,
             bond_state,

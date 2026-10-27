@@ -1174,6 +1174,62 @@ async function guiPhase() {
     await shotOf(ws, "c3-gui-add-url.png");
     await evaluate(ws, `(() => { document.querySelector('#dlg-cancel').click(); return true; })()`);
     await sleep(400);
+
+    // C4: status-bar uplink chips ("name rate spark state"). Bonding is
+    // turned on for the private daemon late (not in isolateDaemon) so it
+    // never touches the earlier phases' loopback engine dialing or the
+    // torrent session setup. The HTTP bond publishes the machine's real
+    // uplinks on its 5 s tick; the chips sample every 2 s.
+    const bondOn = await runRipdl(["config", "bond_interfaces=true"], 10000);
+    check("C4 private daemon bonding turned on", bondOn.code === 0, bondOn.out.trim());
+    let chipsOk = false;
+    try {
+        await until(
+            "uplink chips to appear",
+            async () =>
+                evaluate(
+                    ws,
+                    `(() => { const b = document.querySelector('#st-uplinks'); return !!(b && !b.hidden && b.children.length); })()`,
+                ),
+            45000,
+            500,
+        );
+        chipsOk = true;
+    } catch (_) { /* render untouched; the check below reports it */ }
+    check("C4 bonding uplink chips appear in the status bar", chipsOk, "no #st-uplinks children");
+    const chips = await evaluate(
+        ws,
+        `(() => [...document.querySelectorAll('.uplink-chip')].map((c) => ({
+            text: c.textContent.trim(),
+            word: c.textContent.trim().split(/\\s+/).pop(),
+            title: c.title,
+        })))()`,
+    );
+    const words = [...new Set(chips.map((c) => c.word))];
+    check(
+        "C4 each chip carries a state word and a full tooltip",
+        chips.length > 0 &&
+            words.length > 0 &&
+            words.every((w) => ["active", "idle", "flaky", "dead"].includes(w)) &&
+            chips.every((c) => c.title.includes("now") && c.title.includes("preference weight")),
+        JSON.stringify(chips).slice(0, 500),
+    );
+    await shotOf(ws, "c4-gui-uplinks.png");
+
+    // A chip is a pointer into Settings > Network (where the toggle lives).
+    await evaluate(
+        ws,
+        `(() => { const c = document.querySelector('.uplink-chip'); if (c) c.click(); return !!c; })()`,
+    );
+    await sleep(900);
+    const netVisible = await evaluate(
+        ws,
+        `(() => { const p = document.querySelector('#set-panel-network'); return !!p && !p.classList.contains('hidden'); })()`,
+    );
+    check("C4 clicking a chip opens Settings > Network", netVisible === true);
+    await shotOf(ws, "c4-gui-settings-network.png");
+    await evaluate(ws, `(() => { document.querySelector('#set-close').click(); return true; })()`);
+    await sleep(400);
     ws.close();
     killTree(gui1.pid);
 }

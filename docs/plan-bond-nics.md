@@ -194,7 +194,18 @@ state churn. Rules, in priority order:
   stalled-segment cancel + rerun from durable done (aria2
   `lowest-speed-limit`-style, deferred - the steal itself already
   rescues a stalled uplink's cell once any other worker frees).
-- Slice 3: status-bar NIC chips (GUI, screenshot-verified).
+- Slice 3 - LANDED 2026-10-27 (e2e C4, screenshots c4-gui-uplinks /
+  c4-gui-settings-network): status-bar uplink chips `name rate spark
+  state` on a 2 s sampler (`bond_links` GUI command over
+  `Reply::Config.bond_links`; hidden while bonding is off). State is a
+  word, never color-only: active (teal) / idle (grey) / flaky (amber, a
+  dial failed and a re-probe is due) / dead (red, quarantined).
+  Tooltip: name+IP+default route, now/avg from the 80 s window,
+  connections + dial fails, weight. Click opens Settings > Network
+  with the bond row flashed. e2e gate grew the C4 checks (3): chips
+  appear after the private daemon's bonding toggle turns on late in the
+  run (early phases' loopback engine flows untouched), state word +
+  tooltip shape, chip click -> Network panel.
 - Slice 4: NIC settings cards + exclude list + docs/ROADMAP.
 
 Debug daemon for live testing: private pipe + data dir, CDP-attached GUI,

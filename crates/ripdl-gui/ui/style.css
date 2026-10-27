@@ -252,6 +252,27 @@ td.prog-cell .parts { margin-left: 8px; color: var(--amber); }
 .st-off { background: #fae9e6; color: var(--red); }
 .st-gap { margin-left: 16px; color: #42554d; }
 
+/* Bonding uplink chips: `name rate spark state`, one per NIC. State is
+   always a word (teal active / grey idle / amber uneven dial / red dead)
+   — color alone never carries the meaning. */
+#st-uplinks {
+    margin-left: auto;
+    display: inline-flex; align-items: center; gap: 8px;
+    white-space: nowrap; overflow: hidden;
+}
+.uplink-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 1px 8px; border-radius: 8px; font-size: 11.5px;
+    cursor: pointer; border: 1px solid transparent;
+    font-variant-numeric: tabular-nums;
+}
+.uplink-chip b { font-weight: 650; }
+.uplink-chip .u-spark { display: block; }
+.uplink-chip.st-on  { background: #e1f1e8; color: var(--green); border-color: var(--line); }
+.uplink-chip.st-idle { background: #eef1ef; color: #42554d; border-color: var(--line); }
+.uplink-chip.st-warn { background: #f8eedb; color: #8a6116; border-color: var(--line); }
+.uplink-chip.st-off { background: #fae9e6; color: var(--red); border-color: var(--line); }
+
 /* Empty hint */
 #empty-hint { text-align: center; color: var(--muted); padding: 42px 20px; }
 #empty-hint .empty-ico { width: 32px; height: 32px; color: #8aa99b; margin-bottom: 8px; }

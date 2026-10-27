@@ -1198,6 +1198,121 @@ function renderStatusbar() {
     if (ST_COUNTS.textContent !== countsTxt) ST_COUNTS.textContent = countsTxt;
 }
 
+/* Uplink chips in the status bar: one per bonded NIC, "name rate spark
+ * state", sampled every 2 s while the window is visible. The chip is a
+ * pointer into Settings > Network (where the toggle lives) - the state
+ * word is in the chip, not just a color, so a quick glance still reads. */
+const UPLINK_WINDOW = 40; // samples kept per link (40 x 2 s = 80 s of spark)
+let uplinks = []; // last fetch: [{ name, ip, default_route, rate_bps, weight, in_use, fails }]
+const uplinkHist = new Map(); // ip -> [bytes/s ...] at the 2 s cadence
+let uplinkTimer = null;
+let uplinksOpen = false; // one fetch in flight at a time
+
+function uplinkClass(l) {
+    if (l.weight === 0) return "st-off"; // quarantined: its dead dial streak won
+    if (l.fails > 0) return "st-warn"; // a dial just failed; it is being re-probed
+    return l.in_use > 0 ? "st-on" : "st-idle";
+}
+
+function uplinkWord(l) {
+    const c = uplinkClass(l);
+    if (c === "st-off") return "dead";
+    if (c === "st-warn") return "flaky";
+    return c === "st-on" ? "active" : "idle";
+}
+
+function uplinkSpark(hist) {
+    const w = 44, h = 12;
+    if (hist.length < 2) return "";
+    const peak = Math.max(...hist) || 1;
+    const pts = hist
+        .map((v, i) => {
+            const x = (i / (hist.length - 1)) * w;
+            const y = h - 1 - (v / peak) * (h - 2);
+            return `${x.toFixed(1)},${y.toFixed(1)}`;
+        })
+        .join(" ");
+    return `<svg class="u-spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>`;
+}
+
+function renderUplinks() {
+    const box = $("#st-uplinks");
+    if (!uplinks.length) {
+        box.hidden = true;
+        box.replaceChildren();
+        return;
+    }
+    box.hidden = false;
+    // Keyed rebuild only when the set changed: rates/sparks re-render anyway,
+    // but the two-second cadence keeps this cheap (<5 chips).
+    box.replaceChildren(
+        ...uplinks.map((l) => {
+            let hist = uplinkHist.get(l.ip);
+            if (!hist) {
+                hist = [];
+                uplinkHist.set(l.ip, hist);
+            }
+            const avg = hist.length
+                ? hist.reduce((s, v) => s + v, 0) / hist.length
+                : l.rate_bps;
+            const chip = document.createElement("span");
+            chip.className = `uplink-chip ${uplinkClass(l)}`;
+            chip.textContent = `${l.name} `;
+            const rate = document.createElement("b");
+            rate.textContent = l.rate_bps > 0 ? `${humans(l.rate_bps)}/s` : "\u2014";
+            chip.appendChild(rate);
+            const spark = uplinkSpark(hist);
+            if (spark) chip.insertAdjacentHTML("beforeend", spark);
+            const word = document.createElement("i");
+            word.textContent = ` ${uplinkWord(l)}`;
+            word.style.fontStyle = "normal";
+            chip.appendChild(word);
+            chip.title = [
+                `${l.name} - ${l.ip}${l.default_route ? " (default route)" : ""}`,
+                `now ${humans(l.rate_bps)}/s - avg ${humans(Math.round(avg))}/s`,
+                `connections: ${l.in_use} - dial fails: ${l.fails}`,
+                `state: ${uplinkWord(l)} (preference weight ${l.weight})`,
+            ].join("\n");
+            chip.onclick = () => openSettings("network");
+            return chip;
+        })
+    );
+}
+
+async function pollUplinks() {
+    if (uplinksOpen) return;
+    uplinksOpen = true;
+    try {
+        const links = await invokeSafe("bond_links");
+        uplinks = links;
+        for (const l of uplinks) {
+            let hist = uplinkHist.get(l.ip);
+            if (!hist) {
+                hist = [];
+                uplinkHist.set(l.ip, hist);
+            }
+            hist.push(l.rate_bps);
+            while (hist.length > UPLINK_WINDOW) hist.shift();
+        }
+        // Links that disappeared (toggle off, adapter gone) leave their
+        // history behind; a returning adapter starts from its old curve -
+        // harmless, it fades out through the window.
+        renderUplinks();
+    } catch (_) {
+        /* daemon briefly unreachable at open: keep the last render */
+    } finally {
+        uplinksOpen = false;
+    }
+}
+
+function scheduleUplinks() {
+    clearTimeout(uplinkTimer);
+    // Hidden window: no RPM reason to sample, tray-hibernate skips onto the
+    // slow poll; chips just wait.
+    const ms = document.hidden ? 5000 : 2000;
+    uplinkTimer = setTimeout(() => { pollUplinks().then(scheduleUplinks); }, ms);
+}
+
 /* Toolbar */
 let dlgDestTouched = false;
 
@@ -1630,9 +1745,11 @@ function setPathField(selector, value) {
     input.title = input.value;
 }
 
-async function openSettings() {
+async function openSettings(tab) {
     const err = $("#set-err");    err.classList.add("hidden");
-    selectSettingsTab($("#set-tab-general"));
+    const network = tab === "network";
+    selectSettingsTab(network ? $("#set-tab-network") : $("#set-tab-general"));
+    if (network) highlightBondRow();
     SET_INPUTS.forEach((sel) => { $(sel).value = ""; });
     $("#set-tray").checked = true;
     $("#set-bond").checked = false;
@@ -1897,6 +2014,22 @@ function selectSettingsTab(tab) {
         document.getElementById(t.getAttribute("aria-controls")).classList.toggle("hidden", !on);
     });
     $("#set-body").scrollTop = 0;
+}
+
+// The status-bar chips' jump target: the bond row flashes so the click
+// visibly connects a chip to its setting (row = the toggle + its uplink
+// list, see the plan's "Settings > Network, row highlighted").
+function highlightBondRow() {
+    const row = document.querySelector("#set-panel-network .set-status");
+    const toggle = document.querySelector("#set-panel-network #set-bond");
+    if (toggle) {
+        toggle.closest(".set-row").style.background = "var(--teal-wash, #e8f2ee)";
+        setTimeout(() => { toggle.closest(".set-row").style.background = ""; }, 2200);
+    }
+    if (row) {
+        row.style.background = "var(--teal-wash, #e8f2ee)";
+        setTimeout(() => { row.style.background = ""; }, 2200);
+    }
 }
 setTabs.forEach((t, i) => {
     t.onclick = () => selectSettingsTab(t);
@@ -2944,6 +3077,7 @@ initColumnUi();
 initWindowMemory();
 initDragDrop();
 poll().then(schedulePoll);
+pollUplinks().then(scheduleUplinks);
 
 /* Window size: remembered across launches (a 1100 px task list is not a
  * preference you should have to redo every morning). Maximized windows are
