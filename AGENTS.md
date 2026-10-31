@@ -185,7 +185,22 @@ bytes.
 
 ## Current status
 
-Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-18:
+Check `docs/ROADMAP.md` checkboxes for ground truth. As of 2026-10-31
+(v0.4.9 in progress): link refresh as a system landed end to end -
+engine `stale` state + `stale_reason` with a confirming re-probe
+(`Error::HttpStatus` for auth-class answers), GUI "Refresh address"
+dialog with a dry-run verdict strip and auto-resume after swap, the
+copy chip offering one-tap "Refresh keeps X of Y" for unfinished tasks
+(`Command::StaleCandidates`, daemon-side name match + 5 s-budget probe),
+and the bridge answering unknown commands under the caller's id.
+`.ripdl.json` sidecars are hidden on Windows (attribute re-applied on
+every write). Verified live: a real 50 GB task with a dead tokenized
+host URL refreshed through the fresh signed link, kept 5.4 GiB, and
+resumed (no lag signature in a 900 s watcher window). Remaining
+backlog: duplicate-window refresh offer, headers editing in the
+refresh dialog, AdoptNoRange salvage, the librqbit loopback flake under
+full-suite parallel load.
+Earlier:
 P0/P1 core complete: multi-segment download, resume, retry, daemon + RPC,
 persistent queue, buffered writes, shared speed limiter, header/auth/cookie
 pass-through, Content-Disposition naming, duplicate-URL idempotency,
