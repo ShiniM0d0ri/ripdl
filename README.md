@@ -91,6 +91,20 @@ dropped. ripdl probes each uplink with a source-bound TCP handshake before
 bonding it, drops a link after two failed probes and re-adopts it on the first
 success — no dead path ever eats half the peer connections.
 
+**A Windows note:** when a second connection appears (USB tether, Ethernet
+cable), Windows may disconnect the Wi-Fi on its own — a power-saving policy
+("minimize simultaneous connections") that assumes one link is enough. Bonding
+needs both alive. Stop Windows from doing it with an elevated command:
+
+```powershell
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WcmSvc\GroupPolicy" -Name fMinimizeConnections -Type DWord -Value 0
+```
+
+(or gpedit: Computer Configuration → Policies → Network → WLAN → WLAN Settings
+→ "Do not permit Windows to automatically connect to suggested networks", set
+the simultaneous-connections minimization to *never*), then reconnect Wi-Fi
+once.
+
 ## Features
 
 - **Fast, resumable downloads** — up to 8 parallel connections per file when
