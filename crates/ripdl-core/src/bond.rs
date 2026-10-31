@@ -119,6 +119,7 @@ impl Link {
     fn take_delta(&self) -> u64 {
         self.delta.swap(0, Ordering::Relaxed)
     }
+
     fn note_fail(&self, skip_after: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.fails = inner.fails.saturating_add(1);
@@ -242,6 +243,16 @@ impl Bond {
         self.links.read().unwrap().clone()
     }
 
+    /// The live `Link` for a specific address, when present.
+    pub fn link_for(&self, ip: IpAddr) -> Option<Arc<Link>> {
+        self.links
+            .read()
+            .unwrap()
+            .iter()
+            .find(|l| l.info.ip == ip)
+            .cloned()
+    }
+
     pub fn status(&self) -> Vec<LinkStatus> {
         self.links
             .read()
@@ -306,6 +317,99 @@ impl Bond {
             *c -= total;
         }
         Some(pick)
+    }
+
+    /// A link that the machine-level probe just proved alive (the daemon's
+    /// source-bound handshake succeeds) outranks any dial-failure streak
+    /// recorded while the link was away. Without this, a link that dropped
+    /// during a task stays skip-listed forever: weight 0 means it is never
+    /// dialed, so nothing can ever call `note_ok` on it - the only escape
+    /// is the one-sample explore window, which only helps if a dial happens
+    /// to fall inside it.
+    pub fn revive(&self, ip: IpAddr) {
+        for link in self.links.read().unwrap().iter() {
+            if link.info.ip == ip {
+                link.note_ok();
+                return;
+            }
+        }
+    }
+
+    /// The live connection a worker should move to rebalance on the fly:
+    /// `Some((shed, fill))` - close one connection currently riding `shed`
+    /// and re-dial it on `fill`. Pure arithmetic over weights and live
+    /// connection counts; the caller owns the migration itself.
+    ///
+    /// Desired share per link is floor(conns x weight / total_weight), with
+    /// any floor-rounding remainder given to links in descending weight
+    /// order (deterministic, so the decision does not flap). A link is
+    /// over-served when it holds at least one connection more than its
+    /// desired share; migration stops when no link is over-served or no
+    /// healthy link is under-served.
+    pub fn rebalance(&self) -> Option<(IpAddr, IpAddr)> {
+        let links = self.links.read().unwrap().clone();
+        let healthy: Vec<(Arc<Link>, u64)> = links
+            .iter()
+            .filter_map(|l| {
+                let w = l.weight() as u64;
+                (w > 0).then(|| (Arc::clone(l), w))
+            })
+            .collect();
+        if healthy.len() < 2 {
+            return None;
+        }
+        let total_w: u64 = healthy.iter().map(|(_, w)| *w).sum();
+        let total_conns: u64 = healthy
+            .iter()
+            .map(|(l, _)| l.in_use.load(Ordering::Relaxed) as u64)
+            .sum();
+        // Fewer live connections than links: the next dials spread anyway.
+        if total_conns < healthy.len() as u64 {
+            return None;
+        }
+        let mut desired: Vec<(IpAddr, i64)> = healthy
+            .iter()
+            .map(|(l, w)| (l.info.ip, (total_conns * w / total_w).max(1) as i64))
+            .collect();
+        let assigned: u64 = desired.iter().map(|(_, d)| *d as u64).sum();
+        // Hand the rounding remainder to the strongest links first (ties:
+        // stable by the existing order - discovery order, which pick() also
+        // uses as its tiebreak).
+        let mut leftover = (total_conns - assigned) as i64;
+        let mut order: Vec<(IpAddr, u64)> = healthy.iter().map(|(l, w)| (l.info.ip, *w)).collect();
+        order.sort_by(|a, b| b.1.cmp(&a.1));
+        for (ip, _) in &order {
+            if leftover <= 0 {
+                break;
+            }
+            if let Some(d) = desired.iter_mut().find(|(d_ip, _)| d_ip == ip) {
+                d.1 += 1;
+                leftover -= 1;
+            }
+        }
+        // surplus = in_use - desired
+        let mut surplus: Vec<(IpAddr, i64)> = desired
+            .into_iter()
+            .map(|(ip, d)| {
+                let live = healthy
+                    .iter()
+                    .find(|(l, _)| l.info.ip == ip)
+                    .map(|(l, _)| l.in_use.load(Ordering::Relaxed) as i64)
+                    .unwrap_or(0);
+                (ip, live - d)
+            })
+            .collect();
+        let shed = surplus
+            .iter()
+            .copied()
+            .max_by_key(|s| (s.1, std::cmp::Reverse(s.0)))
+            .filter(|s| s.1 >= 1)?;
+        let fill = surplus
+            .iter()
+            .copied()
+            .filter(|s| s.1 < 0)
+            .min_by_key(|s| (s.1, s.0))?;
+        Some((shed.0, fill.0))
     }
 
     /// Fold the metered bytes since the last call into the per-link EMA and
@@ -669,6 +773,84 @@ mod tests {
         let by_ip: HashMap<IpAddr, LinkStatus> = statuses.into_iter().map(|s| (s.ip, s)).collect();
         assert_eq!(by_ip[&addr(1)].weight, 10);
         assert_eq!(by_ip[&addr(2)].weight, 7, "idle keeps its earned weight");
+    }
+
+    /// A probe-proven uplink clears the skip it earned while it was away:
+    /// otherwise a returning link is never dialed again (weight 0 blocks
+    /// the very dial that would restore it).
+    #[test]
+    fn revive_clears_a_skip_listed_link() {
+        let b = Bond::new();
+        b.set_links(&[link_info(1, "tether", true), link_info(2, "wifi", false)]);
+        let wifi = link(&b, 2);
+        b.note_fail(&wifi);
+        b.note_fail(&wifi);
+        let statuses = b.sample(5.0);
+        let by_ip: HashMap<IpAddr, LinkStatus> = statuses.into_iter().map(|s| (s.ip, s)).collect();
+        assert_eq!(by_ip[&addr(2)].weight, 0, "two dead dials skip the link");
+        b.revive(addr(2));
+        let statuses = b.sample(5.0);
+        let by_ip: HashMap<IpAddr, LinkStatus> = statuses.into_iter().map(|s| (s.ip, s)).collect();
+        assert_eq!(by_ip[&addr(2)].weight, 1, "revive restores the floor");
+        assert_eq!(by_ip[&addr(2)].fails, 0, "the stale streak is forgotten");
+        assert!(b.pick().is_some(), "a pick exists again over both links");
+    }
+
+    /// Rebalance decisions: a link holding more connections than its weight
+    /// share sheds one to a link holding fewer - and stops once shares are
+    /// met (no flapping).
+    #[test]
+    fn rebalance_moves_a_connection_to_the_under_served_link() {
+        let b = Bond::new();
+        b.set_links(&[link_info(1, "tether", true), link_info(2, "wifi", false)]);
+        let tether = link(&b, 1);
+        let wifi = link(&b, 2);
+        // Equal weights: desired split of 4 connections is 2/2. 3 on the
+        // tether, 0 on Wi-Fi -> shed the tether.
+        b.record(&tether, 1024);
+        tether.conn_ms.store(1_000, Ordering::Relaxed);
+        b.record(&wifi, 1024);
+        wifi.conn_ms.store(1_000, Ordering::Relaxed);
+        let _ = b.sample(5.0);
+        for _ in 0..3 {
+            b.begin(&tether);
+        }
+        assert_eq!(
+            b.rebalance(),
+            Some((addr(1), addr(2))),
+            "the over-served link sheds to the empty one"
+        );
+        // Simulate two migrations landing: 3/2 meets the 2/2 floor split
+        // with the remainder unassigned; one more tether dial trips it.
+        b.begin(&wifi);
+        b.begin(&wifi);
+        assert_eq!(b.rebalance(), None, "shares met: nothing to move");
+        b.begin(&tether);
+        assert_eq!(
+            b.rebalance(),
+            Some((addr(1), addr(2))),
+            "one connection over the share sheds again"
+        );
+    }
+
+    #[test]
+    fn rebalance_never_moves_a_solo_or_dead_link() {
+        let b = Bond::new();
+        b.set_links(&[link_info(1, "tether", true), link_info(2, "wifi", false)]);
+        // Wi-Fi skip-listed (weight 0): not a fill candidate.
+        b.note_fail(&link(&b, 2));
+        b.note_fail(&link(&b, 2));
+        for _ in 0..3 {
+            b.begin(&link(&b, 1));
+        }
+        let _ = b.sample(5.0);
+        assert_eq!(b.rebalance(), None, "no healthy under-served link");
+        // Fewer connections than links: dials spread anyway, don't churn.
+        let b2 = Bond::new();
+        b2.set_links(&[link_info(1, "a", true), link_info(2, "b", false)]);
+        b2.begin(&link(&b2, 1));
+        let _ = b2.sample(5.0);
+        assert_eq!(b2.rebalance(), None, "one connection, two links: no-op");
     }
 
     #[test]

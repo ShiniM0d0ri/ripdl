@@ -29,6 +29,13 @@ pub enum Error {
     #[error("download cancelled")]
     Cancelled,
 
+    /// The bond supervisor asked this connection to move to a different
+    /// uplink (on-the-fly rebalancing). Not a failure: the durable offset
+    /// is kept, the un-durable tail rolls back, and the next dial goes out
+    /// forced onto the under-served link. Never retry-counted.
+    #[error("connection migrated between uplinks")]
+    Migrated,
+
     #[error("downloaded size mismatch: expected {expected}, got {actual}")]
     SizeMismatch { expected: u64, actual: u64 },
 

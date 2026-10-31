@@ -338,6 +338,11 @@ impl Engine {
         // picked the OS default route carries the attempt.
         let dialer = self.dialer.clone();
 
+        // On-the-fly bond rebalancing state, shared by the workers and the
+        // migration supervisor below.
+        let linkmap: Arc<Mutex<HashMap<usize, IpAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+        let migrate: Arc<Mutex<HashMap<usize, IpAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+
         let mut handles = Vec::with_capacity(segments.len());
         for (rank, seg) in segments.into_iter().enumerate() {
             let url = url.to_string();
@@ -352,6 +357,8 @@ impl Engine {
             let limiter = self.limiter.clone();
             let primary = self.client.clone();
             let dialer = dialer.clone();
+            let linkmap = linkmap.clone();
+            let migrate = migrate.clone();
             let stream_idle = self.cfg.stream_idle;
             // Ramp-in (the part-start lag spike): every segment used to
             // open its first handshake at the same moment, which read as a
@@ -377,11 +384,74 @@ impl Engine {
                     &gate,
                     stagger,
                     stream_idle,
+                    linkmap,
+                    migrate,
                 )
                 .await;
                 active.fetch_sub(1, Ordering::SeqCst);
                 r
             }));
+        }
+
+        // The migration supervisor: weights only steer dials, so a link
+        // that came back (or slowed down) stays over-served until every
+        // long-lived cell happens to end. Every REBALANCE_TICK this decides
+        // - purely from weights and live connection counts - whether one
+        // connection should move from the most over-served link to the
+        // most under-served one, and orders a worker riding the shed link.
+        // Ranged cells only: an UNBOUNDED stream restarts from zero.
+        if let Some(bond) = dialer.as_ref().map(|d| Arc::clone(&d.bond)) {
+            const REBALANCE_TICK: Duration = Duration::from_secs(10);
+            let cells = cells.clone();
+            let token = token.clone();
+            let finished = finished.clone();
+            let linkmap = linkmap.clone();
+            let migrate = migrate.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(REBALANCE_TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    if finished.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Some((shed, fill)) = bond.rebalance() else {
+                        continue;
+                    };
+                    // Victim: a live ranged connection currently riding the
+                    // shed link, not already under orders.
+                    let candidates: Vec<usize> = {
+                        let map = linkmap.lock().expect("link map");
+                        let cells = cells.lock().expect("state cells");
+                        map.iter()
+                            .filter(|(idx, ip)| {
+                                **ip == shed
+                                    && cells.get(**idx as usize)
+                                        .map(|c| c.end != UNBOUNDED)
+                                        .unwrap_or(false)
+                            })
+                            .map(|(idx, _)| *idx)
+                            .collect()
+                    };
+                    for victim in candidates {
+                        let mut orders = migrate.lock().expect("migrations");
+                        if orders.contains_key(&victim) {
+                            continue;
+                        }
+                        orders.insert(victim, fill);
+                        tracing::info!(
+                            segment = victim,
+                            from = %shed,
+                            to = %fill,
+                            "bond rebalance: moving a connection to the under-served uplink"
+                        );
+                        break;
+                    }
+                }
+            });
         }
 
         // Task metadata for the sidecar file (kept for the final writes below).
@@ -654,6 +724,18 @@ impl Dialer {
         }
     }
 
+    /// A forced dial: a migration lands on the link the supervisor chose,
+    /// not on whatever the credit math would pick this instant. Returns
+    /// None when the link left the bond between order and dial - the
+    /// caller falls back to a plain pick.
+    fn force(&self, ip: IpAddr) -> Option<DialAttempt> {
+        let link = self.bond.link_for(ip)?;
+        Some(DialAttempt {
+            client: self.client_for(ip),
+            link: Some(link),
+        })
+    }
+
     /// The warm client bound to a link address: built once, then pooled.
     /// A `Client`'s internal keep-alive pool carries established sockets
     /// across attempts, so a link's next attempt hops on an existing TCP
@@ -704,8 +786,16 @@ async fn run_segment(
     gate: &gate::Gate,
     stagger: Duration,
     stream_idle: Option<Duration>,
+    // Live map: segment index -> link address its current connection rides
+    // (read by the migration supervisor). Orders: segment index -> target
+    // link the supervisor wants it moved to.
+    linkmap: Arc<Mutex<HashMap<usize, IpAddr>>>,
+    migrate: Arc<Mutex<HashMap<usize, IpAddr>>>,
 ) -> Result<()> {
     let mut attempt = 0u32;
+    // A migration order the previous attempt ended with: the next dial must
+    // land on this link, bypassing the credit math (see `Dialer::force`).
+    let mut forced: Option<IpAddr> = None;
     // The cell this worker currently owns. On completion it can be split
     // elsewhere: the loop takes what `steal_largest` deals out (work stealing).
     let mut idx = initial.index;
@@ -765,17 +855,30 @@ async fn run_segment(
             p = gate.acquire() => p,
         };
 
+        // A migration ordered while the previous attempt streamed lands
+        // here (the chunk-loop check covers orders arriving mid-stream).
+        if let Some(target) = migrate.lock().expect("migrations").remove(&idx) {
+            forced = Some(target);
+            drop(permit);
+            continue;
+        }
+
         // This attempt's dial: a bond pick when bonding is on, or the plain
         // unbound client. The pick re-runs per attempt, so a link that has
-        // started to fail is abandoned by the retry loop itself.
-        let pick = match dialer.as_ref() {
-            Some(d) => Some(d.attempt(&token).await),
-            None => None,
+        // started to fail is abandoned by the retry loop itself. A forced
+        // dial (migration) bypasses the pick for exactly one attempt.
+        let pick = match (&dialer, forced.take()) {
+            (Some(d), Some(ip)) => d.force(ip),
+            (Some(d), None) => Some(d.attempt(&token).await),
+            (None, _) => None,
         };
         let (client, link) = match pick {
             Some(DialAttempt { client, link }) => (client, link),
             None => (primary.clone(), None),
         };
+        if let Some(l) = link.as_ref() {
+            linkmap.lock().expect("link map").insert(idx, l.info.ip);
+        }
         // Claim sizing wants a rate ballpark for what THIS connection will
         // pull: the per-connection capacity EMA when the link has one (an
         // aggregate rate would size a claim by the whole link's share, not
@@ -808,10 +911,12 @@ async fn run_segment(
             &limiter,
             &token,
             stream_idle,
+            &migrate,
         )
         .await
         {
             Ok(()) => {
+                linkmap.lock().expect("link map").remove(&idx);
                 drop(permit);
                 gate.grow();
                 // The cell is done. Rather than retire, this worker splits
@@ -830,6 +935,19 @@ async fn run_segment(
                 }
             }
             Err(Error::Cancelled) => return Err(Error::Cancelled),
+            Err(Error::Migrated) => {
+                linkmap.lock().expect("link map").remove(&idx);
+                // Not a failure: no attempt increment, no backoff, no fail
+                // note. The next dial goes out forced onto the target link.
+                forced = migrate.lock().expect("migrations").remove(&idx);
+                drop(permit);
+                tracing::info!(
+                    index = seg.index,
+                    target = ?forced,
+                    "bond rebalance: connection migrated between uplinks"
+                );
+                continue;
+            }
             Err(e)
                 if retry::is_retryable(&e)
                     && attempt < retry::max_attempts(&retry_cfg, retry::is_host_pressure(&e)) =>
@@ -990,6 +1108,7 @@ async fn segment_attempt(
     limiter: &limiter::Limiter,
     token: &CancellationToken,
     stream_idle: Option<Duration>,
+    migrate: &Mutex<HashMap<usize, IpAddr>>,
 ) -> Result<()> {
     let mut file: Option<std::fs::File> = Some(
         std::fs::OpenOptions::new()
@@ -1165,6 +1284,17 @@ async fn segment_attempt(
     }
 
     loop {
+        // On-the-fly bond rebalancing: the supervisor asked this connection
+        // to move. The parked write joins first (the durable offset keeps
+        // it), then the attempt ends without a failure note; the worker
+        // re-dials forced onto the target link and re-downloads at most
+        // one flush window's tail. UNBOUNDED cells never migrate: their
+        // stream restarts from zero, which would throw away the whole run.
+        if seg.end != UNBOUNDED && migrate.lock().expect("migrations").contains_key(&seg.index) {
+            flush!();
+            await_write!();
+            return Err(Error::Migrated);
+        }
         let chunk = tokio::select! {
             _ = token.cancelled() => {
                 // Pause/retry with a parked write: join it so the sidecar

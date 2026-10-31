@@ -1794,6 +1794,18 @@ impl Daemon {
                 live.iter().chain(dead.iter()).map(|n| std::net::IpAddr::V4(n.addr)).collect();
             failures.retain(|addr, _| known.contains(addr));
         }
+        // A link the probe just re-adopted is alive at the machine level:
+        // clear any dial-failure skip it earned while it was away. Without
+        // this a returning uplink can stay skip-listed forever (weight 0
+        // means it is never dialed, so nothing can clear the streak; the
+        // only escape is the one-sample explore window). Reviving on the
+        // dead->live transition only - a link that is up but cannot reach
+        // the current host keeps its dial-failure skip.
+        for nic in &live {
+            if !prev.iter().any(|p| p.addr == nic.addr) {
+                self.bond.revive(std::net::IpAddr::V4(nic.addr));
+            }
+        }
         *self.uplinks.lock().unwrap() = live;
         *self.uplinks_dead.lock().unwrap() = dead;
     }
