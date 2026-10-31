@@ -613,3 +613,37 @@ column) toggles a column without the header drifting; saved widths are shrunk to
 fit a narrower window (`fitWidths`) instead of growing a scrollbar. The row menu
 also gained "Copy address", and "Open file" only shows when a file exists.
 
+2026-10-31, live debugging of "everything lags when a big download starts" and
+"bonding only uses one NIC" (findings in gitignored research/lag/): the lag is
+preallocation on a non-sparse NTFS file - first writes past VDL trigger
+multi-second zero-fill storms (measured 800-884 MB/s write bursts, ~7x write
+amplification, 10-16 ms disk latency on a DRAM-less NVMe). Fix: `mark_sparse`
+(FSCTL_SET_SPARSE before `set_len`; order matters - marking after allocation
+does not deallocate), verified live (4 GiB allocated for a 45 GB preallocated
+file) and by test. The "lost disk space" was VSS shadow-copy storage growth
+(volsnap events), not ripdl; Windows.old was separate. Wi-Fi auto-disconnect on
+tether plug-in is Windows' "minimize simultaneous connections" policy, fixed by
+HKLM `fMinimizeConnections=0` (documented in README). Bonding was never
+single-NIC - curl per-interface tests showed ripdl beats single-stream; the
+ceiling is the upstream (OVH per-connection throttle / phone radio). Engine
+gaps fixed anyway: skip-listed links revive on probe success (`Bond::revive`),
+and connections now migrate between uplinks on the fly (`Bond::rebalance` ->
+`Error::Migrated`, never retry-counted; supervisor ticks every 10 s,
+`segment_attempt` flushes and re-dials forced on a new uplink; UNBOUNDED
+(no-range) streams never migrate). Verified live on an isolated debug daemon:
+dials spread 3+2 from task start, migrations follow measured weights and stop
+when the split matches (no flapping). `ripdl config` now prints the live HTTP
+bond links (capacity/weight/conns/fails; `BondLink.capacity_bps` added,
+serde-defaulted). Gotcha for isolated daemon tests: env
+(`RIPDL_RPC_PIPE`/`RIPDL_DATA_DIR`/`RIPDL_RPC_PORT`) must be set in the SAME
+shell invocation as the CLI call - a fresh call without them silently talks to
+the installed daemon; and a fresh data dir defaults `bond_interfaces` to OFF -
+write a config.json to test bonding. Known bug found by accident: `add` with a
+URL that a running task already uses starts a second task on the same file
+(idempotency does not guard running tasks) - the duplicate wrote identical
+bytes (same URL+ETag) so nothing corrupted, but it is a data race; guard it.
+Backlog additions: duplicate-URL guard for running tasks, migration hysteresis
+if live churn ever shows up, duplicate-window refresh offer, headers/cookies
+editing in the refresh dialog, AdoptNoRange salvage, parent-page hint, toasts,
+batch refresh, video-task refresh, engine tail drain, librqbit loopback flake.
+
