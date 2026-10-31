@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use ripdl_core::rpc::{
     BundlePart, Command, DuplicatePolicy, ExtensionStatus, LanInfo, LanSendInfo, ProposalOutcome,
-    Reply, Request, Response, TaskDetailsSnapshot, TaskInfo,
+    Reply, Request, Response, StaleCandidate, TaskDetailsSnapshot, TaskInfo,
 };
 use ripdl_core::task::{Progress, TaskKind, TaskState};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
@@ -1063,6 +1063,9 @@ impl Daemon {
             Command::Details { id } => self.cmd_details(req.id, &id).await,
             Command::RefreshUrl { id, url, resume, part, probe_only } => {
                 self.cmd_refresh_url(req.id, &id, &url, resume, part, probe_only).await
+            }
+            Command::StaleCandidates { name, url } => {
+                self.cmd_stale_candidates(req.id, &name, &url).await
             }
             Command::AddBundleParts { id, parts } => {
                 self.cmd_add_bundle_parts(req.id, &id, parts).await
@@ -2670,6 +2673,116 @@ impl Daemon {
         }
     }
 
+    /// Read-only validation of a candidate address against one HTTP task:
+    /// probe the URL, check it against the task's sidecar through the same
+    /// gate a real refresh runs, and answer `(kept, total, warning)`. Used by
+    /// the GUI's dry-run preview and by stale-candidate matching. A task with
+    /// no sidecar yet has nothing to keep and nothing to conflict - the probe
+    /// itself is the whole verdict.
+    async fn probe_refresh_candidate(
+        self: &Arc<Self>,
+        rec: &TaskRecord,
+        url: &str,
+    ) -> Result<(u64, Option<u64>, Option<String>), String> {
+        let engine = Engine::new(self.engine_config(&rec.headers, false)).map_err(|e| e.to_string())?;
+        let info = engine.plan(url).await.map_err(|e| e.to_string())?;
+        Ok(match find_sidecar(rec, &self.sidecar_dirs(rec)) {
+            Some((dest, state)) => {
+                let check =
+                    ripdl_core::refresh::check_compatible(&dest, &state, &info).map_err(|e| e.to_string())?;
+                (
+                    ripdl_core::refresh::kept_bytes(&state),
+                    info.total,
+                    check.warning,
+                )
+            }
+            None => (rec.downloaded, info.total, None),
+        })
+    }
+
+    /// The file name a task is known by: the planned output file when the
+    /// engine learned one, else the URL's last path segment (a task that
+    /// never started has no better truth). Case handled by the caller.
+    fn task_file_name(rec: &TaskRecord) -> Option<String> {
+        if let Some(dest) = &rec.dest_file {
+            if let Some(name) = dest.file_name() {
+                return Some(name.to_string_lossy().into_owned());
+            }
+        }
+        let tail = ripdl_core::bundle::url_tail(&rec.url);
+        if tail.is_empty() {
+            None
+        } else {
+            Some(tail)
+        }
+    }
+
+    /// The extension's capture asks which unfinished tasks a fresh link
+    /// could refresh. Match by file name (never by URL: neither side needs
+    /// the other's links), cap the probing at two candidates, and validate
+    /// each through the refresh gate so the offer's "keeps X" is real. A
+    /// candidate that fails the gate stays silent - the link can still be
+    /// queued as a new download.
+    async fn cmd_stale_candidates(self: &Arc<Self>, req_id: u64, name: &str, url: &str) -> Response {
+        let reply: Result<Reply, String> = async {
+            let want = name.trim().to_ascii_lowercase();
+            if want.is_empty() || url.is_empty() {
+                return Ok(Reply::StaleCandidates { candidates: Vec::new() });
+            }
+            let found: Vec<TaskRecord> = {
+                let records = self.records.lock().unwrap();
+                records
+                    .iter()
+                    .filter(|r| r.kind == TaskKind::Http)
+                    .filter(|r| {
+                        matches!(
+                            r.state,
+                            TaskState::Paused | TaskState::Failed | TaskState::Stale
+                        )
+                    })
+                    .filter(|r| {
+                        Self::task_file_name(r)
+                            .map_or(false, |n| n.eq_ignore_ascii_case(&want))
+                    })
+                    .take(2)
+                    .cloned()
+                    .collect()
+            };
+            let mut candidates = Vec::new();
+            for rec in found {
+                let name = match Self::task_file_name(&rec) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                // The offer must not hang on a slow host: a candidate probe
+                // gets a short budget, and a probe that misses it simply
+                // stays silent (the link can still be queued as new).
+                let probe = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.probe_refresh_candidate(&rec, url),
+                )
+                .await;
+                if let Ok(Ok((kept, total, _warning))) = probe {
+                    candidates.push(StaleCandidate {
+                        id: rec.id.clone(),
+                        name,
+                        state: rec.state,
+                        stale_reason: rec.stale_reason.clone(),
+                        kept,
+                        total,
+                    });
+                }
+            }
+            Ok(Reply::StaleCandidates { candidates })
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
+    }
+
     /// IDM's "refresh download address": an expiring signed URL can be
     /// replaced for the same file. The paused sidecar is re-pointed (byte
     /// offsets untouched) only after the new address passes the same-file
@@ -2719,23 +2832,10 @@ impl Daemon {
             // Dry run: pure read. A live runner keeps downloading while the
             // candidate address is probed and validated against the sidecar.
             if probe_only {
-                let engine =
-                    Engine::new(self.engine_config(&rec.headers, false)).map_err(|e| e.to_string())?;
-                let info = engine.plan(url).await.map_err(|e| e.to_string())?;
-                let (kept, total, warning) = match find_sidecar(&rec, &self.sidecar_dirs(&rec)) {
-                    Some((dest, state)) => {
-                        let check = ripdl_core::refresh::check_compatible(&dest, &state, &info)
-                            .map_err(|e| e.to_string())?;
-                        (
-                            ripdl_core::refresh::kept_bytes(&state),
-                            info.total,
-                            check.warning,
-                        )
-                    }
-                    // Nothing planned yet: nothing to keep, nothing to
-                    // conflict - the probe itself is the whole verdict.
-                    None => (rec.downloaded, info.total, None),
-                };
+                let (kept, total, warning) = self
+                    .probe_refresh_candidate(&rec, url)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 return Ok(Reply::Refreshed {
                     id: id.to_string(),
                     kept,
@@ -6104,6 +6204,113 @@ mod tests {
         assert_eq!(data.len(), TOTAL);
         for (i, b) in data.iter().enumerate() {
             assert_eq!(*b, (i as u64 % 251) as u8, "byte {i} corrupted");
+        }
+    }
+
+    /// The extension's offer: a fresh link matches unfinished tasks by file
+    /// name, and every offered candidate has already passed the refresh gate
+    /// (same name + size through the probe), so "keeps X" is real.
+    #[tokio::test]
+    async fn stale_candidates_match_by_name_and_confirm_by_probe() {
+        use std::sync::atomic::AtomicBool;
+
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let forbidden = Arc::new(AtomicBool::new(false));
+        let base = spawn_refresh_server(Arc::clone(&forbidden), Some(4096)).await;
+
+        let (daemon, dir) = proposal_daemon("cands");
+        // Two tasks serving the same file name from different URLs (the
+        // duplicate rule keys on the URL, not the name), each in its own
+        // folder - a task owns its sidecar, so same-name tasks must not
+        // share one.
+        let mut ids = Vec::new();
+        for (n, q) in [(1, "t=1"), (2, "x=1")] {
+            let resp = daemon.cmd_add(
+                n,
+                format!("{base}/file.bin?{q}"),
+                Some(dir.join(format!("t{n}"))),
+                HashMap::new(),
+                None,
+                TaskKind::Http,
+                false,
+                None,
+                DuplicatePolicy::Report,
+            );
+            let Reply::Added { id } = resp.reply else {
+                panic!("expected Added, got {:?}", resp.reply);
+            };
+            ids.push(id.clone());
+            let mut bytes = 0u64;
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if let Some(t) = daemon.task_info_for(&id) {
+                    bytes = t.downloaded;
+                    if bytes > 256 * 1024 {
+                        break;
+                    }
+                }
+            }
+            assert!(bytes > 256 * 1024, "task {n} never got going");
+            daemon.cmd_pause(n, &id).await;
+        }
+        let mut paused = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            paused = daemon
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.kind == TaskKind::Http)
+                .all(|r| r.state == TaskState::Paused);
+            if paused {
+                break;
+            }
+        }
+        assert!(paused, "tasks never paused");
+
+        // The fresh link, matched case-insensitively: both tasks qualify.
+        let resp = daemon
+            .cmd_stale_candidates(3, "File.Bin", &format!("{base}/file.bin?t=2"))
+            .await;
+        match resp.reply {
+            Reply::StaleCandidates { candidates } => {
+                assert_eq!(candidates.len(), 2, "capped at two");
+                for c in &candidates {
+                    assert_eq!(c.name, "file.bin");
+                    assert_eq!(c.state, TaskState::Paused);
+                    assert!(c.kept > 0, "the offer must carry real kept bytes");
+                    assert_eq!(c.total, Some(TOTAL));
+                }
+                assert!(
+                    candidates.iter().all(|c| ids.contains(&c.id)),
+                    "candidates must be the paused tasks"
+                );
+            }
+            other => panic!("expected StaleCandidates, got {other:?}"),
+        }
+
+        // A different file name: silence.
+        let resp = daemon
+            .cmd_stale_candidates(4, "other.bin", &format!("{base}/file.bin?t=2"))
+            .await;
+        match resp.reply {
+            Reply::StaleCandidates { candidates } => {
+                assert!(candidates.is_empty(), "unexpected candidates: {candidates:?}")
+            }
+            other => panic!("expected StaleCandidates, got {other:?}"),
+        }
+
+        // Same name, different size (the /small.bin endpoint): the gate
+        // rejects it, so the link is not offered as a refresh.
+        let resp = daemon
+            .cmd_stale_candidates(5, "file.bin", &format!("{base}/small.bin"))
+            .await;
+        match resp.reply {
+            Reply::StaleCandidates { candidates } => {
+                assert!(candidates.is_empty(), "unexpected candidates: {candidates:?}")
+            }
+            other => panic!("expected StaleCandidates, got {other:?}"),
         }
     }
 }

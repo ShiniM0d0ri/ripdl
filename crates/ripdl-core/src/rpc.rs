@@ -351,6 +351,18 @@ pub enum Command {
         #[serde(default)]
         probe_only: bool,
     },
+    /// Which unfinished HTTP tasks could this fresh link be a re-download of?
+    /// The extension's copy capture asks before offering "Refresh existing
+    /// task": the daemon matches by file name (neither side learns the other
+    /// tasks' URLs) and confirms each candidate with the same gate the real
+    /// refresh runs, so the offer's "keeps X" is already validated. At most
+    /// two candidates come back; anything else stays silent.
+    StaleCandidates {
+        /// The fresh link's file name, matched case-insensitively.
+        name: String,
+        /// The fresh link itself, probed against each candidate.
+        url: String,
+    },
     /// Append more links to an existing bundle task ("I forgot part 7").
     /// New links must group under the bundle's own name; URLs already in
     /// the bundle are skipped. The bundle resumes afterwards so a
@@ -527,6 +539,12 @@ pub enum Reply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
     },
+    /// Answer to `StaleCandidates`: the unfinished tasks a fresh link can
+    /// refresh. Empty means "no match - offer a new download".
+    StaleCandidates {
+        #[serde(default)]
+        candidates: Vec<StaleCandidate>,
+    },
     /// Result of `AddBundleParts`: how many links actually joined the
     /// bundle (URLs already present are skipped).
     BundlePartsAdded {
@@ -673,6 +691,24 @@ pub struct LanSendInfo {
     pub done: bool,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// One unfinished task a fresh link can refresh. Already validated: the
+/// daemon probed the candidate link through the same gate a real refresh
+/// runs, so `kept`/`total` are the bytes the swap would actually keep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleCandidate {
+    pub id: String,
+    /// The task's file name (what matched).
+    pub name: String,
+    pub state: TaskState,
+    /// Why the address died (`auth` | `size`) when the task is stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Durable bytes on disk (kept, not re-downloaded).
+    pub kept: u64,
+    #[serde(default)]
+    pub total: Option<u64>,
 }
 
 /// Serializable view of one task for frontends.

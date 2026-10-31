@@ -612,9 +612,14 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       `stale(auth)`; GUI phase: amber "expired" row state (globe row button
       opens refresh), refresh dialog dry-run (`probe_only`) with an inline
       verdict strip before the swap, auto-resume after swap for a task that
-      was running, etag-change adopt-with-warning. Next: extension "refresh
-      existing task" one-tap; backlog: headers editing in the dialog,
-      AdoptNoRange salvage
+      was running, etag-change adopt-with-warning; extension phase: a
+      single-link copy capture that matches a paused/failed/stale task by
+      file name (`StaleCandidates`, daemon probes each candidate through the
+      refresh gate) offers "Refresh keeps X of Y" in the copy chip, one tap
+      swaps and resumes - plus the bridge fix that answers unknown commands
+      under the caller's id (a newer extension no longer stalls against an
+      older app). Backlog: duplicate-window refresh offer, headers editing
+      in the dialog, AdoptNoRange salvage
 - [x] Engine: sidecar reporter can no longer resurrect the sidecar after a
       successful run removed it (serialized writes; was a flaky CI gate)
 

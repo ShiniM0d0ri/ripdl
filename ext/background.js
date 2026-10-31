@@ -339,6 +339,33 @@ function singleGroup(link) {
     };
 }
 
+/** A single copied link may be a fresh address for something ripdl already
+ * has (an expired signed link, a paused task). The daemon matches by file
+ * name and probes the fresh link through the real refresh gate, so a
+ * returned candidate is verified; any older daemon that answers with an
+ * error simply yields no offer. One link only: a bundle capture is not a
+ * refresh scenario, and every copied link must not cost a probe. */
+async function refreshOfferFor(links) {
+    if (links.length !== 1) return null;
+    const url = links[0].url;
+    const name = links[0].filename || tailName(url);
+    const resp = await send({
+        id: `sc-${nextId++}`,
+        cmd: { type: "stale_candidates", name, url },
+    });
+    if (resp?.reply?.type !== "stale_candidates") return null;
+    const c = resp.reply.candidates && resp.reply.candidates[0];
+    if (!c) return null;
+    return {
+        id: c.id,
+        name: c.name,
+        state: c.state || "paused",
+        staleReason: c.stale_reason ?? null,
+        kept: c.kept ?? 0,
+        total: c.total ?? null,
+    };
+}
+
 function tailName(url) {
     try {
         const tail = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
@@ -439,8 +466,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const links = await keepRecognized(sanitizeLinks(msg.links));
             if (!links.length) return { groups: [], bundled: daemonBundles !== false };
             const preview = await previewGroups(links);
-            return { groups: preview.groups, bundled: preview.bundled, hostAlive };
+            const refresh = await refreshOfferFor(links);
+            return { groups: preview.groups, bundled: preview.bundled, refresh, hostAlive };
         });
+        return true; // async reply
+    }
+    if (msg?.type === "ripdl_refresh_task" && typeof msg.id === "string") {
+        // The chip's "Refresh existing task": the copied link replaces the
+        // matched task's dead address, and the task resumes - that click IS
+        // the intent to continue.
+        (async () => {
+            const resp = await send({
+                id: `rf-${nextId++}`,
+                cmd: { type: "refresh_url", id: msg.id, url: String(msg.url || ""), resume: true },
+            });
+            if (resp?.reply?.type === "refreshed") {
+                sendResponse({ ok: true, kept: resp.reply.kept ?? 0, total: resp.reply.total ?? null });
+            } else if (resp?.reply?.type === "error") {
+                sendResponse({ ok: false, error: resp.reply.message || "ripdl refused the refresh." });
+            } else {
+                setHostAlive(!!resp);
+                sendResponse({ ok: false, error: "ripdl is not running." });
+            }
+        })();
         return true; // async reply
     }
     if (msg?.type === "ripdl_offer_send") {

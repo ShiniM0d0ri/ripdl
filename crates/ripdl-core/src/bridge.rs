@@ -190,10 +190,21 @@ fn read_loop<R: Read, W: Write>(
                 }
             }
             Err(e) => {
-                // Unparseable frames cannot be correlated to an id; the only
-                // safe reply is a generic error under a synthetic id.
+                // Unparseable frames still owe the caller an answer under
+                // its own id - a newer extension's unknown Command variant
+                // lands here, and a synthetic id would leave it waiting out
+                // its full timeout on a reply it cannot correlate. The id
+                // is recovered as the bare string it is on the wire.
+                let id = serde_json::from_slice::<serde_json::Value>(&frame)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "<parse>".to_string());
                 let reply = NativeResponse {
-                    id: "<parse>".to_string(),
+                    id,
                     reply: Reply::Error {
                         message: format!("bad native request: {e}"),
                     },
@@ -641,7 +652,10 @@ mod tests {
             ..BridgeConfig::default()
         };
         let mut input = Vec::new();
-        for (id, url) in [("slow", "https://x/slow.zip"), ("fast", "https://x/fast.zip")] {
+        for (id, url) in [
+            ("slow", "https://x/slow.zip"),
+            ("fast", "https://x/fast.zip"),
+        ] {
             let req = NativeRequest {
                 id: id.to_string(),
                 cmd: add_cmd(url),
@@ -672,6 +686,31 @@ mod tests {
         let got = frames(&out);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "<parse>");
+        assert!(matches!(got[0].reply, Reply::Error { .. }));
+    }
+
+    /// A valid envelope carrying a command this host does not know (a newer
+    /// extension talking to an older app) must answer under the caller's own
+    /// id: a synthetic id leaves the extension waiting out its full timeout
+    /// on a reply it cannot correlate, and every offer on the page stalls.
+    #[test]
+    fn unknown_command_answers_under_the_callers_id() {
+        let mut input = Vec::new();
+        write_frame(
+            &mut input,
+            br#"{"id":"sc-7","cmd":{"type":"command_from_a_newer_extension"}}"#,
+        )
+        .unwrap();
+        let config = BridgeConfig {
+            spawn_daemon: false,
+            use_pipe: false,
+            ..BridgeConfig::default()
+        };
+        let out = SharedBuf::default();
+        serve_with(config, Cursor::new(input), out.clone()).unwrap();
+        let got = frames(&out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "sc-7", "the caller's id must survive");
         assert!(matches!(got[0].reply, Reply::Error { .. }));
     }
 

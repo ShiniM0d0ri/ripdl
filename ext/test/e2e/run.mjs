@@ -956,7 +956,11 @@ async function extPhase() {
             await closeDupWindows();
             await selectNode("slow");
             await copyKeys();
-            await until("the B10 offer", offerReady, 10000);
+            const c = await until("the B10 offer", offerReady, 10000);
+            // The copied link names a paused task: the chip must offer the
+            // refresh instead of just a second copy (phase: link refresh).
+            check("B10 the chip offers the matched task's refresh", c.text.includes("already in ripdl"), squash(c.text));
+            evidence.b10Offer = squash(c.text);
             await clickChip("Send");
             const dup = await dupWindow();
             check("B10 duplicate window opened for the paused download", !!dup);

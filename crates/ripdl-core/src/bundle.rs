@@ -273,7 +273,7 @@ fn is_http(url: &str) -> bool {
 }
 
 /// Last path segment, percent-decoded, query and fragment dropped.
-fn url_tail(url: &str) -> String {
+pub fn url_tail(url: &str) -> String {
     let no_frag = url.split('#').next().unwrap_or(url);
     let no_query = no_frag.split('?').next().unwrap_or(no_frag);
     let tail = no_query.rsplit('/').next().unwrap_or(no_query);

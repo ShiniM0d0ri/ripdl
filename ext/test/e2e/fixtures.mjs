@@ -59,6 +59,20 @@ export function startFixtures({ files, page }) {
 
 function serve(kind, name, entry, req, res, hit) {
     const buf = entry.buf;
+    // A HEAD on the throttled path must answer at once: node flushes headers
+    // with the first body write, and a HEAD has none - the header block would
+    // otherwise wait for the whole body drain (a client probe reads that as a
+    // 15 s server). Other kinds end() immediately anyway.
+    if (kind === "slow" && req.method === "HEAD") {
+        hit.status = 200;
+        res.writeHead(200, {
+            "Content-Type": "application/octet-stream",
+            "Accept-Ranges": "bytes",
+            "Content-Length": buf.length,
+        });
+        res.end();
+        return;
+    }
     if (kind === "norange") {
         hit.status = 200;
         res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": buf.length });

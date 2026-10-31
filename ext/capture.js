@@ -245,10 +245,55 @@
         }
         const singles = linkCount() - multiGroups().reduce((n, g) => n + g.parts.length, 0);
         if (singles) frag.append(el("div", ROW, `${singles} single download${singles === 1 ? "" : "s"}`));
+        if (offer.refresh) frag.append(refreshRow());
         if (!offer.bundled) {
             frag.append(el("div", NOTE, "This daemon predates bundles - the links are queued one by one."));
         }
         return frag;
+    }
+
+    /** One matched unfinished task: the copied link can refresh it instead of
+     * queueing a second copy. The daemon already probed the fresh link
+     * through the real refresh gate, so "keeps X" is a verified number. */
+    function refreshRow() {
+        const r = offer.refresh;
+        const state = r.state === "stale" ? "expired" : r.state;
+        const done = r.kept
+            ? `${humans(r.kept)}${r.total ? " of " + humans(r.total) : ""} already on disk`
+            : "nothing on disk yet";
+        const row = el("div", ROW);
+        const label = el("span", "flex: 1; min-width: 0;", "");
+        label.append(
+            el("div", NOTE, `\u21bb ${r.name} is already in ripdl (${state})`),
+            el("div", QUIET, `Refresh keeps ${done}.`)
+        );
+        row.append(label, button("Refresh", BTN, "#e6eaee", () => doRefresh()));
+        return row;
+    }
+
+    /** Bytes the way ripdl everywhere else says them. */
+    function humans(n) {
+        const UNITS = ["B", "KB", "MB", "GB", "TB"];
+        let v = Number(n) || 0;
+        let u = 0;
+        while (v >= 1024 && u < UNITS.length - 1) { v /= 1024; u++; }
+        return `${v >= 100 ? Math.round(v) : v.toFixed(v >= 10 ? 1 : 2)} ${UNITS[u]}`;
+    }
+
+    /** Swap the copied link into the matched task; the daemon resumes it. */
+    function doRefresh() {
+        const r = offer.refresh;
+        const url = (offer.groups[0] && offer.groups[0].parts[0] && offer.groups[0].parts[0].url) || "";
+        showStatus("refreshing\u2026", "", false);
+        chrome.runtime.sendMessage({ type: "ripdl_refresh_task", id: r.id, url }, (resp) => {
+            if (chrome.runtime.lastError || !resp || !resp.ok) {
+                showStatus("refresh failed", (resp && resp.error) || "ripdl could not refresh it.", true);
+                return;
+            }
+            const kept = resp.kept ? ` Kept ${humans(resp.kept)}${resp.total ? " of " + humans(resp.total) : ""}.` : "";
+            showStatus("address refreshed - resuming", `ripdl continues where it stopped.${kept}`, false);
+            setTimeout(dismiss, 2500);
+        });
     }
 
     /** "x - 3 of 7 parts" (plus the numbers the selection skipped). */

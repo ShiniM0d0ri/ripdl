@@ -212,3 +212,37 @@ Extend the hand-rolled mock server in `crates/ripdl-core/tests/`:
 - Deferred: headers/cookies editing in the dialog (rarely the blocker; the
   extension capture supplies cookies) and `AdoptNoRange` salvage - both stay
   in the backlog list below.
+
+### Phase 3
+
+- `Command::StaleCandidates { name, url }` → `Reply::StaleCandidates {
+  candidates: Vec<StaleCandidate> }`: the daemon matches unfinished
+  (paused/failed/stale) HTTP tasks by file name - the planned output file's
+  basename, else the URL's last path segment (`ripdl_core::bundle::url_tail`,
+  now public) - case-insensitively, caps the list at two, and validates each
+  candidate with the same gate the real refresh runs (the GUI dry-run's
+  `probe_refresh_candidate`, factored out of `cmd_refresh_url`). A candidate
+  probe gets a 5 s budget: a slow host must not hold the user's copy chip.
+  A rejected or slow candidate simply stays silent.
+- Extension: for a single-link copy capture the background asks for
+  candidates and adds `refresh` to the offer; the copy chip shows one row -
+  "↻ <name> is already in ripdl (<state>) / Refresh keeps X of Y already on
+  disk" - with a Refresh button. Clicking sends `refresh_url` with
+  `resume: true` (the click IS the intent to continue; the daemon's
+  was-running auto-resume covers the rest). Multi-link captures skip the
+  lookup: a bundle is not a refresh scenario and no probe should ride on a
+  bulk copy. Older daemons answer the unknown command with an error → no
+  offer, never a failure.
+- Bridge fix the work uncovered: a native frame whose Command fails to
+  deserialize (a newer extension talking to an older app) is now answered
+  under the CALLER's id instead of the synthetic `"<parse>"` - the old
+  behavior left the extension waiting out its full 15 s timeout on a reply
+  it could not correlate, stalling every single-link offer on the page
+  (`bridge.rs`, test `unknown_command_answers_under_the_callers_id`).
+- E2E: B10 gained a check - copying a paused task's link shows the refresh
+  row (65 checks now). The slow fixture answers HEADs immediately (node
+  flushes headers with the first body write; a HEAD has none, so the header
+  block used to wait out the entire throttled body drain).
+- Deferred (unchanged backlog): the duplicate window could offer "Refresh
+  with this link" for matched stale tasks; the popup hunt rows do not match
+  candidates.

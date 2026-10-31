@@ -1212,6 +1212,19 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                 total.map(humans).unwrap_or_else(|| "?".to_string())
             );
         }
+        // Askable only through the extension's capture; the CLI has no
+        // surface for it yet.
+        Reply::StaleCandidates { candidates } => {
+            for c in candidates {
+                println!(
+                    "{} ({}) keeps {} of {}",
+                    c.name,
+                    c.id,
+                    humans(c.kept),
+                    c.total.map(humans).unwrap_or_else(|| "?".to_string())
+                );
+            }
+        }
         Reply::BundlePreview { groups } => {
             if groups.is_empty() {
                 println!("no usable links");
