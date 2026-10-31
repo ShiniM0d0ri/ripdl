@@ -296,6 +296,17 @@ impl Engine {
             // in place - no per-write grow/metadata events, contiguous
             // allocation on NTFS (disk-toll rule C9b). Never truncate a
             // resumed file: only extend when it is shorter than planned.
+            // Sparse on Windows: without it, the first writes into the
+            // preallocated span trigger NTFS zero-fill storms (every byte
+            // below the write offset until the valid-data length catches
+            // up) - measured as ~800 MB/s multi-second write bursts on a
+            // DRAM-less NVMe at task start, the "everything lags when a
+            // new download starts" report. A sparse hole reads as zeros
+            // by definition, so the file system allocates only what is
+            // actually written and the reserved-space confusion (a 53%
+            // task showing the full 50 GiB in Explorer) goes away too.
+            #[cfg(windows)]
+            mark_sparse(&f);
             let len = f.metadata()?.len();
             if let Some(total) = info.total {
                 if len < total {
@@ -1383,8 +1394,33 @@ fn write_sidecar_bytes(path: &Path, json: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Mark the download file sparse (NTFS). Best effort: a failure leaves
+/// the ordinary preallocated behavior in place, the download is unaffected.
+/// See the call site for why the zero-fill storm makes this mandatory.
+#[cfg(windows)]
+fn mark_sparse(f: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            f.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
 /// The sidecar is internal bookkeeping sitting next to the user's download;
 /// mark it hidden on Windows so it stays out of the Explorer view. The
+/// rename installs the fresh (non-hidden) temp file as the new sidecar, so
+/// the attribute must be re-applied after every write. Best effort: a
 /// rename installs the fresh (non-hidden) temp file as the new sidecar, so
 /// the attribute must be re-applied after every write. Best effort: a
 /// failure to set it changes nothing about the resume data.
@@ -1454,6 +1490,60 @@ mod tests {
         let plan = plan_fresh(&info(Some(1024 * 1024 * 500), false), &cfg);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].end, UNBOUNDED);
+    }
+
+    /// Sparse preallocation: extending the file to its planned size must not
+    /// materialize clusters for data that was never downloaded, and a write
+    /// deep in the file must allocate only its own bytes (no zero-fill of
+    /// everything before it). Windows only - Unix truncate is already holey.
+    #[test]
+    #[cfg(windows)]
+    fn sparse_preallocation_allocates_only_written_bytes() {
+        use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+        let dir = std::env::temp_dir().join(format!("ripdl-sparse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("sparse.bin");
+        let big = 64 * 1024 * 1024u64;
+        {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&dest)
+                .unwrap();
+            mark_sparse(&f);
+            f.set_len(big).unwrap();
+        }
+        let allocated = |p: &std::path::Path| {
+            use std::os::windows::ffi::OsStrExt as _;
+            let mut wide: Vec<u16> = p
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut high = 0u32;
+            let low = unsafe { GetCompressedFileSizeW(wide.as_mut_ptr(), &mut high) };
+            assert_ne!(low, u32::MAX, "GetCompressedFileSizeW failed");
+            ((high as u64) << 32) | low as u64
+        };
+        let empty = allocated(&dest);
+        assert!(
+            empty <= 1024 * 1024,
+            "sparse preallocation must not materialize 64 MiB, got {empty} allocated"
+        );
+        // A single write near the end of the span: only its own clusters.
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&dest).unwrap();
+            use std::io::Seek as _;
+            f.seek(std::io::SeekFrom::Start(big - 4096)).unwrap();
+            std::io::Write::write_all(&mut f, &[0xABu8; 4096]).unwrap();
+        }
+        let after = allocated(&dest);
+        assert!(
+            after <= 4 * 1024 * 1024,
+            "one tail write must not zero-fill the span, got {after} allocated"
+        );
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The sidecar is bookkeeping next to the user's file: hidden on Windows,
