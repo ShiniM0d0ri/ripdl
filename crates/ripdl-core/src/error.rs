@@ -10,6 +10,13 @@ pub enum Error {
     #[error("server error: {0}")]
     Server(String),
 
+    /// The server turned the request away with an auth-class status
+    /// (401/403/404/410). Structured so the daemon can tell a dead link
+    /// (address expired) apart from a broken transfer and park the task
+    /// `stale` instead of `failed` - see `retry::is_auth_status`.
+    #[error("server returned {0}")]
+    HttpStatus(u16),
+
     /// Upstream library failure (librqbit etc. report via anyhow).
     #[error("{0:#}")]
     Anyhow(#[from] anyhow::Error),

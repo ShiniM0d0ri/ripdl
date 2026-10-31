@@ -13,6 +13,12 @@ pub enum TaskState {
     Completed,
     Failed,
     Cancelled,
+    /// The bytes on disk are fine but the address is not (an expired signed
+    /// link answers 401/403/404/410). Not `failed`: nothing about the
+    /// transfer is broken - the user re-grabs a fresh link and refreshes the
+    /// task's address (see `crate::refresh`). Parked like Paused: no runner,
+    /// no auto-retry, survives a daemon restart as-is.
+    Stale,
 }
 
 /// The tool that performs the task: plain HTTP range requests, the

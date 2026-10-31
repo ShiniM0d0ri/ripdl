@@ -39,14 +39,44 @@ pub fn rate_limited_status(code: u16) -> bool {
     matches!(code, 429 | 503)
 }
 
+/// Auth-class replies: the address refuses to serve the file at all. On a
+/// task that already has bytes this reads as "the signed link expired" - the
+/// transfer itself is fine. A mid-flight 403 from a CDN hiccup still gets
+/// re-probed before the daemon parks the task (see the daemon's link-death
+/// classification), so this class only marks the *confirmed* dead address.
+pub fn is_auth_status(code: u16) -> bool {
+    matches!(code, 401 | 403 | 404 | 410)
+}
+
+/// The error carries an auth-class HTTP status (structured or wrapped).
+pub fn is_auth(e: &Error) -> bool {
+    status_of(e).is_some_and(is_auth_status)
+}
+
+/// The HTTP status an error carries, when any: the structured variant the
+/// engine emits for terminal auth answers, or a reqwest error's own status.
+pub fn status_of(e: &Error) -> Option<u16> {
+    match e {
+        Error::HttpStatus(c) => Some(*c),
+        Error::Http(h) => h.status().map(|s| s.as_u16()),
+        _ => None,
+    }
+}
+
 /// Only transport-level failures and transient HTTP statuses retry. Failing
 /// the whole task on 408/429/5xx punished parallel segments for a temporary
 /// condition, e.g. a per-IP quota tripped by eight range requests. Terminal:
 /// other 4xx, disk errors, size mismatches.
+///
+/// Auth-class statuses (401/403/404/410) retry too, on the ordinary budget:
+/// a CDN answers one stray 403 and then serves again. When the budget runs
+/// out the terminal branch reports the status structurally, and the daemon
+/// re-probes before parking the task `stale` - a dead link is a parked
+/// download, not a failed one.
 pub fn is_retryable(e: &Error) -> bool {
     match e {
         Error::Http(h) => match h.status() {
-            Some(s) => retryable_status(s.as_u16()),
+            Some(s) => retryable_status(s.as_u16()) || is_auth_status(s.as_u16()),
             None => true,
         },
         Error::ShortSegment { .. } => true,

@@ -21,6 +21,7 @@ fn state_label(s: ripdl_core::TaskState) -> &'static str {
         Failed => "failed",
         Completed => "completed",
         Cancelled => "cancelled",
+        Stale => "stale",
     }
 }
 
@@ -1253,6 +1254,12 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                 if t.state == ripdl_core::TaskState::Running && t.probing {
                     // Still probing the URL / planning segments: no bytes yet.
                     state = "connecting".to_string();
+                }
+                if t.state == ripdl_core::TaskState::Stale {
+                    // Why the address died, when the task says (`stale(auth)`).
+                    if let Some(reason) = &t.stale_reason {
+                        state = format!("stale({reason})");
+                    }
                 }
                 if let Some(start) = t.start_at {
                     if start > now && matches!(t.state, ripdl_core::TaskState::Queued) {

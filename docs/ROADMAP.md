@@ -605,6 +605,14 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       protocol handler
 - [ ] Diagnostics: every failed task exposes a reason + "copy diagnostics"
       (URL, headers without secrets, last error)
+- [ ] Link refresh as a system (docs/plan-refresh.md): signed links expire;
+      the engine reports auth-class answers structurally and the daemon parks
+      the task `stale` (bytes kept) instead of `failed`. Landed: `stale`
+      state + `stale_reason` (auth/size) with a confirming probe, CLI
+      `stale(auth)`, GUI row mapping. Next: GUI dry-run refresh dialog,
+      extension "refresh existing task" one-tap
+- [x] Engine: sidecar reporter can no longer resurrect the sidecar after a
+      successful run removed it (serialized writes; was a flaky CI gate)
 
 ## P9 - same-network transfer (LAN drop box)
 

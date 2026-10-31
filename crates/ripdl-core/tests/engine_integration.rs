@@ -100,6 +100,10 @@ struct ServerState {
     stall_after_bytes: u64,
     stall_times: usize,
     stalled: AtomicUsize,
+    /// Once set, every request answers 403: the signed link expired. The
+    /// engine must report the status structurally (`Error::HttpStatus`) so
+    /// the daemon can park the task `stale` instead of `failed`.
+    forbidden: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
@@ -192,6 +196,16 @@ async fn serve(state: Arc<ServerState>, mut sock: TcpStream) -> std::io::Result<
     }
 
     let etag = etag_of(&state);
+
+    // Expired signed link: every request is turned away until the test flips
+    // the flag back.
+    if state.forbidden.load(std::sync::atomic::Ordering::SeqCst) {
+        sock.write_all(
+            b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // Host-level quota: refuse the first N requests outright, HEAD included.
     // The probe must treat that as transient instead of failing the task.
@@ -408,6 +422,7 @@ async fn multi_segment_exact_bytes() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -461,6 +476,7 @@ async fn rate_limited_ranges_back_off_and_finish() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -512,6 +528,7 @@ async fn probe_retries_host_quota_and_starts() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -559,6 +576,7 @@ async fn bonded_segments_cycle_interfaces() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -615,6 +633,7 @@ async fn bonded_single_extra_address_still_binds() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -665,6 +684,7 @@ async fn quarantined_bond_link_falls_back_unbound() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -721,6 +741,7 @@ async fn shared_bond_state_flows_into_the_engine() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -791,6 +812,7 @@ async fn bonded_stream_credit_releases_on_cancel() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -866,6 +888,7 @@ async fn bonded_no_range_single_stream_meters_one_link() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -915,6 +938,7 @@ async fn bonded_ipv6_loopback_ranges_bind() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server_on("[::1]:0", Arc::clone(&state)).await;
 
@@ -967,6 +991,7 @@ async fn bonded_speed_limit_holds() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1022,6 +1047,7 @@ async fn bonded_engine_serves_two_tasks_concurrently() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1093,6 +1119,7 @@ async fn stalled_connection_recovers_via_watchdog() {
         stall_after_bytes: 64 * KIB,
         stall_times: 8,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1143,6 +1170,7 @@ async fn dropped_connection_recovered_by_retry() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1181,6 +1209,7 @@ async fn no_ranges_falls_back_to_single_stream() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1226,6 +1255,7 @@ async fn bare_head_still_discovers_ranges() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1289,6 +1319,7 @@ async fn freed_worker_steals_from_the_largest_straggler() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1360,6 +1391,7 @@ async fn pause_resumes_from_sidecar() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1448,6 +1480,7 @@ async fn speed_limit_paces_download() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1509,6 +1542,7 @@ async fn speed_limit_applies_to_single_stream() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1567,6 +1601,7 @@ async fn legacy_unbounded_sidecar_reranges_on_resume() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1647,6 +1682,7 @@ async fn refreshed_address_resumes_from_sidecar() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let base = spawn_server(Arc::clone(&state)).await;
     let old = format!("{base}?token=old");
@@ -1738,6 +1774,7 @@ async fn stale_etag_forces_fresh_restart() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1836,6 +1873,7 @@ async fn carries_headers_and_uses_cd_filename() {
         stall_after_bytes: 0,
         stall_times: 0,
         stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
     });
     let url = spawn_server(Arc::clone(&state)).await;
 
@@ -1884,5 +1922,93 @@ async fn carries_headers_and_uses_cd_filename() {
     assert!(
         !seen.iter().any(|h| h.starts_with("user-agent: ripdl/")),
         "default UA leaked past the override, saw {seen:?}"
+    );
+}
+
+/// An expired signed link is a *stale* download, not a failed one: once the
+/// host starts answering 401/403/404/410, the engine reports the status
+/// structurally (`Error::HttpStatus`) instead of a generic server error, the
+/// sidecar with its byte offsets stays intact, and flipping the link back to
+/// life lets the same download finish byte-for-byte. The daemon turns the
+/// structured status into the `stale` task state (see its own tests).
+#[tokio::test]
+async fn expired_link_reports_auth_status_and_keeps_sidecar() {
+    let state = Arc::new(ServerState {
+        total: 4 * MIB,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    let engine = test_engine();
+    let tmp = temp_dir("stale");
+
+    // Pull some bytes, then pause: the sidecar now holds real progress.
+    let token = CancellationToken::new();
+    let killer = token.clone();
+    let res = engine
+        .download(&url, Some(tmp.clone()), token, move |p| {
+            if p.downloaded >= 12 * 131_072 {
+                killer.cancel();
+            }
+        })
+        .await;
+    assert!(matches!(res, Err(ripdl_core::Error::Cancelled)), "{res:?}");
+    let dest = tmp.join("file.bin");
+    let st = ripdl_core::refresh::load(&dest)
+        .expect("sidecar readable")
+        .expect("sidecar exists after cancel");
+    let kept = ripdl_core::refresh::kept_bytes(&st);
+    assert!(kept > 0, "pause must have left durable progress");
+
+    // The link expires: every further request answers 403.
+    state
+        .forbidden
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let res = engine
+        .download(&url, Some(tmp.clone()), CancellationToken::new(), move |_p| {})
+        .await;
+    match res {
+        Err(ripdl_core::Error::HttpStatus(403)) => {}
+        other => panic!("expected the structured auth status, got {other:?}"),
+    }
+    // Nothing about the bytes changed: the sidecar keeps its offsets.
+    let st2 = ripdl_core::refresh::load(&dest)
+        .expect("sidecar readable")
+        .expect("sidecar survives the dead link");
+    assert_eq!(ripdl_core::refresh::kept_bytes(&st2), kept);
+
+    // The link is alive again (a re-grabbed token): the same task completes.
+    state
+        .forbidden
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let done = engine
+        .download(&url, Some(tmp.clone()), CancellationToken::new(), move |_p| {})
+        .await
+        .expect("resume after the link came back");
+    assert_eq!(done, dest);
+    verify(&dest, 4 * MIB);
+    let names = dir_names(&dest.parent().unwrap());
+    assert!(
+        !names.iter().any(|n| n.ends_with(".ripdl.json")),
+        "sidecar must be removed on success: {names:?}"
     );
 }

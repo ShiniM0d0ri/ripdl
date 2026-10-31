@@ -26,6 +26,11 @@ struct TaskRecord {
     state: TaskState,
     #[serde(default)]
     error: Option<String>,
+    /// Why a `stale` task's address died (`auth` | `size` | `name` |
+    /// `login`). Cleared when the task runs again or its address is
+    /// refreshed.
+    #[serde(default)]
+    stale_reason: Option<String>,
     /// Extra engine headers (persisted so resume replays them).
     #[serde(default)]
     headers: std::collections::HashMap<String, String>,
@@ -322,6 +327,12 @@ struct LanSendState {
 /// defaults) live on the core type so every frontend reads the same file
 /// the same way.
 type DaemonConfig = ripdl_core::rpc::DaemonSettings;
+
+/// Why a confirmed link death parks a task, beyond plain auth answers.
+enum StaleCause {
+    Auth,
+    Changed { new: u64, old: u64 },
+}
 
 impl Daemon {
     fn new(queue_path: PathBuf, config_path: PathBuf, config: DaemonConfig) -> Result<Self> {
@@ -2096,6 +2107,7 @@ impl Daemon {
             dest_dir,
             state: TaskState::Queued,
             error: None,
+            stale_reason: None,
             headers,
             start_at,
             kind,
@@ -2360,6 +2372,7 @@ impl Daemon {
             dest_dir,
             state: TaskState::Queued,
             error: None,
+            stale_reason: None,
             headers: Default::default(),
             start_at,
             kind: TaskKind::Bundle,
@@ -2648,6 +2661,7 @@ impl Daemon {
                     percent,
                     etag,
                     error: rec.error,
+                    stale_reason: rec.stale_reason,
                     segments,
                     parts: if is_bundle { rec.parts } else { Vec::new() },
                     bundle_name: rec.bundle_name,
@@ -2730,6 +2744,7 @@ impl Daemon {
                 r.url = url.to_string();
                 r.state = TaskState::Paused;
                 r.error = None;
+                r.stale_reason = None;
                 r.downloaded = kept;
                 if total.is_some() {
                     r.total = total;
@@ -3083,7 +3098,7 @@ impl Daemon {
         let action = {
             let mut records = self.records.lock().unwrap();
             match records.iter_mut().find(|r| r.id == id) {
-                Some(r) if matches!(r.state, TaskState::Paused | TaskState::Failed) => {
+                Some(r) if matches!(r.state, TaskState::Paused | TaskState::Failed | TaskState::Stale) => {
                     r.state = TaskState::Queued;
                     r.error = None;
                     Some(Resume::Run(r.clone()))
@@ -3742,18 +3757,99 @@ impl Daemon {
                     }
                 }
                 Err(Error::Cancelled) => this.set_state(&rec.id, TaskState::Paused, None),
-                Err(e) => this.set_state(&rec.id, TaskState::Failed, Some(e.to_string())),
+                Err(e) => this.park_stale_or_fail(&rec, &e).await,
             }
         });
     }
 
+    /// Park a task whose address died, or fail it the ordinary way.
+    ///
+    /// An auth-class answer (401/403/404/410, surfaced structurally by the
+    /// engine as `Error::HttpStatus`) on a task that already holds bytes
+    /// reads as "the signed link expired": the transfer is fine, the address
+    /// is not. One fresh probe confirms it - a CDN's one-off 403 must not
+    /// park a healthy task - and a changed file size parks the task too,
+    /// because an etag mismatch would otherwise restart the download from
+    /// zero and destroy the kept bytes. Everything else fails as before.
+    async fn park_stale_or_fail(self: &Arc<Self>, rec: &TaskRecord, e: &Error) {
+        let auth = ripdl_core::engine::retry::is_auth(e);
+        // Only plain HTTP downloads refresh their address; video tasks
+        // re-resolve through yt-dlp and torrents have no address to rot.
+        if rec.kind != TaskKind::Http || !auth {
+            self.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
+            return;
+        }
+        // A task with no bytes has no link to lose: a fresh add hitting 403
+        // is just a bad or expired URL. The live sample counts too - a first
+        // run may have pulled gigabytes before the host turned the remaining
+        // ranges away.
+        let bytes_held = rec.downloaded > 0
+            || self
+                .progress
+                .lock()
+                .unwrap()
+                .get(&rec.id)
+                .is_some_and(|t| t.last.downloaded > 0);
+        if !bytes_held {
+            self.set_state(&rec.id, TaskState::Failed, Some(e.to_string()));
+            return;
+        }
+        let verdict = match Engine::new(self.engine_config(&rec.headers, false)) {
+            Ok(engine) => match engine.plan(&rec.url).await {
+                Err(e2) if ripdl_core::engine::retry::is_auth(&e2) => {
+                    // Confirmed dead: the address answers auth-class again.
+                    Some(StaleCause::Auth)
+                }
+                Ok(info) => match (info.total, rec.total) {
+                    (Some(new), Some(old)) if new != old => Some(StaleCause::Changed { new, old }),
+                    _ => None,
+                },
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        match verdict {
+            Some(StaleCause::Auth) => {
+                self.set_stale(&rec.id, "auth", Some(e.to_string()));
+            }
+            Some(StaleCause::Changed { new, old }) => {
+                self.set_stale(
+                    &rec.id,
+                    "size",
+                    Some(format!(
+                        "the address now serves {new} bytes, but the download has {old} - the file changed on the server"
+                    )),
+                );
+            }
+            // The probe recovered (or could not answer): keep the ordinary
+            // failure; the user resumes when ready.
+            None => self.set_state(&rec.id, TaskState::Failed, Some(e.to_string())),
+        }
+    }
+
+    /// Park a task `stale`: bytes kept, no runner, no auto-retry, survives
+    /// restarts. Same record folding as Paused plus the reason.
+    fn set_stale(&self, id: &str, reason: &str, error: Option<String>) {
+        self.set_state_reason(id, TaskState::Stale, error, Some(reason.to_string()));
+    }
+
     fn set_state(&self, id: &str, state: TaskState, error: Option<String>) {
+        self.set_state_reason(id, state, error, None);
+    }
+
+    fn set_state_reason(
+        &self,
+        id: &str,
+        state: TaskState,
+        error: Option<String>,
+        reason: Option<String>,
+    ) {
         {
             let mut records = self.records.lock().unwrap();
             // Fold the last live sample into the record on pause: a torrent
             // has no sidecar, so without this a paused mid-flight task reads
             // "0 B / unknown" until the next daemon boot re-checks it.
-            let last = if state == TaskState::Paused {
+            let last = if matches!(state, TaskState::Paused | TaskState::Stale) {
                 self.progress.lock().unwrap().get(id).map(|t| {
                     (t.last.downloaded, t.last.total, t.last.dest_file.clone())
                 })
@@ -3764,6 +3860,11 @@ impl Daemon {
                 Some(r) => {
                     r.state = state;
                     r.error = error;
+                    match reason {
+                        Some(reason) => r.stale_reason = Some(reason),
+                        None if state == TaskState::Running => r.stale_reason = None,
+                        None => {}
+                    }
                     if let Some((downloaded, total, dest_file)) = last {
                         if downloaded > 0 {
                             r.downloaded = downloaded;
@@ -4271,6 +4372,7 @@ fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> Ta
         verifying,
         probing,
         error: r.error.clone(),
+        stale_reason: r.stale_reason.clone(),
         start_at: r.start_at,
         kind: r.kind,
         percent,
@@ -4540,6 +4642,7 @@ mod tests {
             output_name: None,
             state: TaskState::Completed,
             error: None,
+            stale_reason: None,
             headers: std::collections::HashMap::new(),
             start_at: None,
             kind: TaskKind::Http,
@@ -4704,6 +4807,7 @@ mod tests {
             dest_dir: Some(tmp.clone()),
             state: TaskState::Paused,
             error: None,
+            stale_reason: None,
             headers: Default::default(),
             start_at: None,
             kind: TaskKind::Http,
@@ -4746,6 +4850,7 @@ mod tests {
             dest_dir: Some(tmp.clone()),
             state: TaskState::Failed,
             error: None,
+            stale_reason: None,
             headers: Default::default(),
             start_at: None,
             kind: TaskKind::Http,
@@ -5342,6 +5447,7 @@ mod tests {
             dest_dir: Some(dest.clone()),
             state: TaskState::Completed,
             error: None,
+            stale_reason: None,
             headers: Default::default(),
             start_at: None,
             kind: TaskKind::Torrent,
@@ -5523,6 +5629,195 @@ mod tests {
         // every uplink.
         let w = weights_from_rates(&[(wifi, 500.0), (tether, 0.0)]);
         assert_eq!(w, vec![(wifi, 1), (tether, 1)]);
+    }
+    /// A dead link parks the task `stale`, not `failed`: after the host turns an
+    /// in-progress HTTP task away with 403, the daemon confirms with one probe
+    /// and parks it with reason `auth` - bytes and sidecar intact, no runner.
+    /// A refreshed address (or the link coming back) resumes the same bytes to
+    /// completion.
+    #[tokio::test]
+    async fn dead_link_parks_task_stale_and_refresh_recovers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const TOTAL: usize = 8 * 1024 * 1024;
+        let forbidden = Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let flag = Arc::clone(&forbidden);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let forbidden = Arc::clone(&flag);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut byte).await {
+                            Ok(1) => head.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head);
+                    if forbidden.load(Ordering::SeqCst) {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    let range = text
+                        .lines()
+                        .find_map(|l| {
+                            let l = l.to_ascii_lowercase();
+                            l.strip_prefix("range: bytes=")
+                                .and_then(|s| s.split_once('-'))
+                                .and_then(|(a, _)| a.trim().parse::<u64>().ok())
+                        });
+                    if text.starts_with("HEAD") {
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\netag: \"v1\"\r\ncontent-length: {TOTAL}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n"
+                        );
+                        let _ = sock.write_all(answer.as_bytes()).await;
+                        return;
+                    }
+                    let start = match range {
+                        Some(a) => a,
+                        None => 0,
+                    };
+                    // Paced in 64 KiB blocks so the test can pause
+                    // mid-flight deterministically (a full-speed 8 MiB would
+                    // complete before the pause command lands).
+                    let mut sent = start;
+                    while sent < TOTAL as u64 {
+                        let end = (sent + 64 * 1024).min(TOTAL as u64);
+                        let chunk: Vec<u8> = (sent..end).map(|i| (i % 251) as u8).collect();
+                        if sent == start {
+                            let head = format!(
+                                "HTTP/1.1 206 Partial Content\r\netag: \"v1\"\r\ncontent-range: bytes {start}-{}-{TOTAL}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                TOTAL as u64 - 1,
+                                TOTAL as u64 - start
+                            );
+                            let _ = sock.write_all(head.as_bytes()).await;
+                        }
+                        let _ = sock.write_all(&chunk).await;
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        sent = end;
+                    }
+                });
+            }
+        });
+
+        let (daemon, dir) = proposal_daemon("stale");
+        let url = format!("http://{addr}/file.bin?t=1");
+        let resp = daemon.cmd_add(
+            1,
+            url.clone(),
+            Some(dir.clone()),
+            HashMap::new(),
+            None,
+            TaskKind::Http,
+            false,
+            None,
+            DuplicatePolicy::Report,
+        );
+        let id = match resp.reply {
+            Reply::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+
+        // Wait for real progress, then pause: the sidecar holds bytes.
+        let mut progress = 0u64;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(t) = daemon.task_info_for(&id) {
+                progress = t.downloaded;
+                if progress > 0 {
+                    break;
+                }
+            }
+        }
+        assert!(progress > 0, "download never started");
+        daemon.cmd_pause(2, &id).await;
+        let mut paused = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if daemon
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id && r.state == TaskState::Paused)
+            {
+                paused = true;
+                break;
+            }
+        }
+        assert!(paused, "task never paused");
+
+        // The link dies. Resuming must park the task stale(auth), not failed.
+        forbidden.store(true, Ordering::SeqCst);
+        daemon.cmd_resume(3, &id);
+        let mut stale = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let hit = daemon.records.lock().unwrap().iter().find(|r| r.id == id).map(|r| {
+                (r.state == TaskState::Stale, r.stale_reason.clone(), r.error.clone())
+            });
+            if let Some((true, Some(reason), Some(err))) = hit {
+                assert_eq!(reason, "auth");
+                assert!(err.contains("403"), "error text: {err}");
+                stale = true;
+                break;
+            }
+            // A generic failure here would mean classification did not run.
+            assert!(
+                !daemon
+                    .records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.id == id && r.state == TaskState::Failed),
+                "dead link must park stale, not failed"
+            );
+        }
+        assert!(stale, "task never reached stale");
+
+        // The link comes back (fresh token): refresh the address, resume, done.
+        forbidden.store(false, Ordering::SeqCst);
+        let fresh = format!("http://{addr}/file.bin?t=2");
+        let resp = daemon.cmd_refresh_url(4, &id, &fresh, false, None).await;
+        assert!(
+            matches!(resp.reply, Reply::Refreshed { .. }),
+            "refresh failed: {:?}",
+            resp.reply
+        );
+        daemon.cmd_resume(5, &id);
+        let mut done = false;
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if daemon
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id && r.state == TaskState::Completed)
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "task never completed after the refresh");
+
+        // The bytes are the server's, complete and uncorrupted.
+        let dest = dir.join("file.bin");
+        let data = std::fs::read(&dest).expect("output file");
+        assert_eq!(data.len(), TOTAL);
+        for (i, b) in data.iter().enumerate() {
+            assert_eq!(*b, (i as u64 % 251) as u8, "byte {i} corrupted");
+        }
+        assert!(
+            !dir.join("file.bin.ripdl.json").exists(),
+            "sidecar must be gone on completion"
+        );
     }
 }
 

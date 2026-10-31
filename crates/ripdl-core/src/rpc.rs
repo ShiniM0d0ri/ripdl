@@ -704,6 +704,10 @@ pub struct TaskInfo {
     pub probing: bool,
     #[serde(default)]
     pub error: Option<String>,
+    /// Why a `stale` task's address died (`auth` | `size` | `name` | `login`).
+    /// Frontends use it for the row hint and the refresh dialog's copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
     /// Unix seconds when the task may start (None = immediately).
     #[serde(default)]
     pub start_at: Option<i64>,
@@ -795,6 +799,9 @@ pub struct TaskDetailsSnapshot {
     pub etag: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Why a `stale` task's address died (None for other states).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
     /// Segments from the resume sidecar (empty when the engine never
     /// planned, when the task finished, or for the yt-dlp sidecar).
     #[serde(default)]

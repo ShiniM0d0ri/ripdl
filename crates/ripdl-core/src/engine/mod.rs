@@ -308,6 +308,13 @@ impl Engine {
         let downloaded = Arc::new(AtomicU64::new(segments.iter().map(|s| s.done).sum()));
         let active = Arc::new(AtomicU64::new(segments.len() as u64));
         let finished = Arc::new(AtomicBool::new(false));
+        // Success-sidecar serialization: the fire-and-forget reporter and the
+        // run's success tail both touch the sidecar file. The reporter holds
+        // this mutex while writing; the tail takes it once, flips the stop
+        // flag, and only then removes the file - a tick that already passed
+        // the finished check can never resurrect the sidecar after a
+        // completed download (a flake that read as "paused" under load).
+        let sidecar_stop = Arc::new(tokio::sync::Mutex::new(false));
         // Shared in-flight cap: 429/503 (or refused connections) halve it, a
         // finished attempt doubles it back, so a quota storm ends up with one
         // connection instead of eight retries tripping the same limit.
@@ -382,6 +389,7 @@ impl Engine {
             let downloaded = downloaded.clone();
             let active = active.clone();
             let finished = finished.clone();
+            let sidecar_stop = sidecar_stop.clone();
             let state_path = state_path.clone();
             let meta_task = meta.clone();
             let dest_report = dest.clone();
@@ -432,10 +440,19 @@ impl Engine {
                         // responsive under antivirus/flush stalls.
                         if let Ok(json) = serde_json::to_vec(&file) {
                             let path = state_path.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                write_sidecar_bytes(&path, json)
-                            })
-                            .await;
+                            // Hold the sidecar lock across the write so the
+                            // success tail can never remove the file while
+                            // this write is in flight (and this tick can
+                            // never write after the tail removed it). A stop
+                            // seen here only skips the write; the loop's top
+                            // check still emits the final snapshot.
+                            let stop = sidecar_stop.lock().await;
+                            if !*stop {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    write_sidecar_bytes(&path, json)
+                                })
+                                .await;
+                            }
                         }
                     }
                     on_progress(Progress {
@@ -502,6 +519,13 @@ impl Engine {
             }
         }
 
+        // Success: no sidecar may survive this point. Take the sidecar lock
+        // (waits out any in-flight reporter write), latch the stop flag, then
+        // remove - the reporter cannot write again after this.
+        {
+            let mut stop = sidecar_stop.lock().await;
+            *stop = true;
+        }
         let _ = std::fs::remove_file(&state_path);
         Ok(dest)
     }
@@ -822,7 +846,16 @@ async fn run_segment(
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A segment the host turned away (401/403/404/410) reports the
+                // status structurally: the daemon re-probes and parks the task
+                // `stale` when the address is confirmed dead, instead of
+                // filing it under the generic failure pile.
+                if let Some(code) = retry::status_of(&e).filter(|c| retry::is_auth_status(*c)) {
+                    return Err(Error::HttpStatus(code));
+                }
+                return Err(e);
+            }
         }
     }
 }

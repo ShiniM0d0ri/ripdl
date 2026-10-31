@@ -49,7 +49,13 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
         };
         let status = resp.status();
         if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
-            let err = Error::Server(format!("server returned {status}"));
+            let err = if super::retry::is_auth_status(status.as_u16()) {
+                // Structured: the daemon uses this to park a task with bytes
+                // as `stale` (expired signed link) instead of `failed`.
+                Error::HttpStatus(status.as_u16())
+            } else {
+                Error::Server(format!("server returned {status}"))
+            };
             if !super::retry::retryable_status(status.as_u16()) {
                 return Err(err);
             }

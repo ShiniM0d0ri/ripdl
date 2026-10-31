@@ -288,6 +288,9 @@ function kindCell(t) {
 const STATUS_ICON = {
     completed: ico("check"), running: ico("download"), queued: ico("clock"),
     timed: ico("clock"), paused: ico("pause"), failed: ico("alert"),
+    // Parked like paused (the bytes are fine, the link is not): phase 2 gives
+    // the stale chip its own amber treatment and a refresh affordance.
+    stale: ico("pause"),
     cancelled: ico("x"), hunt: ico("film"), downloading: ico("download"),
     verifying: ico("search"), seeding: ico("up"), metadata: ico("globe"),
     connecting: ico("globe"),
@@ -480,7 +483,7 @@ function setSort(key) {
 
 const STATE_RANK = {
     running: 0, hunt: 1, verifying: 2, connecting: 2, metadata: 3, queued: 4, timed: 5,
-    seeding: 6, paused: 7, failed: 8, completed: 9, cancelled: 10,
+    seeding: 6, paused: 7, stale: 8, failed: 9, completed: 10, cancelled: 11,
 };
 const KIND_RANK = { torrent: 0, bundle: 1, http: 2, video: 3 };
 
@@ -750,7 +753,7 @@ function render() {
         const name = rowName(t);
         const state = stateLabel(t);
         const pct = percentOf(t);
-        const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "timed"].includes(state) ? "paused" : "");
+        const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "stale", "timed"].includes(state) ? "paused" : "");
         const parts = partsText(t);
         const partsSpan = parts ? `<span class="parts">${parts}</span>` : "";
         const prog = pct == null
@@ -850,7 +853,7 @@ function toggleIntent(t) {
     if (t.state === "completed") {
         return t.kind === "torrent" ? (t.seeding ? "pause" : "resume") : null;
     }
-    if (["paused", "failed", "timed"].includes(t.state)) return "resume";
+    if (["paused", "failed", "stale", "timed"].includes(t.state)) return "resume";
     return null;
 }
 
@@ -1317,7 +1320,7 @@ function scheduleUplinks() {
 let dlgDestTouched = false;
 
 async function resumeAll() {
-    for (const t of tasks.filter((x) => ["paused", "failed", "timed"].includes(x.state))) {
+    for (const t of tasks.filter((x) => ["paused", "failed", "stale", "timed"].includes(x.state))) {
         try { await invokeSafe("resume_task", { id: t.id }); } catch (e) { flashErr(String(e)); break; }
     }
     poll();
