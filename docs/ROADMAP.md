@@ -609,8 +609,12 @@ M3.5 - seeding lifecycle + post-download visibility (2026-10-19):
       the engine reports auth-class answers structurally and the daemon parks
       the task `stale` (bytes kept) instead of `failed`. Landed: `stale`
       state + `stale_reason` (auth/size) with a confirming probe, CLI
-      `stale(auth)`, GUI row mapping. Next: GUI dry-run refresh dialog,
-      extension "refresh existing task" one-tap
+      `stale(auth)`; GUI phase: amber "expired" row state (globe row button
+      opens refresh), refresh dialog dry-run (`probe_only`) with an inline
+      verdict strip before the swap, auto-resume after swap for a task that
+      was running, etag-change adopt-with-warning. Next: extension "refresh
+      existing task" one-tap; backlog: headers editing in the dialog,
+      AdoptNoRange salvage
 - [x] Engine: sidecar reporter can no longer resurrect the sidecar after a
       successful run removed it (serialized writes; was a flaky CI gate)
 

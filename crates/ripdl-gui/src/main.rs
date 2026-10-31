@@ -805,22 +805,31 @@ struct RefreshOutcome {
     /// Durable bytes kept on disk.
     kept: u64,
     total: Option<u64>,
+    /// Dry-run only (`probe_only`): why the kept bytes might not line up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 /// Point a paused/failed download at a fresh URL (expired signed link) and
 /// resume it: the daemon keeps the bytes already downloaded. `part` targets
 /// one part of a bundle (by its part number) instead of the whole task.
 #[tauri::command]
-async fn refresh_url(id: String, url: String, part: Option<u32>) -> Result<RefreshOutcome, String> {
+async fn refresh_url(
+    id: String,
+    url: String,
+    part: Option<u32>,
+    probe_only: Option<bool>,
+) -> Result<RefreshOutcome, String> {
     match rpc(Command::RefreshUrl {
         id,
         url,
         resume: true,
         part,
+        probe_only: probe_only.unwrap_or(false),
     })
     .await?
     {
-        Reply::Refreshed { kept, total, .. } => Ok(RefreshOutcome { kept, total }),
+        Reply::Refreshed { kept, total, warning, .. } => Ok(RefreshOutcome { kept, total, warning }),
         Reply::Error { message } => Err(message),
         other => Err(format!("unexpected daemon reply: {other:?}")),
     }

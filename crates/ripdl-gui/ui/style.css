@@ -215,6 +215,9 @@ td.prog-cell .parts { margin-left: 8px; color: var(--amber); }
 .st-ico .ico { width: 13px; height: 13px; }
 .st-err { color: var(--red); font-weight: 400; font-size: 11px; max-width: 150px; white-space: normal; line-height: 1.15; }
 .st-timed { color: var(--amber); font-weight: 650; }
+/* Expired link: same amber family as "timed" (the bytes are safe, the
+ * address is not). The row's globe button opens the refresh dialog. */
+.st-expired { color: var(--amber); font-weight: 650; }
 .st-verifying { color: #65589a; font-weight: 650; }
 .st-connecting { color: var(--blue); font-weight: 650; }
 
@@ -549,6 +552,17 @@ body.drop-target::after {
     resize: vertical; user-select: text;
 }
 #rdlg-err { color: #c23b3b; font-size: 12px; }
+
+/* Dry-run verdict strip under the URL box (probe_only preview): the same
+ * palette the rest of the app uses for good/warn/bad states. */
+.rdlg-verdict {
+    font-size: 12px; line-height: 1.4; padding: 7px 10px;
+    border-radius: 6px; border: 1px solid var(--line);
+}
+.rdlg-verdict.ok { background: #e1f1e8; color: var(--green); }
+.rdlg-verdict.warn { background: #f8eedb; color: #8a6116; }
+.rdlg-verdict.err { background: #fae9e6; color: var(--red); }
+.rdlg-verdict.checking { color: var(--muted); }
 
 /* Sidebar torrent category color tweak */
 .side-item[data-cat="torrents"] .count { color: #6c7; }

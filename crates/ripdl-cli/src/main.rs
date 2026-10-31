@@ -463,7 +463,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
         Cmd::Details { id } => rpc(Command::Details { id }).await,
         Cmd::Refresh { id, url, resume, part } => {
-            let reply = rpc_reply(Command::RefreshUrl { id: id.clone(), url, resume, part }).await?;
+            let reply = rpc_reply(Command::RefreshUrl {
+                id: id.clone(),
+                url,
+                resume,
+                part,
+                probe_only: false,
+            })
+            .await?;
             match reply {
                 Reply::Refreshed { kept, total, part: seq, .. } => {
                     if let Some(seq) = seq {

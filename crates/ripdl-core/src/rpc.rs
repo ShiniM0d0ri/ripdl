@@ -344,6 +344,12 @@ pub enum Command {
         resume: bool,
         #[serde(default)]
         part: Option<u32>,
+        /// Dry run: probe the new address and validate it against the task's
+        /// sidecar without pausing a runner or swapping anything. The GUI's
+        /// refresh dialog previews the verdict ("keeps 5.4 GiB of 50 GiB")
+        /// before the user commits.
+        #[serde(default)]
+        probe_only: bool,
     },
     /// Append more links to an existing bundle task ("I forgot part 7").
     /// New links must group under the bundle's own name; URLs already in
@@ -515,6 +521,11 @@ pub enum Reply {
         /// Bundle-only: the part number that was refreshed.
         #[serde(default)]
         part: Option<u32>,
+        /// Non-swap detail for the dry-run preview (`probe_only`): why the
+        /// bytes are not reusable (the new address serves no byte ranges, or
+        /// the server dropped the etag). `None` on a clean adopt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     /// Result of `AddBundleParts`: how many links actually joined the
     /// bundle (URLs already present are skipped).

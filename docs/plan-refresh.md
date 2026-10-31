@@ -160,3 +160,55 @@ Extend the hand-rolled mock server in `crates/ripdl-core/tests/`:
 3. Extension: stale-candidate matching + one-tap "Refresh existing task".
 4. Backlog: parent-page hint, notifications, batch refresh, no-range byte
    salvage, video-task refresh.
+
+## 10. Implementation notes (as landed)
+
+### Phase 1 (commit `58d231a`)
+
+- `TaskState::Stale` in core; `park_stale_or_fail` in the daemon (HTTP only,
+  bytes-held check incl. the live progress sample, one confirming
+  `Engine::plan` probe, `StaleCause::Auth`/`Changed` → `stale_reason`
+  `"auth"`/`"size"`). Mid-flight auth answers ride the normal retry budget
+  first (`Error::HttpStatus` from planner + segment tails).
+- CLI: `stale(auth)` suffix in `ls`; GUI: minimal safe mapping (pause icon,
+  sort rank, resume/toggle includes stale).
+- Deviations from the plan text: no `url_state` field (the `TaskState` IS the
+  state); `stale_reason` is a short string, not an enum over RPC.
+
+### Phase 2
+
+- `Command::RefreshUrl.probe_only: bool` (serde default): the same probe +
+  same-file check run read-only — no pause, no swap. A task with no sidecar
+  yet answers `kept = downloaded` (usually 0 → "ready to download").
+- `Reply::Refreshed.warning: Option<String>` and `ripdl_core::refresh::
+  RefreshCheck { warning }`: `check_compatible` now adopts-with-warning when
+  the server's etag differs from the sidecar's ("different file version -
+  kept bytes may not match") instead of just succeeding silently. The other
+  gates (size, name, ranges) stay hard rejections with the same messages.
+- Auto-resume: the daemon records `was_running` (live runner or
+  Running/Queued) before pausing for the swap and resumes after it
+  (`resume || was_running`). CLI `--resume` still forces it; a task that was
+  parked stays parked. Bundle parts: same rule against the bundle runner.
+- GUI (`app.js`/`index.html`/`style.css`):
+  - The state label for `stale` is **expired** (amber, same family as
+    `timed`), globe icon, tooltip explains "refresh to keep the bytes"
+    (worded by `stale_reason`). The row's play button becomes a globe
+    "Refresh address" button; `toggleIntent` returns null for stale so bulk
+    pause/resume skips it (resuming a stale row would only re-confirm the
+    failure).
+  - The refresh dialog now validates before it commits: 400 ms after open
+    (diagnosing the old link) and 500 ms after every edit, it runs
+    `probe_only` and shows an inline verdict strip - green "Same file -
+    keeps X of Y", amber for the etag warning, red for the precise
+    rejection. The swap button is disabled until the check passes, so a bad
+    paste never reaches the daemon as a real swap. Palette reuses the
+    existing tokens (`#e1f1e8`/`--green`, `#f8eedb`/`#8a6116`,
+    `#fae9e6`/`--red`) - no new colors.
+  - Tests: `refresh_probe_only_previews_without_touching_the_task` and
+    `refresh_auto_resumes_a_running_task` (daemon; the paced single-file
+    server moved into `spawn_refresh_server`, shared by all three refresh
+    tests, with a `/small.bin` wrong-size endpoint); core unit tests for the
+    clean/warn adopt split.
+- Deferred: headers/cookies editing in the dialog (rarely the blocker; the
+  extension capture supplies cookies) and `AdoptNoRange` salvage - both stay
+  in the backlog list below.

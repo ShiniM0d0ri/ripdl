@@ -1061,8 +1061,8 @@ impl Daemon {
             Command::PreviewBundle { links } => self.cmd_preview_bundle(req.id, links),
             Command::List => self.cmd_list(req.id),
             Command::Details { id } => self.cmd_details(req.id, &id).await,
-            Command::RefreshUrl { id, url, resume, part } => {
-                self.cmd_refresh_url(req.id, &id, &url, resume, part).await
+            Command::RefreshUrl { id, url, resume, part, probe_only } => {
+                self.cmd_refresh_url(req.id, &id, &url, resume, part, probe_only).await
             }
             Command::AddBundleParts { id, parts } => {
                 self.cmd_add_bundle_parts(req.id, &id, parts).await
@@ -2674,6 +2674,15 @@ impl Daemon {
     /// replaced for the same file. The paused sidecar is re-pointed (byte
     /// offsets untouched) only after the new address passes the same-file
     /// check; a live runner is paused first so it cannot flush stale state.
+    ///
+    /// `probe_only` is the GUI dialog's dry run: the same probe and
+    /// same-file check run read-only, but nothing pauses and nothing swaps -
+    /// the answer is a preview ("keeps 5.4 GiB of 50 GiB") or the precise
+    /// rejection, shown before the user commits.
+    ///
+    /// A task that was running (or queued to run) when its address died
+    /// resumes automatically after the swap - that was the user's intent -
+    /// and `resume` forces it for a task that was already parked.
     async fn cmd_refresh_url(
         self: &Arc<Self>,
         req_id: u64,
@@ -2681,9 +2690,12 @@ impl Daemon {
         url: &str,
         resume: bool,
         part: Option<u32>,
+        probe_only: bool,
     ) -> Response {
         if part.is_some() {
-            return self.cmd_refresh_part(req_id, id, url, resume, part.unwrap()).await;
+            return self
+                .cmd_refresh_part(req_id, id, url, resume, part.unwrap(), probe_only)
+                .await;
         }
         let reply: Result<Reply, String> = async {
             let rec = {
@@ -2700,12 +2712,44 @@ impl Daemon {
                     "only HTTP downloads can refresh their address".into()
                 });
             }
-            if rec.state == TaskState::Completed {
+            if !probe_only && rec.state == TaskState::Completed {
                 return Err("the download already finished; nothing to refresh".into());
+            }
+
+            // Dry run: pure read. A live runner keeps downloading while the
+            // candidate address is probed and validated against the sidecar.
+            if probe_only {
+                let engine =
+                    Engine::new(self.engine_config(&rec.headers, false)).map_err(|e| e.to_string())?;
+                let info = engine.plan(url).await.map_err(|e| e.to_string())?;
+                let (kept, total, warning) = match find_sidecar(&rec, &self.sidecar_dirs(&rec)) {
+                    Some((dest, state)) => {
+                        let check = ripdl_core::refresh::check_compatible(&dest, &state, &info)
+                            .map_err(|e| e.to_string())?;
+                        (
+                            ripdl_core::refresh::kept_bytes(&state),
+                            info.total,
+                            check.warning,
+                        )
+                    }
+                    // Nothing planned yet: nothing to keep, nothing to
+                    // conflict - the probe itself is the whole verdict.
+                    None => (rec.downloaded, info.total, None),
+                };
+                return Ok(Reply::Refreshed {
+                    id: id.to_string(),
+                    kept,
+                    total,
+                    part: None,
+                    warning,
+                });
             }
 
             // A runner holds the URL it was spawned with: stop it and wait
             // for the engine's paused sidecar before swapping the address.
+            // Recorded before the cancel: this is what "was downloading" means.
+            let was_running = self.runtime.lock().unwrap().contains_key(id)
+                || matches!(rec.state, TaskState::Running | TaskState::Queued);
             let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
             if let Some(token) = token {
                 token.cancel();
@@ -2723,19 +2767,23 @@ impl Daemon {
             let mut kept = rec.downloaded;
             let mut total = rec.total;
             let mut dest_file = rec.dest_file.clone();
+            let mut warning = None;
             if let Some((dest, mut state)) = find_sidecar(&rec, &self.sidecar_dirs(&rec)) {
                 let engine = Engine::new(self.engine_config(&rec.headers, false))
                     .map_err(|e| e.to_string())?;
                 let info = engine.plan(url).await.map_err(|e| e.to_string())?;
-                ripdl_core::refresh::check_compatible(&dest, &state, &info)
+                let check = ripdl_core::refresh::check_compatible(&dest, &state, &info)
                     .map_err(|e| e.to_string())?;
+                // An imperfect but valid adopt (server etag changed) surfaces
+                // in the reply so the frontend can say "kept bytes may not
+                // match".
+                warning = check.warning;
                 kept = ripdl_core::refresh::kept_bytes(&state);
                 total = info.total;
                 dest_file = Some(dest.clone());
                 ripdl_core::refresh::retarget(&mut state, url, info.etag, info.total);
                 ripdl_core::refresh::save(&dest, &state).map_err(|e| e.to_string())?;
             }
-
             let snapshot = {
                 let mut records = self.records.lock().unwrap();
                 let Some(r) = records.iter_mut().find(|r| r.id == id) else {
@@ -2758,7 +2806,7 @@ impl Daemon {
             // The old attempt's samples describe the old URL's run.
             self.progress.lock().unwrap().remove(id);
 
-            if resume {
+            if resume || was_running {
                 match self.cmd_resume(req_id, id).reply {
                     Reply::Ok => {}
                     other => return Ok(other),
@@ -2769,6 +2817,7 @@ impl Daemon {
                 kept,
                 total,
                 part: None,
+                warning,
             })
         }
         .await;
@@ -2782,7 +2831,8 @@ impl Daemon {
     /// Refresh ONE part of a bundle: swap that part's address while keeping
     /// its on-disk bytes. The whole bundle pauses for the swap (a runner
     /// holds the parts it was spawned with) and resumes afterwards; parts
-    /// that already finished stay finished.
+    /// that already finished stay finished. `probe_only` validates the
+    /// candidate address read-only (no pause, no swap).
     async fn cmd_refresh_part(
         self: &Arc<Self>,
         req_id: u64,
@@ -2790,6 +2840,7 @@ impl Daemon {
         url: &str,
         resume: bool,
         seq: u32,
+        probe_only: bool,
     ) -> Response {
         let reply: Result<Reply, String> = async {
             let (rec, index) = {
@@ -2807,12 +2858,55 @@ impl Daemon {
                     .ok_or_else(|| format!("no part {seq} in this bundle"))?;
                 (rec.clone(), index)
             };
-            if rec.parts[index].state == TaskState::Completed {
+            if !probe_only && rec.parts[index].state == TaskState::Completed {
                 return Err(format!("part {seq} already finished; nothing to refresh"));
+            }
+
+            let part = &rec.parts[index];
+            let filename = part
+                .filename
+                .clone()
+                .unwrap_or_else(|| ripdl_core::bundle::Link::new(part.url.as_str()).part_filename());
+            let mut kept = part.downloaded;
+            let mut total = part.total;
+            let mut warning = None;
+
+            // Sidecar lookup, shared by the dry run and the swap.
+            let sidecar = rec
+                .dest_file
+                .as_ref()
+                .map(|root| root.join(format!("{filename}.ripdl.json")));
+            let found = match sidecar {
+                Some(path) => read_sidecar_for(path, &part.url),
+                None => None,
+            };
+
+            if probe_only {
+                // Read-only: probe the candidate and check it against the
+                // part's sidecar without stopping the bundle.
+                let engine = Engine::new(self.engine_config(&part.headers, false))
+                    .map_err(|e| e.to_string())?;
+                let info = engine.plan(url).await.map_err(|e| e.to_string())?;
+                if let Some((dest, state)) = found {
+                    let check = ripdl_core::refresh::check_compatible(&dest, &state, &info)
+                        .map_err(|e| e.to_string())?;
+                    kept = ripdl_core::refresh::kept_bytes(&state);
+                    warning = check.warning;
+                }
+                total = info.total;
+                return Ok(Reply::Refreshed {
+                    id: id.to_string(),
+                    kept,
+                    total: total,
+                    part: Some(seq),
+                    warning,
+                });
             }
 
             // Stop the bundle's runner so no part is mid-flight during the
             // swap, then wait for it to land its sidecars.
+            let was_running = self.runtime.lock().unwrap().contains_key(id)
+                || matches!(rec.state, TaskState::Running | TaskState::Queued);
             let token = self.runtime.lock().unwrap().get(id).map(|t| t.token.clone());
             if let Some(token) = token {
                 token.cancel();
@@ -2828,26 +2922,17 @@ impl Daemon {
             // A part that never started has no sidecar to validate: the swap
             // is pure bookkeeping. One that did gets the same compatibility
             // gate as a whole task (same file name + size, byte ranges).
-            let part = &rec.parts[index];
-            let filename = part
-                .filename
-                .clone()
-                .unwrap_or_else(|| ripdl_core::bundle::Link::new(part.url.as_str()).part_filename());
-            let mut kept = part.downloaded;
-            let mut total = part.total;
-            if let Some(root) = &rec.dest_file {
-                let sidecar = root.join(format!("{filename}.ripdl.json"));
-                if let Some((dest, mut state)) = read_sidecar_for(sidecar, &part.url) {
-                    let engine = Engine::new(self.engine_config(&part.headers, false))
-                        .map_err(|e| e.to_string())?;
-                    let info = engine.plan(url).await.map_err(|e| e.to_string())?;
-                    ripdl_core::refresh::check_compatible(&dest, &state, &info)
-                        .map_err(|e| e.to_string())?;
-                    kept = ripdl_core::refresh::kept_bytes(&state);
-                    total = info.total;
-                    ripdl_core::refresh::retarget(&mut state, url, info.etag, info.total);
-                    ripdl_core::refresh::save(&dest, &state).map_err(|e| e.to_string())?;
-                }
+            if let Some((dest, mut state)) = found {
+                let engine = Engine::new(self.engine_config(&part.headers, false))
+                    .map_err(|e| e.to_string())?;
+                let info = engine.plan(url).await.map_err(|e| e.to_string())?;
+                let check = ripdl_core::refresh::check_compatible(&dest, &state, &info)
+                    .map_err(|e| e.to_string())?;
+                warning = check.warning;
+                kept = ripdl_core::refresh::kept_bytes(&state);
+                total = info.total;
+                ripdl_core::refresh::retarget(&mut state, url, info.etag, info.total);
+                ripdl_core::refresh::save(&dest, &state).map_err(|e| e.to_string())?;
             }
 
             let snapshot = {
@@ -2875,7 +2960,7 @@ impl Daemon {
             let _ = self.persist(&snapshot);
             self.progress.lock().unwrap().remove(id);
 
-            if resume {
+            if resume || was_running {
                 match self.cmd_resume(req_id, id).reply {
                     Reply::Ok => {}
                     other => return Ok(other),
@@ -2886,6 +2971,7 @@ impl Daemon {
                 kept,
                 total,
                 part: Some(seq),
+                warning,
             })
         }
         .await;
@@ -4429,6 +4515,7 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     /// A daemon whose queue and downloads live in a fresh temp folder.
     fn proposal_daemon(tag: &str) -> (Arc<Daemon>, PathBuf) {
@@ -5272,7 +5359,7 @@ mod tests {
         // An expired link for part 2 only: the fixture serves the same bytes
         // at every /fN, so /f9 is the "fresh" address of the same file.
         match daemon
-            .cmd_refresh_url(2, &id, &format!("{}/f9", fx.base), true, Some(2))
+            .cmd_refresh_url(2, &id, &format!("{}/f9", fx.base), true, Some(2), false)
             .await
             .reply
         {
@@ -5291,7 +5378,7 @@ mod tests {
 
         // A finished part refuses a refresh: its bytes are final.
         match daemon
-            .cmd_refresh_url(3, &id, &format!("{}/f8", fx.base), false, Some(1))
+            .cmd_refresh_url(3, &id, &format!("{}/f8", fx.base), false, Some(1), false)
             .await
             .reply
         {
@@ -5300,7 +5387,7 @@ mod tests {
         }
         // So does an unknown part number.
         match daemon
-            .cmd_refresh_url(4, &id, &format!("{}/f8", fx.base), false, Some(9))
+            .cmd_refresh_url(4, &id, &format!("{}/f8", fx.base), false, Some(9), false)
             .await
             .reply
         {
@@ -5630,23 +5717,24 @@ mod tests {
         let w = weights_from_rates(&[(wifi, 500.0), (tether, 0.0)]);
         assert_eq!(w, vec![(wifi, 1), (tether, 1)]);
     }
-    /// A dead link parks the task `stale`, not `failed`: after the host turns an
-    /// in-progress HTTP task away with 403, the daemon confirms with one probe
-    /// and parks it with reason `auth` - bytes and sidecar intact, no runner.
-    /// A refreshed address (or the link coming back) resumes the same bytes to
-    /// completion.
-    #[tokio::test]
-    async fn dead_link_parks_task_stale_and_refresh_recovers() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    /// One-file paced HTTP fixture shared by the refresh tests: HEAD says
+    /// 8 MiB with etag "v1", ranged GETs stream the byte pattern in 64 KiB
+    /// blocks (slow enough to pause mid-flight deterministically).
+    /// `forbidden` turns every answer into 403 (a dead token); `/small.bin`
+    /// serves `other_size` bytes so the same-file gate has something to
+    /// reject. Returns the server base URL.
+    async fn spawn_refresh_server(
+        forbidden: Arc<AtomicBool>,
+        other_size: Option<u64>,
+    ) -> String {
+        use std::sync::atomic::Ordering;
 
-        const TOTAL: usize = 8 * 1024 * 1024;
-        let forbidden = Arc::new(AtomicBool::new(false));
+        const TOTAL: u64 = 8 * 1024 * 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let flag = Arc::clone(&forbidden);
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                let forbidden = Arc::clone(&flag);
+                let forbidden = Arc::clone(&forbidden);
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut head = Vec::new();
@@ -5658,6 +5746,11 @@ mod tests {
                         }
                     }
                     let text = String::from_utf8_lossy(&head);
+                    let is_small = text
+                        .lines()
+                        .next()
+                        .map_or(false, |l| l.contains("/small.bin"));
+                    let total = if is_small { other_size.unwrap_or(TOTAL) } else { TOTAL };
                     if forbidden.load(Ordering::SeqCst) {
                         let _ = sock
                             .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
@@ -5674,7 +5767,7 @@ mod tests {
                         });
                     if text.starts_with("HEAD") {
                         let answer = format!(
-                            "HTTP/1.1 200 OK\r\netag: \"v1\"\r\ncontent-length: {TOTAL}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n"
+                            "HTTP/1.1 200 OK\r\netag: \"v1\"\r\ncontent-length: {total}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n"
                         );
                         let _ = sock.write_all(answer.as_bytes()).await;
                         return;
@@ -5687,14 +5780,14 @@ mod tests {
                     // mid-flight deterministically (a full-speed 8 MiB would
                     // complete before the pause command lands).
                     let mut sent = start;
-                    while sent < TOTAL as u64 {
-                        let end = (sent + 64 * 1024).min(TOTAL as u64);
+                    while sent < total {
+                        let end = (sent + 64 * 1024).min(total);
                         let chunk: Vec<u8> = (sent..end).map(|i| (i % 251) as u8).collect();
                         if sent == start {
                             let head = format!(
-                                "HTTP/1.1 206 Partial Content\r\netag: \"v1\"\r\ncontent-range: bytes {start}-{}-{TOTAL}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                                TOTAL as u64 - 1,
-                                TOTAL as u64 - start
+                                "HTTP/1.1 206 Partial Content\r\netag: \"v1\"\r\ncontent-range: bytes {start}-{}-{total}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                total - 1,
+                                total - start
                             );
                             let _ = sock.write_all(head.as_bytes()).await;
                         }
@@ -5705,9 +5798,24 @@ mod tests {
                 });
             }
         });
+        format!("http://{addr}")
+    }
+
+    /// A dead link parks the task `stale`, not `failed`: after the host turns an
+    /// in-progress HTTP task away with 403, the daemon confirms with one probe
+    /// and parks it with reason `auth` - bytes and sidecar intact, no runner.
+    /// A refreshed address (or the link coming back) resumes the same bytes to
+    /// completion.
+    #[tokio::test]
+    async fn dead_link_parks_task_stale_and_refresh_recovers() {
+        use std::sync::atomic::Ordering;
+
+        const TOTAL: usize = 8 * 1024 * 1024;
+        let forbidden = Arc::new(AtomicBool::new(false));
+        let base = spawn_refresh_server(Arc::clone(&forbidden), None).await;
 
         let (daemon, dir) = proposal_daemon("stale");
-        let url = format!("http://{addr}/file.bin?t=1");
+        let url = format!("{base}/file.bin?t=1");
         let resp = daemon.cmd_add(
             1,
             url.clone(),
@@ -5783,8 +5891,8 @@ mod tests {
 
         // The link comes back (fresh token): refresh the address, resume, done.
         forbidden.store(false, Ordering::SeqCst);
-        let fresh = format!("http://{addr}/file.bin?t=2");
-        let resp = daemon.cmd_refresh_url(4, &id, &fresh, false, None).await;
+        let fresh = format!("{base}/file.bin?t=2");
+        let resp = daemon.cmd_refresh_url(4, &id, &fresh, false, None, false).await;
         assert!(
             matches!(resp.reply, Reply::Refreshed { .. }),
             "refresh failed: {:?}",
@@ -5818,6 +5926,185 @@ mod tests {
             !dir.join("file.bin.ripdl.json").exists(),
             "sidecar must be gone on completion"
         );
+    }
+
+    /// The GUI dialog's dry run: `probe_only` previews the verdict ("keeps
+    /// X of Y", or the precise rejection) without pausing the runner,
+    /// swapping the address, or touching the sidecar.
+    #[tokio::test]
+    async fn refresh_probe_only_previews_without_touching_the_task() {
+        const TOTAL: u64 = 8 * 1024 * 1024;
+        let forbidden = Arc::new(AtomicBool::new(false));
+        let base = spawn_refresh_server(Arc::clone(&forbidden), Some(4096)).await;
+
+        let (daemon, dir) = proposal_daemon("probe");
+        let url = format!("{base}/file.bin?t=1");
+        let resp = daemon.cmd_add(
+            1,
+            url.clone(),
+            Some(dir.clone()),
+            HashMap::new(),
+            None,
+            TaskKind::Http,
+            false,
+            None,
+            DuplicatePolicy::Report,
+        );
+        let id = match resp.reply {
+            Reply::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+
+        // Real progress, then pause: the sidecar holds bytes to keep.
+        let mut progress = 0u64;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(t) = daemon.task_info_for(&id) {
+                progress = t.downloaded;
+                if progress > 512 * 1024 {
+                    break;
+                }
+            }
+        }
+        assert!(progress > 512 * 1024, "download never got going");
+        daemon.cmd_pause(2, &id).await;
+        let mut paused = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if daemon
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id && r.state == TaskState::Paused)
+            {
+                paused = true;
+                break;
+            }
+        }
+        assert!(paused, "task never paused");
+        let before = daemon
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| (r.url.clone(), r.state == TaskState::Paused, r.downloaded))
+            .unwrap();
+
+        // A good candidate answers green: same file, bytes kept.
+        let fresh = format!("{base}/file.bin?t=2");
+        let resp = daemon.cmd_refresh_url(3, &id, &fresh, false, None, true).await;
+        match resp.reply {
+            Reply::Refreshed { kept, total, warning, .. } => {
+                assert!(kept > 0, "probe must report the kept bytes");
+                assert_eq!(total, Some(TOTAL));
+                assert_eq!(warning, None, "same etag must adopt clean");
+            }
+            other => panic!("expected Refreshed, got {other:?}"),
+        }
+        let after = daemon
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| (r.url.clone(), r.state == TaskState::Paused, r.downloaded))
+            .unwrap();
+        assert_eq!(after, before, "a dry run must not touch the task");
+
+        // A different file size: rejected with both numbers, still untouched.
+        let resp = daemon
+            .cmd_refresh_url(4, &id, &format!("{base}/small.bin"), false, None, true)
+            .await;
+        match resp.reply {
+            Reply::Error { message } => {
+                assert!(message.contains("not the same file"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let after2 = daemon
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| (r.url.clone(), r.state == TaskState::Paused, r.downloaded))
+            .unwrap();
+        assert_eq!(after2, before, "a rejected probe must not touch the task");
+    }
+
+    /// A task that was downloading when its address was swapped comes back
+    /// downloading on its own: refresh with `resume: false` must still
+    /// resume it (the user's intent was "downloading").
+    #[tokio::test]
+    async fn refresh_auto_resumes_a_running_task() {
+        const TOTAL: usize = 8 * 1024 * 1024;
+        let forbidden = Arc::new(AtomicBool::new(false));
+        let base = spawn_refresh_server(Arc::clone(&forbidden), None).await;
+
+        let (daemon, dir) = proposal_daemon("autoresume");
+        let url = format!("{base}/file.bin?t=1");
+        let resp = daemon.cmd_add(
+            1,
+            url,
+            Some(dir.clone()),
+            HashMap::new(),
+            None,
+            TaskKind::Http,
+            false,
+            None,
+            DuplicatePolicy::Report,
+        );
+        let id = match resp.reply {
+            Reply::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+
+        let mut progress = 0u64;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(t) = daemon.task_info_for(&id) {
+                progress = t.downloaded;
+                if progress > 512 * 1024 {
+                    break;
+                }
+            }
+        }
+        assert!(progress > 512 * 1024, "download never got going");
+
+        // Swap the address mid-flight. No explicit resume: was-running is
+        // the intent, so the daemon resumes by itself.
+        let resp = daemon
+            .cmd_refresh_url(2, &id, &format!("{base}/file.bin?t=2"), false, None, false)
+            .await;
+        assert!(
+            matches!(resp.reply, Reply::Refreshed { .. }),
+            "refresh failed: {:?}",
+            resp.reply
+        );
+        let mut done = false;
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if daemon
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.id == id && r.state == TaskState::Completed)
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "task never completed after the mid-flight refresh");
+
+        let dest = dir.join("file.bin");
+        let data = std::fs::read(&dest).expect("output file");
+        assert_eq!(data.len(), TOTAL);
+        for (i, b) in data.iter().enumerate() {
+            assert_eq!(*b, (i as u64 % 251) as u8, "byte {i} corrupted");
+        }
     }
 }
 

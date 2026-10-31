@@ -39,11 +39,33 @@ pub fn kept_bytes(state: &TaskStateFile) -> u64 {
     state.segments.iter().map(|s| s.done).sum()
 }
 
+/// What a compatible-but-imperfect adopt warns about. The bytes stay; the
+/// user just learns what might not line up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshCheck {
+    /// None on a clean adopt.
+    pub warning: Option<String>,
+}
+
+impl RefreshCheck {
+    #[allow(dead_code)] // phase 3 (extension matching) consumes the clean adopt
+    fn clean() -> Self {
+        Self { warning: None }
+    }
+}
+
 /// Reject a new address that cannot continue the paused download.
 ///
 /// `prev` is the sidecar of the download being retargeted, `info` the probe
-/// of the new address, `dest` the partial file on disk.
-pub fn check_compatible(dest: &Path, prev: &TaskStateFile, info: &PlanInfo) -> Result<()> {
+/// of the new address, `dest` the partial file on disk. A clean adopt answers
+/// `Ok(RefreshCheck::clean())`; an imperfect one (the server advertises a
+/// different file version) answers `Ok` with a warning - the bytes are kept,
+/// but the user should know.
+pub fn check_compatible(
+    dest: &Path,
+    prev: &TaskStateFile,
+    info: &PlanInfo,
+) -> Result<RefreshCheck> {
     let old_total = prev
         .total
         .ok_or_else(|| Error::Refresh("the paused download never learned the file size".into()))?;
@@ -74,7 +96,16 @@ pub fn check_compatible(dest: &Path, prev: &TaskStateFile, info: &PlanInfo) -> R
             )));
         }
     }
-    Ok(())
+    // Same name and size but a different file version: the engine resumes
+    // against the new etag, so the bytes on disk may not line up. Adopt with
+    // a warning rather than silently splicing two versions together.
+    let warning = match (&prev.etag, &info.etag) {
+        (Some(old), Some(new)) if old != new => Some(format!(
+            "the server reports a different file version than the one the kept bytes came from - they may not match"
+        )),
+        _ => None,
+    };
+    Ok(RefreshCheck { warning })
 }
 
 /// Point the paused state at a new address: segments and their offsets are
@@ -142,7 +173,21 @@ mod tests {
     #[test]
     fn same_file_same_size_is_compatible() {
         let d = dest("f.bin");
-        check_compatible(&d, &state(), &info(Some(4096), true, "f.bin")).expect("compatible");
+        let check =
+            check_compatible(&d, &state(), &info(Some(4096), true, "f.bin")).expect("compatible");
+        // The fixture etags differ ("v1" vs "v2"): adoptable, with a word of
+        // caution about the file version.
+        assert!(check.warning.is_some(), "etag change must warn");
+    }
+
+    #[test]
+    fn same_etag_adopts_clean() {
+        let d = dest("f.bin");
+        let mut prev = state();
+        prev.etag = Some("\"v2\"".into());
+        let check =
+            check_compatible(&d, &prev, &info(Some(4096), true, "f.bin")).expect("compatible");
+        assert_eq!(check.warning, None);
     }
 
     #[test]

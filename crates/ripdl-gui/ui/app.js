@@ -182,6 +182,9 @@ function stateLabel(t) {
     if (t.state === "running" && t.kind === "torrent" && !t.total) return "metadata";
     // Probing the URL / planning segments: no bytes have arrived yet.
     if (t.state === "running" && t.probing) return "connecting";
+    // The link died (auth/expiry): the bytes are safe, the address is not.
+    // "expired" says what happened; "stale" stays the internal name.
+    if (t.state === "stale") return "expired";
     return t.state;
 }
 
@@ -288,9 +291,9 @@ function kindCell(t) {
 const STATUS_ICON = {
     completed: ico("check"), running: ico("download"), queued: ico("clock"),
     timed: ico("clock"), paused: ico("pause"), failed: ico("alert"),
-    // Parked like paused (the bytes are fine, the link is not): phase 2 gives
-    // the stale chip its own amber treatment and a refresh affordance.
-    stale: ico("pause"),
+    // The address died; the fix is a refresh, so the icon points there
+    // (same globe the refresh entries use).
+    expired: ico("globe"),
     cancelled: ico("x"), hunt: ico("film"), downloading: ico("download"),
     verifying: ico("search"), seeding: ico("up"), metadata: ico("globe"),
     connecting: ico("globe"),
@@ -483,7 +486,7 @@ function setSort(key) {
 
 const STATE_RANK = {
     running: 0, hunt: 1, verifying: 2, connecting: 2, metadata: 3, queued: 4, timed: 5,
-    seeding: 6, paused: 7, stale: 8, failed: 9, completed: 10, cancelled: 11,
+    seeding: 6, paused: 7, expired: 8, failed: 9, completed: 10, cancelled: 11,
 };
 const KIND_RANK = { torrent: 0, bundle: 1, http: 2, video: 3 };
 
@@ -753,7 +756,7 @@ function render() {
         const name = rowName(t);
         const state = stateLabel(t);
         const pct = percentOf(t);
-        const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "stale", "timed"].includes(state) ? "paused" : "");
+        const barClass = state === "failed" || state === "cancelled" ? "failed" : (["paused", "queued", "expired", "timed"].includes(state) ? "paused" : "");
         const parts = partsText(t);
         const partsSpan = parts ? `<span class="parts">${parts}</span>` : "";
         const prog = pct == null
@@ -764,6 +767,15 @@ function render() {
         const speed = speedText(t);
         const peers = peersText(t);
         const dir = t.dest_dir ? t.dest_dir.replace(/[\\/]+$/, "") : "";
+        // Expired rows explain themselves in the cell tooltip; other states
+        // keep the error text there.
+        const stateTip = state === "expired"
+            ? (t.stale_reason === "auth"
+                ? "The link expired - refresh the address to keep the bytes already on disk."
+                : t.stale_reason === "size"
+                    ? "The file changed on the server - refresh to the same file, or re-add it."
+                    : "The address stopped working - refresh it to keep the bytes already on disk.")
+            : errorTitle(t.error);
         const cls = selectedIds.has(t.id) ? ' class="selected"' : "";
         return `<tr${cls} data-id="${t.id}">
           <td class="name-cell" title="${escapeHtml(detailsTitle(t))}">
@@ -771,7 +783,7 @@ function render() {
             <div class="fdir" title="${escapeHtml(dir)}">${escapeHtml(dir)}</div>
           </td>
           ${kindCell(t)}
-          <td class="st-${state}" title="${escapeHtml(errorTitle(t.error))}"><span class="st-ico">${STATUS_ICON[state] || ""}</span>${state}${t.error ? '<div class="st-err">' + escapeHtml(shortError(t.error)) + '</div>' : ""}</td>
+          <td class="st-${state}" title="${escapeHtml(stateTip)}"><span class="st-ico">${STATUS_ICON[state] || ""}</span>${state}${t.error ? '<div class="st-err">' + escapeHtml(shortError(t.error)) + '</div>' : ""}</td>
           <td class="size-cell">${size}</td>
           <td class="prog-cell">${prog}</td>
           <td class="eta-cell">${eta}</td>
@@ -853,7 +865,11 @@ function toggleIntent(t) {
     if (t.state === "completed") {
         return t.kind === "torrent" ? (t.seeding ? "pause" : "resume") : null;
     }
-    if (["paused", "failed", "stale", "timed"].includes(t.state)) return "resume";
+    // A stale row's fix is a new address, not a resume (resuming would only
+    // re-confirm the failure): its row button opens the refresh dialog and
+    // bulk resume skips it.
+    if (t.state === "stale") return null;
+    if (["paused", "failed", "timed"].includes(t.state)) return "resume";
     return null;
 }
 
@@ -871,13 +887,17 @@ function actionButtons(t) {
       <button class="row-btn" ${idAttr} data-act="toggle" title="${toggleTitle(t)}">
         ${ico(intent === "pause" ? "pause" : "play")}
       </button>` : "";
+    // An expired link has no play button: resuming would only re-confirm the
+    // failure. The globe opens the refresh dialog, which keeps the bytes.
+    const refresh = t.state === "stale" ? `
+      <button class="row-btn" ${idAttr} data-act="refresh" title="Refresh address - keeps the downloaded bytes">${ico("globe")}</button>` : "";
     const openFile = t.state === "completed" ? `
       <button class="row-btn" ${idAttr} data-act="openFile" title="${t.kind === "bundle" ? "Open bundle folder" : "Open file"}">${ico("file")}</button>` : "";
     const open = `
       <button class="row-btn" ${idAttr} data-act="openFolder" title="Open download folder">${ico("folder")}</button>`;
     const rm = `
       <button class="row-btn" ${idAttr} data-act="deleteFiles" title="Delete from list AND disk">${ico("trash")}</button>`;
-    return `<span class="actions">${stop}${openFile}${open}${rm}</span>`;
+    return `<span class="actions">${stop}${refresh}${openFile}${open}${rm}</span>`;
 }
 
 function escapeHtml(s) {
@@ -1320,7 +1340,9 @@ function scheduleUplinks() {
 let dlgDestTouched = false;
 
 async function resumeAll() {
-    for (const t of tasks.filter((x) => ["paused", "failed", "stale", "timed"].includes(x.state))) {
+    // Stale rows are skipped on purpose: resuming one only re-confirms the
+    // dead link; the fix is the refresh dialog (the row's globe button).
+    for (const t of tasks.filter((x) => ["paused", "failed", "timed"].includes(x.state))) {
         try { await invokeSafe("resume_task", { id: t.id }); } catch (e) { flashErr(String(e)); break; }
     }
     poll();
@@ -3040,9 +3062,16 @@ $("#hdt-folder").onclick = async () => {
 
 /* Refresh download address (expired signed links, same file).
  * For bundles the dialog targets ONE part: the bundle pauses for the swap
- * and resumes, finished parts stay finished. */
+ * and resumes, finished parts stay finished.
+ *
+ * The dialog validates before it commits: 400 ms after open or edit it runs
+ * the daemon's probe in `probe_only` (read-only, nothing pauses or swaps)
+ * and shows the verdict inline - "Same file - keeps 5.4 GB of 50 GB" or the
+ * precise rejection. The swap button stays disabled until the check passes,
+ * so a bad paste never reaches the daemon as a real swap. */
 let refreshTargetId = null;
 let refreshPartSeq = null;
+let refreshCheckTimer = null;
 
 function openRefreshDialog(id, seq = null) {
     const t = findTask(id);
@@ -3063,10 +3092,14 @@ function openRefreshDialog(id, seq = null) {
         (["running", "queued"].includes(t.state) ? " The download is paused first." : "");
     $("#rdlg-err").classList.add("hidden");
     $("#rdlg-err").textContent = "";
+    refreshVerdict(null);
     $("#rdlg-backdrop").classList.remove("hidden");
     const field = $("#rdlg-url");
     field.focus();
     field.setSelectionRange(field.value.length, field.value.length);
+    // Diagnose the address that is already in the box: for an expired task
+    // this is the answer to "what is wrong" before anything is pasted.
+    scheduleRefreshCheck(400);
 }
 
 // The part's current address, from the details the dialog is showing.
@@ -3081,7 +3114,45 @@ function partUrl(id, seq) {
 function closeRefreshDialog() {
     refreshTargetId = null;
     refreshPartSeq = null;
+    if (refreshCheckTimer) { clearTimeout(refreshCheckTimer); refreshCheckTimer = null; }
     $("#rdlg-backdrop").classList.add("hidden");
+}
+
+// Inline verdict under the URL box: null hides, "ok"/"warn"/"err"/"checking"
+// recolors. The swap button follows the verdict (enabled on ok/warn only).
+function refreshVerdict(kind, msg) {
+    const el = $("#rdlg-verdict");
+    if (kind == null) { el.className = "rdlg-verdict hidden"; }
+    else { el.className = `rdlg-verdict ${kind}`; el.textContent = msg; }
+    $("#rdlg-ok").disabled = kind == null || kind === "checking" || kind === "err";
+}
+
+function scheduleRefreshCheck(delay = 500) {
+    if (refreshCheckTimer) clearTimeout(refreshCheckTimer);
+    refreshCheckTimer = setTimeout(runRefreshCheck, delay);
+}
+
+async function runRefreshCheck() {
+    refreshCheckTimer = null;
+    const id = refreshTargetId;
+    if (!id) return;
+    const url = $("#rdlg-url").value.trim();
+    if (!url) { refreshVerdict(null); return; }
+    refreshVerdict("checking", "Checking the new address...");
+    try {
+        const args = { id, url, probeOnly: true };
+        if (refreshPartSeq != null) args.part = refreshPartSeq;
+        const out = await invokeSafe("refresh_url", args);
+        if (refreshTargetId !== id || $("#rdlg-url").value.trim() !== url) return; // moved on meanwhile
+        const kept = out && out.kept ? humans(out.kept) : null;
+        const total = out && out.total ? humans(out.total) : null;
+        const have = kept ? `keeps ${kept}${total ? " of " + total : ""} already on disk` : "ready to download";
+        if (out && out.warning) refreshVerdict("warn", `Same file, but ${out.warning} (${have}).`);
+        else refreshVerdict("ok", `Same file - ${have}.`);
+    } catch (e) {
+        if (refreshTargetId !== id || $("#rdlg-url").value.trim() !== url) return;
+        refreshVerdict("err", String(e).replace(/^.*error: /, ""));
+    }
 }
 
 function refreshError(msg) {
@@ -3091,7 +3162,7 @@ function refreshError(msg) {
 }
 
 async function submitRefresh() {
-    if (!refreshTargetId) return;
+    if (!refreshTargetId || $("#rdlg-ok").disabled) return;
     const id = refreshTargetId;
     const url = $("#rdlg-url").value.trim();
     if (!url) { refreshError("Paste the fresh URL first."); return; }
@@ -3113,13 +3184,13 @@ async function submitRefresh() {
         if (httpDetailsId === id) await refreshHttpDetails();
     } catch (e) {
         refreshError(String(e).replace(/^.*error: /, ""));
-    } finally {
-        btn.disabled = false;
+        $("#rdlg-ok").disabled = false;
     }
 }
 
 $("#rdlg-cancel").onclick = closeRefreshDialog;
 $("#rdlg-ok").onclick = submitRefresh;
+$("#rdlg-url").addEventListener("input", () => scheduleRefreshCheck());
 $("#rdlg-backdrop").onclick = (ev) => { if (ev.target === ev.currentTarget) closeRefreshDialog(); };
 $("#rdlg-url").onkeydown = (ev) => {
     // A URL has no newlines: Enter submits, Shift+Enter still breaks the line.
