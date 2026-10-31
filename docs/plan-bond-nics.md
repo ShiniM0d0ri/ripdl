@@ -6,18 +6,26 @@ production findings from the first real dual-NIC run on v0.4.7.
 
 ## G. New production findings -> concrete work items
 
-### G1. Lag spike whenever a NEW part starts (then normal) - STAGGER LANDED (pending live verification)
+### G1. Lag spike whenever a NEW part starts (then normal) - CODE CLEAN, kernel-side suspect
 Observed live 2026-10-27: each part start stalls the desktop for a few
-seconds. Suspects, to be proven by the 1 s spike watcher (armed):
-burst of 8 TLS connects at once, sparse-file grow + Defender WriteFile
-interception x8, runner semaphore stampede, GUI polling burst on state
-flip. Fix direction (choose by evidence):
-- stagger segment spawns (~150-300 ms apart) and warm the first byte range
-  before spawning the rest; - LANDED as RAMP_STEP 400 ms in run_segment,
-  `ramp-in stagger` log line; verify against spike-watch.log on the next
-  live bundle run.
-- open/extend the dest file once before spawning (already single fd - verify);
-- GUI: batch task-list refreshes around start/stop events instead of a burst.
+seconds (operator: "so bad even mouse stuck", 2026-10-31, v0.4.8). The
+400 ms dial stagger did not remove it. Audited end to end 2026-10-31
+(research/lag/): probe/plan, single prealloc `set_len` before spawn,
+stagger, PICK_WAIT (200 ms poll), gate, per-attempt file handle reused
+across flushes, 2 s sidecar cadence, 15 s queue persist, GUI poll
+(500 ms single-flight, structural-key render) - all bounded. Looped
+stress through a private daemon: 4 GB pulled (up to ~1 GB/s), daemon
+burned 1.52 s CPU TOTAL, Defender 0 CPU at ~900 MB/s of fresh-file
+writes, per-core DPC <= 6%. No user-mode spin exists to fix. Prime
+suspect: the USB RNDIS tether driver - DPC/interrupt storm at the ~5x
+throughput bonding now drives through it (Wi-Fi-only era was ~12 MB/s,
+under the pain threshold); loopback cannot reproduce (no NIC in path).
+Confirm with: does bond-OFF (Wi-Fi-only) still lag? If yes -> watcher
+repro (research/lag/watch-real.ps1, per-core DPC max) with the operator
+starting one download. Mitigations if confirmed: OS-side (driver
+update, USB mode, power saving) and a ripdl-side per-link speed cap
+(backlog "per-task quota polish") to keep the tether under the
+stutter threshold.
 
 ### G2. Bundle/HTTP progress bar does not move until a part completes
 Row % must derive from summed durable bytes / summed total of every part
