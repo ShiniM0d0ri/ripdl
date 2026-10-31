@@ -645,6 +645,10 @@ pub struct BondLink {
     pub default_route: bool,
     /// Smoothed measured rate, bytes/s (idle links keep the last EMA).
     pub rate_bps: u64,
+    /// Smoothed per-connection capacity, bytes/s - the weight basis.
+    /// Older daemons omit it.
+    #[serde(default)]
+    pub capacity_bps: u64,
     /// Relative preference of new dials (0 = quarantined).
     pub weight: u32,
     /// Connections currently using this link.

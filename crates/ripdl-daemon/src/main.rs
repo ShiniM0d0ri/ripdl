@@ -1894,6 +1894,7 @@ impl Daemon {
                 ip: s.ip.to_string(),
                 default_route: s.default_route,
                 rate_bps: s.rate_bps,
+                capacity_bps: s.capacity_bps,
                 weight: s.weight,
                 in_use: s.in_use,
                 fails: s.fails,

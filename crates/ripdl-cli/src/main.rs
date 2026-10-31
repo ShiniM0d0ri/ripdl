@@ -861,6 +861,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             torrent_bind,
             torrent_rates,
             torrent_unreachable,
+            bond_links,
             ..
         } => {
             println!("max_concurrent:       {}", settings.max_concurrent.unwrap_or(3));
@@ -915,6 +916,30 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     .join(" \u{b7} ")
             };
             println!("uplinks:              {list}");
+            if !bond_links.is_empty() {
+                // The HTTP bond authority's live per-link view: what the
+                // engine actually dials through, with measured capacity and
+                // any dial-failure skip - "my second connection is ignored"
+                // needs this to be answerable.
+                let links = bond_links
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{} {} (capacity {:.1} MB/s, weight {}, {} conn{}, {} fail{})",
+                            l.name,
+                            l.ip,
+                            l.capacity_bps as f64 / 1e6,
+                            l.weight,
+                            l.in_use,
+                            if l.in_use == 1 { "" } else { "s" },
+                            l.fails,
+                            if l.fails == 1 { "" } else { "s" },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ");
+                println!("bond links:           {links}");
+            }
             if !excludes.is_empty() {
                 println!(
                     "bond_exclude:         {} (these never carry download traffic)",
