@@ -1378,7 +1378,30 @@ fn write_sidecar_bytes(path: &Path, json: Vec<u8>) -> Result<()> {
     let tmp = path.with_extension("ripdl.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, path)?;
+    #[cfg(windows)]
+    hide_on_windows(path);
     Ok(())
+}
+
+/// The sidecar is internal bookkeeping sitting next to the user's download;
+/// mark it hidden on Windows so it stays out of the Explorer view. The
+/// rename installs the fresh (non-hidden) temp file as the new sidecar, so
+/// the attribute must be re-applied after every write. Best effort: a
+/// failure to set it changes nothing about the resume data.
+#[cfg(windows)]
+fn hide_on_windows(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN,
+    };
+    let mut wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        SetFileAttributesW(wide.as_mut_ptr(), FILE_ATTRIBUTE_HIDDEN);
+    }
 }
 
 fn read_sidecar(path: &Path) -> Result<Option<TaskStateFile>> {
@@ -1431,6 +1454,34 @@ mod tests {
         let plan = plan_fresh(&info(Some(1024 * 1024 * 500), false), &cfg);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].end, UNBOUNDED);
+    }
+
+    /// The sidecar is bookkeeping next to the user's file: hidden on Windows,
+    /// and the attribute survives a rewrite (every write re-applies it).
+    #[test]
+    fn sidecar_write_leaves_the_file_hidden() {
+        let dir = std::env::temp_dir().join(format!("ripdl-hideside-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("part.bin");
+        std::fs::write(&dest, b"payload").unwrap();
+        let path = sidecar_path(&dest);
+        let state = crate::task::TaskStateFile {
+            id: "t".into(),
+            url: "https://example/y.bin".into(),
+            etag: None,
+            total: Some(8),
+            state: crate::task::TaskState::Paused,
+            segments: Vec::new(),
+        };
+        write_sidecar(&path, &state).unwrap();
+        write_sidecar(&path, &state).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let attrs = std::fs::metadata(&path).unwrap().file_attributes();
+            assert_ne!(attrs & 0x2, 0, "sidecar must carry FILE_ATTRIBUTE_HIDDEN");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
