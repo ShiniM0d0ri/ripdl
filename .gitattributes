@@ -1,0 +1,10 @@
+# The node/e2e tests parse source files byte-wise (the e2e trace anchors in
+# ext/test/e2e/run.mjs match bare \n), so core.autocrlf smudging the working
+# tree to CRLF breaks them. Pin LF for the extension sources; add patterns
+# here rather than flipping autocrlf. .ps1 stays untouched (ASCII-only files,
+# CRLF conventional for PowerShell 5.1).
+ext/**/*.js text eol=lf
+ext/**/*.mjs text eol=lf
+ext/**/*.json text eol=lf
+ext/**/*.html text eol=lf
+ext/**/*.md text eol=lf
