@@ -25,6 +25,10 @@
     const URL_RE = /https?:\/\/[^\s<>"'`]+/gi;
     /** Anchor text that names a file, never a command ("Download", "here"). */
     const FILENAME_RE = /^[^\\/:*?"<>|\r\n]{1,120}\.[A-Za-z0-9]{1,8}$/;
+    /** A filename-looking token anywhere in a row ("... [DODI].part01.rar" on
+     * crypter/hoster rows whose button carries no name itself). */
+    const FILE_TOKEN_RE =
+        /(?:[\w[\](){}+_'&. -]{2,116}\.)?(?:rar|zip|7z|tar|gz|tgz|cab|iso|mkv|mp4|avi|part\d{2})\b/i;
 
     let host = null; // <ripdl-offer-chip> element
     let root = null; // its shadow root
@@ -105,7 +109,39 @@
             if (named || textHasUrl) push(a.href, named ? label : "", false);
         }
         for (const m of text.matchAll(URL_RE)) push(trimPunctuation(m[0]), "", false);
-        for (const a of anchors) push(a.href, "", true);
+        for (const a of anchors) push(a.href, rowFileName(a), true);
+        return out;
+    }
+
+    /** A weak anchor ("Download") that names no file borrows the name its
+     * row shows: hoster/crypter pages put the filename beside the button,
+     * and the daemon's grouping keys on those names. Other anchors' labels
+     * are not the row's name (a paragraph may hold part1 ... part3 and one
+     * "Download"), so they are stripped before matching. Bounded walk -
+     * nearest ancestor whose stripped text stays row-sized. */
+    function rowFileName(a) {
+        let node = a.parentElement;
+        for (let hop = 0; node && hop < 5; hop++, node = node.parentElement) {
+            if (node.tagName === "BODY" || node.tagName === "HTML") return "";
+            const text = textWithoutOtherAnchors(node, a).replace(/\s+/g, " ").trim();
+            if (text.length > 200) continue; // a page-sized container, not a row
+            const m = text.match(FILE_TOKEN_RE);
+            if (m) return m[0].trim().slice(0, 160);
+        }
+        return "";
+    }
+
+    /** node's visible text, dropping every <a> but `self` (their labels are
+     * their own names - the prose between the links is the row's text). */
+    function textWithoutOtherAnchors(node, self) {
+        if (node === self) return "";
+        let out = "";
+        for (const child of node.childNodes) {
+            if (child.nodeType === 3) { out += child.nodeValue; continue; }
+            if (child.nodeType !== 1) continue;
+            if (child.tagName === "A" && child !== self) continue;
+            out += textWithoutOtherAnchors(child, self);
+        }
         return out;
     }
 
