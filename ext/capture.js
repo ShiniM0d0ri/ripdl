@@ -26,9 +26,10 @@
     /** Anchor text that names a file, never a command ("Download", "here"). */
     const FILENAME_RE = /^[^\\/:*?"<>|\r\n]{1,120}\.[A-Za-z0-9]{1,8}$/;
     /** A filename-looking token anywhere in a row ("... [DODI].part01.rar" on
-     * crypter/hoster rows whose button carries no name itself). */
+     * crypter/hoster rows whose button carries no name itself). The class
+     * holds everything a release name uses; ] and - escaped/placed last. */
     const FILE_TOKEN_RE =
-        /(?:[\w[\](){}+_'&. -]{2,116}\.)?(?:rar|zip|7z|tar|gz|tgz|cab|iso|mkv|mp4|avi|part\d{2})\b/i;
+        /(?:[\w [\]().+_'&{}-]{2,116}\.)?(?:rar|zip|7z|tar|gz|tgz|cab|iso|mkv|mp4|avi|part\d{2})\b/i;
 
     let host = null; // <ripdl-offer-chip> element
     let root = null; // its shadow root
@@ -105,12 +106,32 @@
         }
         for (const a of anchors) {
             const label = (a.textContent || "").trim();
+            if (label && isSiteAnchor(a, label)) continue;
             const named = FILENAME_RE.test(label);
             if (named || textHasUrl) push(a.href, named ? label : "", false);
         }
         for (const m of text.matchAll(URL_RE)) push(trimPunctuation(m[0]), "", false);
-        for (const a of anchors) push(a.href, rowFileName(a), true);
+        for (const a of anchors) {
+            const label = (a.textContent || "").trim();
+            if (label && isSiteAnchor(a, label)) continue;
+            push(a.href, rowFileName(a), true);
+        }
         return out;
+    }
+
+    /** A link labelled with its own address ("filekeeper.net" -> the site)
+     * is navigation, not a file: a domain-shaped label matches the filename
+     * test by accident and would ride the offer as junk parts. */
+    function isSiteAnchor(a, label) {
+        if (/[\s/]/.test(label)) return false;
+        let host;
+        try {
+            host = new URL(a.href, document.baseURI).hostname.toLowerCase().replace(/^www\./, "");
+        } catch {
+            return false;
+        }
+        const lab = label.toLowerCase().replace(/^https?:\/\//, "").replace(/[/.]+$/, "");
+        return lab === host || lab.endsWith("." + host);
     }
 
     /** A weak anchor ("Download") that names no file borrows the name its
@@ -132,7 +153,10 @@
     }
 
     /** node's visible text, dropping every <a> but `self` (their labels are
-     * their own names - the prose between the links is the row's text). */
+     * their own names - the prose between the links is the row's text).
+     * Element children are separated with a space: textContent concatenates
+     * siblings directly, and "...part01.rar" followed by "2.00 GB" must not
+     * read as "...part01.rar2.00" (no word boundary, no match). */
     function textWithoutOtherAnchors(node, self) {
         if (node === self) return "";
         let out = "";
@@ -140,7 +164,7 @@
             if (child.nodeType === 3) { out += child.nodeValue; continue; }
             if (child.nodeType !== 1) continue;
             if (child.tagName === "A" && child !== self) continue;
-            out += textWithoutOtherAnchors(child, self);
+            out += ` ${textWithoutOtherAnchors(child, self)} `;
         }
         return out;
     }

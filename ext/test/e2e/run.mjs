@@ -108,7 +108,11 @@ addFile("ext-slow.bin", 6 * MiB, { throttleBps: 128 * KiB });
 addFile("single.zip", 1 * MiB);
 for (const n of [1, 2, 3]) addFile(`rel.part${n}.rar`, 1 * MiB);
 for (const n of [1, 2, 3]) addFile(`named.part${n}.rar`, 1 * MiB);
+for (const n of [1, 2, 3]) addFile(`fx.part${n}.rar`, 1 * MiB);
 for (const n of [1, 2]) addFile(`box.part${n}.rar`, 1 * MiB);
+// Crypter-style opaque hook ids (the same shape filecrypt serves). The button
+// hrefs stay opaque: the part's real name must come from the row text.
+const FX_LINKS = new Map([["7C388CCC50", "fx.part1.rar"], ["9AA9349455", "fx.part2.rar"], ["E09FA43842", "fx.part3.rar"]]);
 
 function pageHtml(origin) {
     const link = (p) => `${origin}${p}`;
@@ -121,6 +125,11 @@ function pageHtml(origin) {
 <p id="named">Parts: <a href="/files/named.part1.rar">named.part1.rar</a> <a href="/files/named.part2.rar">named.part2.rar</a> <a href="/files/named.part3.rar">Download</a> <a href="/article">Read more</a></p>
 <p id="single"><a href="/files/single.zip">single.zip</a></p>
 <p id="slow"><a href="/slow/ext-slow.bin">ext-slow.bin</a></p>
+<table id="fcx" style="border-collapse:collapse"><tbody>
+<tr class="kwj1"><td class="status"><i class="online small"></i></td><td title="fx.part1.rar">fx.part1.rar<span><a href="//fixture-hoster.example/" target="_blank" class="external_link">fixture-hoster.example</a></span></td><td>2.00 GB</td><td><a href="/Link/7C388CCC50.html" class="button download" target="7C388CCC50" title="Download" data-i18n="Download"></a></td></tr>
+<tr class="kwj2"><td class="status"><i class="online small"></i></td><td title="fx.part2.rar">fx.part2.rar<span><a href="//fixture-hoster.example/" target="_blank" class="external_link">fixture-hoster.example</a></span></td><td>2.00 GB</td><td><a href="/Link/9AA9349455.html" class="button download" target="9AA9349455" title="Download" data-i18n="Download"></a></td></tr>
+<tr class="kwj3"><td class="status"><i class="online small"></i></td><td title="fx.part3.rar">fx.part3.rar<span><a href="//fixture-hoster.example/" target="_blank" class="external_link">fixture-hoster.example</a></span></td><td>2.00 GB</td><td><a href="/Link/E09FA43842.html" class="button download" target="E09FA43842" title="Download" data-i18n="Download"></a></td></tr>
+</tbody></table>
 <textarea id="box" rows="3" cols="70">${[1, 2].map((n) => link(`/files/box.part${n}.rar`)).join("\n")}</textarea>
 </body></html>`;
 }
@@ -256,6 +265,22 @@ function prepareExtensionCopy(relayUrl) {
     // Diagnostics only: the capture snapshot reads this module state (private copy, never shipped).
     const exposed = "\nglobalThis.__ripdlE2E.internals = { reqByUrl, reqByRequestId, browserOwned, findRecord, headersFor, get hostAlive() { return hostAlive; }, get port() { return port; } };\n" + TRACE_TAIL;
     let src = fs.readFileSync(bg, "utf8");
+    // An e2e-only claimer for crypter-style opaque links (/Link/<id>.html on
+    // any host): mirrors what a real hoster plugin contributes to a copy
+    // offer - it keeps those weak candidates alive. Never shipped.
+    const claimer = `export default {
+    id: "fcx-e2e.test",
+    label: "fcx e2e claimer",
+    match(url) { try { return /^\\/Link\\/[0-9A-F]{8,32}\\.html$/i.test(new URL(url).pathname); } catch { return false; } },
+};
+`;
+    const pluginDir = path.join(DIR.ext, "hosts", "local");
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, "fcx-e2e.js"), claimer);
+    fs.writeFileSync(
+        path.join(pluginDir, "registry.js"),
+        `import * as fcx from "./fcx-e2e.js";\nexport const SCRIPTS = [{ file: "fcx-e2e.js", mod: fcx }];\n`,
+    );
     const anchors = [
         ["function remember(details) {", "function remember(details) {\n    __ripdlTraceWebRequest(details);"],
         ["        decide: decideHandoff,", "        decide: __ripdlTraceDecide,"],
@@ -902,6 +927,29 @@ async function extPhase() {
             check("B7 chip closes after the send", await until("the B7 chip to close", gone, 6000));
         });
 
+        await step("B18 crypter rows: nameless buttons, row-named parts -> one bundle", async () => {
+            // Enable the e2e claimer plugin the way the options page would:
+            // a script plugin loads only after it was seen and enabled once.
+            await evaluate(sw, `(async () => {
+                const cur = await chrome.storage.local.get(["plugins_enabled", "plugin_seen"]);
+                await chrome.storage.local.set({
+                    plugins_enabled: { ...(cur.plugins_enabled || {}), "fcx-e2e.test": true },
+                    plugin_seen: { ...(cur.plugin_seen || {}), "fcx-e2e.js": true },
+                });
+                return "ok";
+            })()`);
+            await selectNode("fcx");
+            const k = await copyKeys();
+            check("B18 copy event fired", k.fired, k.via);
+            const c = await until("the B18 offer", offerReady, 10000);
+            check("B18 chip offers exactly the 3 Download buttons (site labels excluded)", c.text.includes("Send 3 links to ripdl"), squash(c.text));
+            check("B18 the row-named parts group as one set", c.text.includes("fx - 3 of 3 parts"), squash(c.text));
+            await clickChip("Send");
+            const q = await until("the B18 queued status", queuedReady, 15000);
+            check("B18 Send reports one bundle", q.text.includes("queued 1 bundle"), squash(q.text));
+            check("B18 chip closes after the send", await until("the B18 chip to close", gone, 6000));
+        });
+
         await step("B8 popup page: ripdl_send add with dest_dir", async () => {
             const reply = await popupAdd(fx("/files/pop.bin"), DIR.popupDest);
             check("B8 popup message accepted by the native host", !!(reply && reply.ok), JSON.stringify(reply));
@@ -1091,6 +1139,9 @@ async function extPhase() {
                 [path.join(DIR.downloads, "named", "named.part1.rar"), "named.part1.rar"],
                 [path.join(DIR.downloads, "named", "named.part2.rar"), "named.part2.rar"],
                 [path.join(DIR.downloads, "named", "named.part3.rar"), "named.part3.rar"],
+                [path.join(DIR.downloads, "fx", "fx.part1.rar"), "fx.part1.rar"],
+                [path.join(DIR.downloads, "fx", "fx.part2.rar"), "fx.part2.rar"],
+                [path.join(DIR.downloads, "fx", "fx.part3.rar"), "fx.part3.rar"],
                 [path.join(DIR.downloads, "single.zip"), "single.zip"],
                 [path.join(DIR.downloads, "ext-slow.bin"), "ext-slow.bin"],
                 [path.join(DIR.downloads, "cap.bin"), "cap.bin"],
@@ -1103,6 +1154,13 @@ async function extPhase() {
         await step("B16 server-side request checks", async () => {
             const seen = FIXTURES.hits();
             const pageFiles = seen.filter((h) => /^\/files\/(rel|named)\.|^\/files\/single\.zip$/.test(h.path));
+            const linkHits = seen.filter((h) => /^\/Link\/[0-9A-F]+\.html$/i.test(h.path));
+            check("B18 the crypter-links were fetched exactly once each", linkHits.length >= 3 && new Set(linkHits.map((h) => h.path)).size === 3, `${linkHits.length} requests`);
+            check(
+                "B16 the crypter-link requests carry the page as Referer",
+                linkHits.every((h) => h.referer === home()),
+                `${linkHits.length} requests`,
+            );
             check("B16 the box links were never requested", !seen.some((h) => h.path.includes("/files/box.part")));
             check("B16 the prose link /article was never requested", !seen.some((h) => h.path === "/article"));
             check(
@@ -1349,7 +1407,7 @@ async function main() {
     const downloadsBefore = downloadsSnapshot();
 
     try {
-        FIXTURES = startFixtures({ files: FILES, page: pageHtml });
+        FIXTURES = startFixtures({ files: FILES, links: FX_LINKS, page: pageHtml });
         ORIGIN = await FIXTURES.start();
         RELAY = await startRelay({ bridgeExe: RIPDL, origin: `chrome-extension://${EXT_ID}/`, env: ENV, logDir: RUN_DIR });
         prepareExtensionCopy(RELAY.url);

@@ -5,12 +5,13 @@
 //   /dl/<name>           same bytes with Content-Disposition: attachment
 //   /norange/<name>      no range support (the single-stream path)
 //   /slow/<name>         byte ranges, throttled per connection (entry.throttleBps)
+//   /Link/<id>.html      crypter-style opaque link -> links.get(id)'s bytes
 // Every request is logged; the runner reads the log through hits().
 import http from "node:http";
 
 const RANGE = /^bytes=(\d*)-(\d*)$/;
 
-export function startFixtures({ files, page }) {
+export function startFixtures({ files, links, page }) {
     const hits = [];
     let origin = "";
 
@@ -30,6 +31,11 @@ export function startFixtures({ files, page }) {
         };
         if (url.pathname === "/") return text(200, "text/html; charset=utf-8", page(origin));
         if (url.pathname === "/article") return text(200, "text/html; charset=utf-8", "<p>article</p>");
+        const lk = /^\/Link\/([0-9A-F]{8,32})\.html$/i.exec(url.pathname);
+        if (lk) {
+            const mapped = links ? links.get(lk[1].toUpperCase()) : undefined;
+            if (mapped) return serve("files", mapped, files.get(mapped), req, res, hit);
+        }
         const m = /^\/(files|dl|norange|slow)\/(.+)$/.exec(url.pathname);
         const name = m ? decodeURIComponent(m[2]) : "";
         const entry = m ? files.get(name) : undefined;
