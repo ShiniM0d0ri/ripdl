@@ -9,7 +9,7 @@ Upgrade/registration/trial popups are **excluded** from this map.
 |---|---|---|---|
 | S01 | Main window + task table | spec ready, native spike partial | SHARED |
 | S02 | Add URL | spec ready, spike shell only | S01 |
-| S03 | Settings / Options | spec ready, generated schema landed | SHARED, S01 |
+| S03 | Settings / Options | spec ready, generated schema landed | SHARED, S01, SETTINGS.csv |
 | S04 | Scheduler | spec ready, daemon support exists | S02, S03 |
 | S05 | Link grabber / bundles | spec ready, bundle engine exists | S02, S01 |
 | S06 | Queues | spec ready, single queue today | S01 |

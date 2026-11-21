@@ -1,6 +1,8 @@
 # S03 - Settings / Options
 
-Status: `spec ready` (schema and codegen landed; UI to build). Read `SHARED.md`.
+Status: `spec ready` (schema and codegen landed; UI to build). Read `SHARED.md`
+and `SETTINGS.csv` for the individual 50 options; this card is only the screen
+shell.
 
 Screenshot: IDM Settings dialog not captured; group order from IDM help + UI-MAP S03.
 
