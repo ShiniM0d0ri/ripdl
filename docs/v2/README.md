@@ -169,6 +169,9 @@ Rules:
 - `INVARIANTS.md`: the numeric rules the system must never break.
 - `ARCHITECTURE.md`: module ownership and data flow.
 - `UI-SPIKE.md`: native UI scope, toolkit, and go/no-go metrics.
+- `SCALABILITY.md`: load targets, protocol sizing, generated types, CI gates.
+- `EXTENSION-PLAN.md`: the extension as a first-class v2 frontend.
+- `FEATURE-ROADMAP.md`: which feature IDs land in v0.5, v0.6, and v0.7.
 
 Exit: every feature marked `shipped` has a code path and a test; every headline
 bug has a failing-test sketch.
@@ -196,26 +199,38 @@ Standalone module:
 
 Exit: per-link rates sum to the aggregate; no ghost links; CLI and daemon agree.
 
-### M3 - daemon integration
+### M3 - daemon integration + protocol v2
 
-Wire `TrafficController` and `LinkSet` behind `traffic-v2`:
+Wire `TrafficController` and `LinkSet` behind `traffic-v2`, and define the
+wire format at the same time so frontends do not build against a shape that
+cannot scale:
 
 - HTTP tasks, bundle parts, torrents, and video share the global cap;
 - live limit changes apply within one tick;
-- `TaskInfo` rate fields come from the controller;
-- old path remains default until parity.
+- `GetSnapshot { since }` with full/delta snapshots, sized for the extension's
+  1 MiB reply cap;
+- one `TransferSnapshot` with task, link, limit, and throttle state;
+- `protocol_version` in the handshake; v1 command adapters for old clients;
+- generated `protocol.d.ts` for GUI and extension, checked in CI.
 
 Exit: two HTTP tasks + one bundle + one torrent + one video under one cap;
-pause latency < 300 ms at 10 KB/s.
+pause latency < 300 ms at 10 KB/s; a 200-task snapshot stays under 1 MiB.
 
-### M4 - protocol v2
+### M4 - frontends
 
-- `protocol_version` on the handshake;
-- `GetSnapshot` / `Subscribe` (or a bounded event stream);
-- one `TransferSnapshot` with task, link, limit, and throttle state;
-- v1 command adapters for old clients.
+Split by surface so one frontend cannot block another:
 
-Exit: old CLI/extension still work; new CLI/GUI render the same numbers.
+- **M4a CLI**: render the snapshot; add `--json` for automation; keep old
+  commands working through v1 adapters where needed.
+- **M4b Tauri GUI**: remove `liveSpeed`/`speedText` math; render snapshots;
+  keep only graph history in the frontend.
+- **M4c Extension**: execute `EXTENSION-PLAN.md` E1-E4 - pipe verification,
+  version handshake, ping, delta store, generated types, rehydration.
+- **M4d Native spike** (parallel, timeboxed): egui prototype + AccessKit
+  inspection harness; no WebView2.
+
+Exit: CLI, GUI, and extension show the same numbers from the same snapshot;
+old extension still works; the native harness can assert a row without pixels.
 
 ### M5 - flip and delete
 
@@ -226,16 +241,19 @@ Exit: old CLI/extension still work; new CLI/GUI render the same numbers.
 Exit: conformance suite, existing tests, node tests, and the manual e2e gate
 all pass.
 
-### M6 - native UI decision
+### M6 - feature waves
 
-Runs in parallel from M1, timeboxed:
+Follow `FEATURE-ROADMAP.md`:
 
-- `spike/native-ui` with the task list, status bar, Add URL, Settings;
-- read-only snapshot first, then pause/resume/remove;
-- measure startup, RSS, CPU, binary size, DPI, keyboard, Narrator;
-- keep Tauri unless the numbers clearly win.
+- v0.6 "control": per-host limits, proxy, checksum, HTTP/2, safe filenames,
+  config validation, per-task torrent cap, LAN throttle, update cache,
+  extension hardening, queue priorities, bandwidth scheduling.
+- v0.7 "reach": grabber/packages, auto-extract, automation/MCP, diagnostics,
+  Firefox, shell integration, post-download hooks.
+- native UI adoption only if the M4d measurements win; otherwise keep Tauri.
 
-Exit: `docs/v2/UI-SPIKE.md` updated with measurements and a go/no-go.
+Each feature graduates idea -> matrix row -> invariant -> code -> test ->
+shipped. No shortcut.
 
 ## Definition of done
 
