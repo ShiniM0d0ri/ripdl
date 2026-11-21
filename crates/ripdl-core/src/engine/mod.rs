@@ -136,6 +136,9 @@ pub struct EngineConfig {
     /// draws its budget from this handle (global -> task -> host) instead of
     /// the engine's private limiter. `None` keeps v1 behavior.
     pub traffic: Option<std::sync::Arc<dyn crate::traffic::Traffic>>,
+    /// v2: optional shared link set. When set, per-link bytes are metered here
+    /// instead of only in the private bond authority.
+    pub links: Option<std::sync::Arc<crate::links::LinkSet>>,
 }
 
 impl Default for EngineConfig {
@@ -151,6 +154,7 @@ impl Default for EngineConfig {
             bond_state: None,
             stream_idle: Some(std::time::Duration::from_secs(30)),
             traffic: None,
+            links: None,
         }
     }
 }
@@ -343,6 +347,7 @@ impl Engine {
         // picked the OS default route carries the attempt.
         let dialer = self.dialer.clone();
         let traffic = self.cfg.traffic.clone();
+        let links = self.cfg.links.clone();
 
         // On-the-fly bond rebalancing state, shared by the workers and the
         // migration supervisor below.
@@ -367,6 +372,7 @@ impl Engine {
             let migrate = migrate.clone();
             let stream_idle = self.cfg.stream_idle;
             let traffic = traffic.clone();
+            let links = links.clone();
             // Ramp-in (the part-start lag spike): every segment used to
             // open its first handshake at the same moment, which read as a
             // hard CPU/AV hitch at every part start. First dials are spaced
@@ -394,6 +400,7 @@ impl Engine {
                     linkmap,
                     migrate,
                     traffic,
+                    links,
                 )
                 .await;
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -801,6 +808,7 @@ async fn run_segment(
     migrate: Arc<Mutex<HashMap<usize, IpAddr>>>,
     // v2: daemon-owned budget. `None` keeps the private limiter path.
     traffic: Option<Arc<dyn crate::traffic::Traffic>>,
+    links: Option<Arc<crate::links::LinkSet>>,
 ) -> Result<()> {
     let mut attempt = 0u32;
     // A migration order the previous attempt ended with: the next dial must
@@ -923,6 +931,7 @@ async fn run_segment(
             stream_idle,
             &migrate,
             traffic.as_deref(),
+            links.as_deref(),
         )
         .await
         {
@@ -1121,6 +1130,7 @@ async fn segment_attempt(
     stream_idle: Option<Duration>,
     migrate: &Mutex<HashMap<usize, IpAddr>>,
     traffic: Option<&dyn crate::traffic::Traffic>,
+    links: Option<&crate::links::LinkSet>,
 ) -> Result<()> {
     let mut file: Option<std::fs::File> = Some(
         std::fs::OpenOptions::new()
@@ -1391,6 +1401,9 @@ async fn segment_attempt(
         // Attribute the bytes to the link this connection dialed through;
         // the sampler folds deltas into per-link rate EMAs.
         if let Some((bond, link)) = &bond_ctx {
+            if let Some(set) = links {
+                set.record_ip(link.info.ip, chunk.len() as u64, false);
+            }
             bond.record(link, chunk.len() as u64);
         }
 

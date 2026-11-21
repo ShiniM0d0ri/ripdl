@@ -290,6 +290,8 @@ struct Daemon {
     traffic: Arc<TrafficController>,
     #[cfg(feature = "traffic-v2")]
     links: Arc<LinkSet>,
+    #[cfg(feature = "traffic-v2")]
+    link_sample_at: Mutex<Option<Instant>>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
     /// Set during an install fetch (concurrent ones would share a .part).
@@ -411,6 +413,8 @@ impl Daemon {
             traffic: TrafficController::new(initial_speed),
             #[cfg(feature = "traffic-v2")]
             links: LinkSet::new(),
+            #[cfg(feature = "traffic-v2")]
+            link_sample_at: Mutex::new(None),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
             lan: tokio::sync::Mutex::new(None),
@@ -1614,6 +1618,9 @@ impl Daemon {
             let conf = self.conf();
             self.traffic.set_global_rate(conf.max_speed());
             self.links.set_enabled(conf.bond_interfaces());
+            if let Some(session) = self.torrents.lock().await.clone() {
+                session.set_download_rate_limit(conf.max_speed());
+            }
         }
         match new_max.checked_sub(old_max) {
             Some(grow) if grow > 0 => self.sem.add_permits(grow),
@@ -1719,6 +1726,10 @@ impl Daemon {
         traffic: Option<Arc<dyn ripdl_core::traffic::Traffic>>,
     ) -> EngineConfig {
         let conf = self.conf();
+        #[cfg(feature = "traffic-v2")]
+        let link_feed = Some(Arc::clone(&self.links));
+        #[cfg(not(feature = "traffic-v2"))]
+        let link_feed = None;
         EngineConfig {
             max_segments: conf.max_segments(),
             min_segment_size: conf.min_segment_size(),
@@ -1734,6 +1745,7 @@ impl Daemon {
             // shared across tasks instead of re-discovered per engine.
             bond_state: Some(self.bond.clone()),
             traffic,
+            links: link_feed,
             ..EngineConfig::default()
         }
     }
@@ -1788,6 +1800,8 @@ impl Daemon {
             // bound, not what the config says.
             *self.torrent_bind.lock().unwrap() = Some(bind.unwrap_or_default());
             let session = Arc::new(session);
+            #[cfg(feature = "traffic-v2")]
+            session.set_download_rate_limit(self.conf().max_speed());
             *guard = Some(session);
         }
         Ok(Arc::clone(guard.as_ref().unwrap()))
@@ -1932,6 +1946,11 @@ impl Daemon {
         if !self.conf().bond_interfaces() {
             self.bond.set_links(&[]);
             *self.bond_links.lock().unwrap() = Vec::new();
+            #[cfg(feature = "traffic-v2")]
+            {
+                self.links.set_enabled(false);
+                *self.link_sample_at.lock().unwrap() = None;
+            }
             return;
         }
         let links: Vec<ripdl_core::bond::LinkInfo> = {
@@ -1948,6 +1967,26 @@ impl Daemon {
                 })
                 .collect()
         };
+        #[cfg(feature = "traffic-v2")]
+        {
+            let now = Instant::now();
+            let mut prev = self.link_sample_at.lock().unwrap();
+            let measured = prev
+                .map(|t| now.duration_since(t))
+                .unwrap_or(Duration::from_secs(5));
+            *prev = Some(now);
+            self.links.set_enabled(true);
+            let infos: Vec<ripdl_core::links::LinkInfo> = links
+                .iter()
+                .map(|l| ripdl_core::links::LinkInfo {
+                    ip: l.ip,
+                    name: l.name.clone(),
+                    default_route: l.default_route,
+                })
+                .collect();
+            self.links.set_links(&infos);
+            let _ = self.links.sample(tokio::time::Instant::from_std(now), measured);
+        }
         self.bond.set_links(&links);
         let status = self.bond.sample(dt);
         *self.bond_links.lock().unwrap() = status
@@ -3962,6 +4001,10 @@ impl Daemon {
                         url: rec.url.clone(),
                         dest_dir: rec.dest_dir.clone().unwrap_or_default(),
                         headers: rec.headers.clone(),
+                        #[cfg(feature = "traffic-v2")]
+                        limit_bps: this.conf().max_speed(),
+                        #[cfg(not(feature = "traffic-v2"))]
+                        limit_bps: None,
                     };
                     ripdl_core::hunt::download(cfg, &token, on_progress)
                         .await

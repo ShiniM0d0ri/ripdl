@@ -47,9 +47,13 @@ registered with a run generation, `on_progress` feeds bytes into its
 `TaskTraffic`, and HTTP/bundle engines acquire budget from the shared handle
 instead of a private limiter. Old paths remain default; CLI keeps a v1 arm.
 
-Remaining M3: torrent and video budget enforcement (librqbit `LimitsConfig`,
-`--limit-rate`), feed `LinkSet` from real HTTP/torrent connections, and replace
-split `bond_links`/`torrent_rates` config fields with the one snapshot.
+Landed next: session-wide torrent download cap via librqbit `LimitsConfig`
+(live on `SetConfig`), yt-dlp `--limit-rate` from the global budget, and HTTP
+per-link metering into the one `LinkSet` with a measured sampler `dt`.
+
+Remaining M3: per-task torrent cap (vendor delta), feed torrent `MeteredRead`
+into the same `LinkSet`, and replace split `bond_links`/`torrent_rates` config
+fields with the one snapshot.
 
 Exit: two HTTP tasks + bundle + torrent + video under one cap in the daemon;
 live change applies within one tick; one link snapshot in CLI/GUI/config.

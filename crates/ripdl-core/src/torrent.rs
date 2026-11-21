@@ -357,6 +357,13 @@ fn sanitize_component(s: &str) -> String {
     }
 }
 
+/// Convert a daemon byte cap into librqbit's `NonZeroU32` rate. Oversized
+/// budgets saturate to `u32::MAX` rather than silently becoming unlimited.
+fn rate_limit(bps: Option<u64>) -> Option<std::num::NonZeroU32> {
+    bps.map(|v| v.min(u32::MAX as u64) as u32)
+        .and_then(std::num::NonZeroU32::new)
+}
+
 /// Process-wide handle over the daemon's single torrent session.
 pub struct TorrentSession {
     session: Arc<Session>,
@@ -480,6 +487,27 @@ impl TorrentSession {
     /// Monotonic bytes read over each bonded uplink.
     pub fn bind_totals(&self) -> Vec<(IpAddr, u64)> {
         self.session.bind_totals()
+    }
+
+    /// Session-wide download cap from the daemon's global budget. librqbit
+    /// applies this to peer reads; larger budgets are clamped to u32 bytes/s.
+    pub fn set_download_rate_limit(&self, bps: Option<u64>) {
+        self.session
+            .ratelimits
+            .set_download_bps(rate_limit(bps));
+    }
+
+    /// Session-wide upload cap (seeding), when configured.
+    pub fn set_upload_rate_limit(&self, bps: Option<u64>) {
+        self.session.ratelimits.set_upload_bps(rate_limit(bps));
+    }
+
+    /// Effective session download cap, for diagnostics and tests.
+    pub fn download_rate_limit(&self) -> Option<u64> {
+        self.session
+            .ratelimits
+            .get_download_bps()
+            .map(|v| v.get() as u64)
     }
 
     /// Make sure the torrent is managed, in the requested run state.
@@ -1246,6 +1274,14 @@ mod tests {
 
         seed_session.stop().await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rate_limit_conversion() {
+        assert_eq!(rate_limit(None), None);
+        assert_eq!(rate_limit(Some(0)), None);
+        assert_eq!(rate_limit(Some(512 * 1024)).map(|v| v.get()), Some(512 * 1024));
+        assert_eq!(rate_limit(Some(u64::MAX)).map(|v| v.get()), Some(u32::MAX));
     }
 
     // Pre-add preview: a local .torrent resolves offline (no swarm), with

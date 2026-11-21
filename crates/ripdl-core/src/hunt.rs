@@ -48,6 +48,9 @@ pub struct HuntConfig {
     pub dest_dir: PathBuf,
     /// Request headers replayed into yt-dlp (cookies, referer, UA...).
     pub headers: HashMap<String, String>,
+    /// v2: daemon-wide byte cap passed to yt-dlp as `--limit-rate`.
+    /// `None` leaves the sidecar uncapped.
+    pub limit_bps: Option<u64>,
 }
 
 /// Resulting output file, when the tool reported one.
@@ -148,6 +151,17 @@ pub fn build_args(cfg: &HuntConfig) -> Vec<String> {
         }
         args.push("--add-header".to_string());
         args.push(format!("{k}: {v}"));
+    }
+    if let Some(bps) = cfg.limit_bps {
+        let rate = if bps >= 1024 * 1024 {
+            format!("{}M", bps / (1024 * 1024))
+        } else if bps >= 1024 {
+            format!("{}K", bps / 1024)
+        } else {
+            bps.to_string()
+        };
+        args.push("--limit-rate".to_string());
+        args.push(rate);
     }
     args.push("--".to_string());
     args.push(cfg.url.clone());
@@ -350,7 +364,20 @@ mod tests {
             url: url.into(),
             dest_dir: PathBuf::from("D:\\dl"),
             headers: HashMap::new(),
+            limit_bps: None,
         }
+    }
+
+    #[test]
+    fn limit_rate_is_passed_to_ytdlp() {
+        let mut c = cfg("https://example.com/v");
+        c.limit_bps = Some(2 * 1024 * 1024);
+        let args = build_args(&c);
+        let i = args
+            .iter()
+            .position(|a| a == "--limit-rate")
+            .expect("limit-rate present");
+        assert_eq!(args[i + 1], "2M");
     }
 
     #[test]

@@ -256,6 +256,19 @@ impl LinkSet {
         })
     }
 
+    /// Aggregate byte feed for an engine that has no connection guard (e.g.
+    /// reqwest's pooled sockets). Per-connection capacity still comes from
+    /// guards opened by calls that can hold one.
+    pub fn record_ip(&self, ip: IpAddr, bytes: u64, utp: bool) {
+        if let Some(link) = self.link(ip) {
+            if utp {
+                link.utp_meter.add(bytes);
+            } else {
+                link.meter.add(bytes);
+            }
+        }
+    }
+
     pub fn note_ok(&self, ip: IpAddr) {
         if let Some(link) = self.link(ip) {
             link.fails.store(0, Ordering::Relaxed);

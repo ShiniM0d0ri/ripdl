@@ -169,7 +169,7 @@ not `shipped`.
 | TOR-009 | Stable listen port + UPnP | shipped | `torrent.rs` | Live verification noted in AGENTS |
 | TOR-010 | NIC bonding for peer TCP | shipped | `torrent.rs`, vendor | Torrent integration test |
 | TOR-011 | Per-link torrent rate | partial | `daemon/main.rs` | Aggregate only, no per-connection capacity |
-| TOR-012 | Global speed limit | missing | `torrent.rs::new` | `SessionOptions::ratelimits` left at default |
+| TOR-012 | Global speed limit | partial | `torrent.rs::set_download_rate_limit`, daemon `traffic-v2` | Session-wide librqbit cap is live; per-task cap needs the vendor delta |
 | TOR-013 | Per-task speed limit | missing | `torrent.rs` | Not supported by the current session config |
 | TOR-014 | uTP | missing | `torrent.rs` | TCP-only listener/connect defaults |
 | TOR-015 | Download speed display | partial | `daemon/main.rs::on_progress` | 4 s byte window; tool rate is ignored |
@@ -186,7 +186,7 @@ not `shipped`.
 | VID-001 | yt-dlp sidecar | shipped | `hunt.rs` | Unit tests + live P4 verification |
 | VID-002 | Percent-based progress | shipped | `hunt.rs::parse_progress` | `parses_plain_percent` and friends |
 | VID-003 | Pause = kill sidecar, resume = re-invoke | shipped | `hunt.rs` | Live verification |
-| VID-004 | Global speed limit | missing | `hunt.rs` | `--limit-rate` is not passed |
+| VID-004 | Global speed limit | shipped | `hunt.rs::build_args` | `limit_rate_is_passed_to_ytdlp`; daemon passes the global budget |
 | VID-005 | Speed display | missing | `hunt.rs` | Only percent is emitted |
 | VID-006 | Refresh address | missing | `daemon/main.rs` | Refresh is HTTP-only |
 | VID-007 | Configurable yt-dlp path | shipped | `rpc.rs`, `hunt.rs` | CLI/GUI config |
