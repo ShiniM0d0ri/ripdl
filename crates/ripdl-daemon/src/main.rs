@@ -1593,6 +1593,12 @@ impl Daemon {
         );
         *self.config.lock().unwrap() = settings;
         let new_max = self.conf().max_concurrent();
+        #[cfg(feature = "traffic-v2")]
+        {
+            let conf = self.conf();
+            self.traffic.set_global_rate(conf.max_speed());
+            self.links.set_enabled(conf.bond_interfaces());
+        }
         match new_max.checked_sub(old_max) {
             Some(grow) if grow > 0 => self.sem.add_permits(grow),
             Some(_) => {}
@@ -4688,6 +4694,28 @@ mod tests {
                 assert!(controller.tasks.is_empty());
                 assert!(links.is_empty());
                 assert_eq!(controller.global_limit_bps, None);
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "traffic-v2")]
+    #[tokio::test]
+    async fn traffic_limit_change_applies_live() {
+        let (daemon, _dir) = proposal_daemon("traffic-live");
+        let settings = ripdl_core::rpc::DaemonSettings {
+            max_speed_bytes: Some(2000),
+            ..Default::default()
+        };
+        let resp = daemon.cmd_set_config(2, settings).await;
+        assert!(
+            matches!(resp.reply, Reply::Config { .. }),
+            "set_config failed: {resp:?}"
+        );
+        let snap = daemon.cmd_get_traffic_snapshot(3);
+        match snap.reply {
+            Reply::TrafficSnapshot { controller, .. } => {
+                assert_eq!(controller.global_limit_bps, Some(2000));
             }
             other => panic!("unexpected reply: {other:?}"),
         }

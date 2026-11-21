@@ -42,7 +42,8 @@ Wire the two domains into the daemon behind a `traffic-v2` feature flag:
 
 Landed so far: daemon owns `TrafficController` + `LinkSet` behind the
 `traffic-v2` Cargo feature; `Command::GetTrafficSnapshot` answers one snapshot;
-the old paths remain default and the CLI has a v1-compatible arm.
+`SetConfig` applies live global-limit and bonding changes; the old paths remain
+default and the CLI has a v1-compatible arm.
 
 Remaining M3: register each task/part/torrent/video with the controller, feed
 the `LinkSet` from HTTP + torrent connections, apply live limit/link changes,
