@@ -18,9 +18,9 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 |---|---|
 | Branch | `next` (clean) |
 | Commit | see `git log -1 --oneline` (updated each PR) |
-| Product code | M1 traffic + M2 links domains landed, not yet wired into daemon |
+| Product code | M1/M2 domains; M3 first slice (daemon ownership + `GetTrafficSnapshot`) |
 | Trackers | `ISSUES.csv` (73), `FEATURE-MATRIX.md`, `INVARIANTS.md` |
-| Next milestone | M3 - daemon integration behind `traffic-v2` |
+| Next milestone | M3 - wire tasks/engines into the owned domains |
 
 M1 and M2 exits met: 12 traffic tests + 14 link tests pass. Global cap, bundle
 share, torrent/video coverage, live limits, cancellation, burst, retry
@@ -39,6 +39,14 @@ Wire the two domains into the daemon behind a `traffic-v2` feature flag:
 3. The `LinkSet` replaces `bond_links` / `torrent_rates` / `bind_rates` in
    `Reply::Config` with one snapshot; probing runs only when bonding is on.
 4. Old rate/limit/bond paths stay the default until parity tests pass.
+
+Landed so far: daemon owns `TrafficController` + `LinkSet` behind the
+`traffic-v2` Cargo feature; `Command::GetTrafficSnapshot` answers one snapshot;
+the old paths remain default and the CLI has a v1-compatible arm.
+
+Remaining M3: register each task/part/torrent/video with the controller, feed
+the `LinkSet` from HTTP + torrent connections, apply live limit/link changes,
+and replace the split `bond_links`/`torrent_rates` config fields.
 
 Exit: two HTTP tasks + bundle + torrent + video under one cap in the daemon;
 live change applies within one tick; one link snapshot in CLI/GUI/config.

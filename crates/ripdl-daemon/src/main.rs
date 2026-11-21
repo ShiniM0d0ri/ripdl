@@ -16,6 +16,10 @@ use ripdl_core::rpc::{
 };
 use ripdl_core::task::{Progress, TaskKind, TaskState};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
+#[cfg(feature = "traffic-v2")]
+use ripdl_core::links::LinkSet;
+#[cfg(feature = "traffic-v2")]
+use ripdl_core::traffic::TrafficController;
 
 /// Persisted queue record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +280,10 @@ struct Daemon {
     /// Latest `sample()` snapshot for `Reply::Config.bond_links` (plain RPC
     /// mirror; the authority itself is not serializable-lockable cheaply).
     bond_links: std::sync::Mutex<Vec<ripdl_core::rpc::BondLink>>,
+    #[cfg(feature = "traffic-v2")]
+    traffic: Arc<TrafficController>,
+    #[cfg(feature = "traffic-v2")]
+    links: Arc<LinkSet>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
     /// Set during an install fetch (concurrent ones would share a .part).
@@ -337,6 +345,8 @@ enum StaleCause {
 impl Daemon {
     fn new(queue_path: PathBuf, config_path: PathBuf, config: DaemonConfig) -> Result<Self> {
         let max_concurrent = config.max_concurrent();
+        #[cfg(feature = "traffic-v2")]
+        let initial_speed = config.max_speed();
         let extension_status_path = config_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -381,6 +391,10 @@ impl Daemon {
             shutdown: tokio::sync::Notify::new(),
             bond: std::sync::Arc::new(ripdl_core::bond::Bond::new()),
             bond_links: std::sync::Mutex::new(Vec::new()),
+            #[cfg(feature = "traffic-v2")]
+            traffic: TrafficController::new(initial_speed),
+            #[cfg(feature = "traffic-v2")]
+            links: LinkSet::new(),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
             lan: tokio::sync::Mutex::new(None),
@@ -1088,6 +1102,7 @@ impl Daemon {
                 Response { id: req.id, reply: Reply::Ok }
             }
             Command::GetConfig => self.cmd_get_config(req.id),
+            Command::GetTrafficSnapshot => self.cmd_get_traffic_snapshot(req.id),
             Command::SetConfig { settings } => self.cmd_set_config(req.id, settings).await,
             Command::ExtensionHello { version } => self.cmd_extension_hello(req.id, version),
             Command::CheckUpdate => self.cmd_check_update(req.id).await,
@@ -1359,6 +1374,22 @@ impl Daemon {
             id: req_id,
             reply: self.config_reply(),
         }
+    }
+
+    /// v2: one authoritative snapshot for limits, task rates and links.
+    /// With `traffic-v2` off the domains are still created; the snapshot is
+    /// empty so old frontends never see half-wired numbers.
+    fn cmd_get_traffic_snapshot(self: &Arc<Self>, req_id: u64) -> Response {
+        #[cfg(feature = "traffic-v2")]
+        let reply = Reply::TrafficSnapshot {
+            controller: self.traffic.snapshot(),
+            links: self.links.snapshot(),
+        };
+        #[cfg(not(feature = "traffic-v2"))]
+        let reply = Reply::Error {
+            message: "traffic-v2 is not enabled on this daemon".to_string(),
+        };
+        Response { id: req_id, reply }
     }
 
     /// Settings plus the live torrent-session bonding state. Frontends use the
@@ -4645,6 +4676,21 @@ mod tests {
         };
         let daemon = Daemon::new(dir.join("queue.json"), dir.join("config.json"), config).unwrap();
         (Arc::new(daemon), dir)
+    }
+
+    #[cfg(feature = "traffic-v2")]
+    #[test]
+    fn traffic_snapshot_is_empty_until_tasks_register() {
+        let (daemon, _dir) = proposal_daemon("traffic-snapshot");
+        let resp = daemon.cmd_get_traffic_snapshot(7);
+        match resp.reply {
+            Reply::TrafficSnapshot { controller, links } => {
+                assert!(controller.tasks.is_empty());
+                assert!(links.is_empty());
+                assert_eq!(controller.global_limit_bps, None);
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
     }
 
     /// Loopback server for handoff probes: HEAD reports `len` bytes, while the

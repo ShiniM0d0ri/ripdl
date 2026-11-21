@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::traffic::{Meter, RateWindow, DEFAULT_RATE_WINDOW};
@@ -26,7 +27,7 @@ pub const DEFAULT_EXPLORE_EVERY: Duration = Duration::from_secs(60);
 const DIAL_FAIL_SKIP: u32 = 2;
 
 /// One bindable uplink address.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LinkInfo {
     pub ip: IpAddr,
     pub name: String,
@@ -34,7 +35,7 @@ pub struct LinkInfo {
 }
 
 /// Serializable view of one link. This is the only shape frontends receive.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkSnapshot {
     pub name: String,
     pub ip: IpAddr,

@@ -854,6 +854,9 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Reply::TrafficSnapshot { .. } => {
+            println!("traffic-v2 snapshot is available; use a v2 frontend to render it");
+        }
         Reply::Error { message } => bail!("{message}"),
         Reply::Config {
             settings,

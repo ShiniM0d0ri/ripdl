@@ -9,6 +9,10 @@ license.workspace = true
 name = "ripdl-daemon"
 path = "src/main.rs"
 
+[features]
+# v2 traffic/link domains. Old paths remain the default until parity.
+traffic-v2 = []
+
 [dependencies]
 ripdl-core = { workspace = true }
 tokio = { workspace = true }

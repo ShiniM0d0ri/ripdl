@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -224,7 +225,8 @@ impl Limiter {
 }
 
 /// The kind of transfer, used only for diagnostics and tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TrafficKind {
     Http,
     Bundle,
@@ -232,7 +234,8 @@ pub enum TrafficKind {
     Video,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TrafficState {
     Running,
     Paused,
@@ -483,7 +486,7 @@ impl Traffic for PartTraffic {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskTrafficSnapshot {
     pub id: TaskId,
     pub kind: TrafficKind,
@@ -495,7 +498,7 @@ pub struct TaskTrafficSnapshot {
     pub throttled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerSnapshot {
     pub global_limit_bps: Option<u64>,
     pub total_bps: f64,
