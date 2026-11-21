@@ -22,6 +22,38 @@ the design is wrong.
    breaking changes get a version gate.
 8. **Proof per invariant.** Every rule in `INVARIANTS.md` has a test name.
 
+## Layers and ports
+
+The module list below is the physical layout. The logical layout is hexagonal,
+and the rules are enforced by CI fitness tests (see `QUALITY.md`):
+
+```
+domain/         Task, Transfer, Link, Setting, Policy, Event - pure, no I/O
+application/    Queue, Scheduler, Updater, EventBus - orchestration only
+ports/          Clock, Meter, Traffic, Links, Settings, EventSink
+adapters/in/    rpc, cli, gui, extension host, native messaging
+adapters/out/   engine, torrent, hunt, lan, update, disk, network
+```
+
+Dependencies point inward. An adapter never imports another adapter's
+internals; it talks through a port. A domain type never performs I/O.
+
+Key ports:
+
+- `Traffic`: acquire budget, report durable bytes, sample rates.
+- `Links`: current link set, per-link rates, weight policy, probe control.
+- `Settings`: typed get/set with scope and validation (see `SETTINGS.md`).
+- `Clock`/`Meter`: injected so time and byte accounting are testable.
+- `EventSink`: publish domain events to frontends and the event log.
+
+Domain events (versioned, additive):
+
+`TaskAdded`, `TaskStateChanged`, `TransferSampled`, `LimitChanged`,
+`LinkSetChanged`, `SettingsChanged`, `UpdateAvailable`, `ProposalExpired`.
+
+Events are the only way a frontend learns that something changed. There is no
+side-channel read of another module's mutex.
+
 ## Module map
 
 ```

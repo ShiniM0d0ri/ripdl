@@ -37,6 +37,25 @@ A rewrite would recreate those seams and throw away the hard parts that already
 work: crash-safe sidecars, sparse preallocation, torrent fastresume, browser
 capture, signed updates, and the LAN receiver.
 
+## Method: architecture first, not bug first
+
+`ISSUES.csv` is evidence, not a backlog. A bug is closed when the invariant
+that prevents its whole class exists and passes - see `QUALITY.md`. We do not
+schedule "fix bug 17"; we implement `INV-017` and the bug disappears with its
+class.
+
+Every capability is designed in this order:
+
+```
+domain model -> invariant -> port/contract -> adapter -> test -> matrix status
+```
+
+Settings are part of the architecture, not a UI afterthought. `SETTINGS.md`
+defines a versioned, typed, scoped schema with live-apply metadata; frontends
+generate their forms from it. `SCALABILITY.md` defines the load targets and
+protocol sizing so the extension is not an afterthought. `FEATURE-ROADMAP.md`
+groups capabilities into waves, not bug fixes.
+
 ## What stays
 
 These are frozen unless a v2 test exposes a correctness bug:
@@ -172,6 +191,8 @@ Rules:
 - `SCALABILITY.md`: load targets, protocol sizing, generated types, CI gates.
 - `EXTENSION-PLAN.md`: the extension as a first-class v2 frontend.
 - `FEATURE-ROADMAP.md`: which feature IDs land in v0.5, v0.6, and v0.7.
+- `SETTINGS.md`: granular, typed, scoped settings schema and apply policy.
+- `QUALITY.md`: engineering rules, layering, error model, CI gates, review checklist.
 
 Exit: every feature marked `shipped` has a code path and a test; every headline
 bug has a failing-test sketch.

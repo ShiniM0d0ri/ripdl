@@ -8,6 +8,12 @@ Rule: before any feature gets code, it gets an ID, an owner module, a target
 wave, and a test name in the matrix. A feature cannot be marked `shipped`
 until that test passes.
 
+This is a **capability roadmap**, not a bug list. Defects in `ISSUES.csv` are
+evidence that a capability or invariant is missing; they are scheduled by
+closing the invariant, not by patching one repro. Settings work
+(`SETTINGS.md`) is part of every wave: a capability is not done until its
+knobs are typed, scoped, validated, and generated into the frontends.
+
 ## v0.5 - Truth (truth layer, no new user features)
 
 Goal: every number ripdl shows is correct, and every knob actually works.
