@@ -1420,6 +1420,10 @@ impl Daemon {
     /// still unbound (and vice versa), and that must be visible, not inferred.
     fn config_reply(self: &Arc<Self>) -> Reply {
         let bind = self.torrent_bind.lock().unwrap().clone();
+        #[cfg(feature = "unified-traffic")]
+        let traffic_links = Some(self.links.snapshot());
+        #[cfg(not(feature = "unified-traffic"))]
+        let traffic_links = None;
         Reply::Config {
             settings: self.conf(),
             torrent_session: bind.is_some(),
@@ -1443,6 +1447,7 @@ impl Daemon {
                 .map(|n| format!("{} ({})", n.name, n.addr))
                 .collect(),
             bond_links: self.bond_links.lock().unwrap().clone(),
+            traffic_links,
             bundles: true,
             version: env!("CARGO_PKG_VERSION").to_string(),
             extension: self.extension_status.lock().unwrap().clone(),
@@ -2054,6 +2059,13 @@ impl Daemon {
                 .map(|(_, b)| *b)
                 .unwrap_or(*total);
             let sample = total.saturating_sub(old) as f64 / dt;
+            #[cfg(feature = "unified-traffic")]
+            {
+                let delta = total.saturating_sub(old);
+                if delta > 0 {
+                    self.links.record_ip(*ip, delta, false);
+                }
+            }
             // Ease in: one 5 s window is noisy on a phone link.
             let ema = match rates.iter().find(|(i, _)| i == ip) {
                 Some((_, r)) => r * 0.6 + sample * 0.4,
@@ -4832,6 +4844,26 @@ mod tests {
         };
         let daemon = Daemon::new(dir.join("queue.json"), dir.join("config.json"), config).unwrap();
         (Arc::new(daemon), dir)
+    }
+
+    #[cfg(feature = "unified-traffic")]
+    #[test]
+    fn config_reply_carries_unified_links() {
+        let (daemon, _dir) = proposal_daemon("config-links");
+        daemon.links.set_enabled(true);
+        daemon.links.set_links(&[ripdl_core::links::LinkInfo {
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            name: "wifi".into(),
+            default_route: true,
+        }]);
+        match daemon.config_reply() {
+            Reply::Config { traffic_links, .. } => {
+                let links = traffic_links.expect("unified links present");
+                assert_eq!(links.len(), 1);
+                assert_eq!(links[0].name, "wifi");
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
     }
 
     #[cfg(feature = "unified-traffic")]

@@ -22,9 +22,9 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 |---|---|
 | Branch | `next` (clean) |
 | Commit | see `git log -1 --oneline` (updated each PR) |
-| Product code | M1/M2 domains; M3: daemon ownership, RPC, live policy, HTTP/bundle/torrent/video budget wiring, shared link feed |
+| Product code | M1/M2 domains; M3 complete: daemon/RPC/live policy/all-engine budgets/one link feed |
 | Trackers | `ISSUES.csv` (73), `FEATURE-MATRIX.md`, `INVARIANTS.md` |
-| Next milestone | M3 - wire tasks/engines into the owned domains |
+| Next milestone | M4 - frontends render the one snapshot |
 
 M1 and M2 exits met: 12 traffic tests + 14 link tests pass. Global cap, bundle
 share, torrent/video coverage, live limits, cancellation, burst, retry
@@ -57,11 +57,24 @@ Landed next: session-wide torrent download cap via librqbit `LimitsConfig`
 `--limit-rate` from the global budget, and HTTP per-link metering into the one
 `LinkSet` with a measured sampler `dt`.
 
-Remaining M3: feed torrent `MeteredRead` into the same `LinkSet`, and replace
-split `bond_links`/`torrent_rates` config fields with the one snapshot.
+M3 complete: torrent `bind_totals` deltas now feed the same `LinkSet`, and
+`Reply::Config.traffic_links` carries the one link snapshot (additive, so old
+frontends ignore it). CLI prints `unified links:`. Test
+`config_reply_carries_unified_links` proves it.
 
-Exit: two HTTP tasks + bundle + torrent + video under one cap in the daemon;
-live change applies within one tick; one link snapshot in CLI/GUI/config.
+Exit met: HTTP + bundle + torrent + video all draw from the daemon-owned budget;
+live changes apply within one tick; one link snapshot feeds config and CLI.
+
+## Next action (M4)
+
+Render that snapshot in every frontend, with no client-side rate math:
+
+- CLI: `--json` from `GetTrafficSnapshot`; keep the human text arm.
+- Tauri GUI: remove `liveSpeed`/`speedText` derivation; status bar and
+  per-NIC chips read `traffic_links` + `TaskInfo`.
+- Extension: delta store, `Ping` instead of `list`, generated `protocol.d.ts`,
+  version handshake (see `EXTENSION-PLAN.md`).
+- Native spike: egui + AccessKit inspection; screenshot QA per screen.
 
 ## Decisions made
 

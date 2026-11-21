@@ -865,6 +865,7 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             torrent_rates,
             torrent_unreachable,
             bond_links,
+            traffic_links,
             ..
         } => {
             println!("max_concurrent:       {}", settings.max_concurrent.unwrap_or(3));
@@ -942,6 +943,23 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
                     .join(" \u{b7} ");
                 println!("bond links:           {links}");
+            }
+            if let Some(links) = &traffic_links {
+                let parts = links
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{} {}/s w{} {} conn{}",
+                            l.name,
+                            humans(l.rate_bps),
+                            l.weight,
+                            l.in_use,
+                            if l.in_use == 1 { "" } else { "s" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ");
+                println!("unified links:        {parts}");
             }
             if !excludes.is_empty() {
                 println!(

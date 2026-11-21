@@ -598,6 +598,11 @@ pub enum Reply {
         /// act on. Empty when bonding is off or no older daemon feeds it.
         #[serde(default)]
         bond_links: Vec<BondLink>,
+        /// One link truth from the shared `LinkSet` (HTTP + torrent). Old
+        /// frontends ignore this additive field; new ones render it instead
+        /// of the split `bond_links` / `torrent_rates` arrays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traffic_links: Option<Vec<crate::links::LinkSnapshot>>,
         /// Capability flag: this daemon understands `AddBundle`/`PreviewBundle`
         /// (multi-part tasks). Frontends check it instead of probing with an
         /// unknown command - an older daemon simply omits the field, which
@@ -989,6 +994,7 @@ mod tests {
                 bundles,
                 version,
                 extension,
+                ..
             } => {
                 assert_eq!(settings.max_segments, Some(4));
                 assert_eq!(version, "0.4.1");
@@ -1026,6 +1032,7 @@ mod tests {
                 in_use: 4,
                 fails: 0,
             }],
+            traffic_links: None,
             bundles: true,
             version: "0.4.1".to_string(),
             extension: ExtensionStatus {
