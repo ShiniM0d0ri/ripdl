@@ -7,10 +7,10 @@ Upgrade/registration/trial popups are **excluded** from this map.
 
 | Card | Screen | ripdl status | Depends on |
 |---|---|---|---|
-| S01 | Main window + task table | spec ready, native spike partial | SHARED |
+| S01 | Main window + task table | spike partial (IDM shell landed) | SHARED |
 | S02 | Add URL | spec ready, spike shell only | S01 |
-| S03 | Settings / Options | spec ready, generated schema landed | SHARED, S01, SETTINGS.csv |
-| S04 | Scheduler | spec ready, daemon support exists | S02, S03 |
+| S03 | Settings / Options | spike partial (IDM tab strip landed) | SHARED, S01, SETTINGS.csv |
+| S04 | Scheduler | spike partial (IDM dialog shell landed) | S02, S03 |
 | S05 | Link grabber / bundles | spec ready, bundle engine exists | S02, S01 |
 | S06 | Queues | spec ready, single queue today | S01 |
 | S07 | Task details / progress | spec ready, Tauri dialog exists | S01 |
