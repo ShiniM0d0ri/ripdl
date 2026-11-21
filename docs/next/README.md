@@ -73,11 +73,15 @@ Render that snapshot in every frontend, with no client-side rate math:
   human table by default and the snapshot as JSON with `--json`.
 - Generated types: `tools/xtask` exports `protocol.d.ts` into the extension and
   Tauri UI from the Rust types; CI checks them with `--check`.
-- Tauri GUI: remove `liveSpeed`/`speedText` derivation; status bar and
-  per-NIC chips read `traffic_links` + `TaskInfo`.
-- Extension: delta store, `Ping` instead of `list`, generated `protocol.d.ts`,
-  version handshake (see `EXTENSION-PLAN.md`).
-- Native spike: egui + AccessKit inspection; screenshot QA per screen.
+- **Native UI first**: M3 is complete, so the snapshot contract is stable and
+  the Tauri GUI has not been adapted yet. Adapting Tauri to the new snapshot
+  would be throwaway work if native wins. Build the egui UI directly against
+  `GetTrafficSnapshot`, with AccessKit inspection and screenshot QA per screen.
+- Tauri GUI: leave it on the v1-compatible path as the comparison baseline.
+  Only adapt it if the native spike fails its go/no-go.
+- Extension: independent of the desktop shell; proceed with delta store,
+  `Ping` instead of `list`, generated `protocol.d.ts`, version handshake
+  (see `EXTENSION-PLAN.md`).
 
 ## Decisions made
 

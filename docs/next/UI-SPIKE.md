@@ -1,8 +1,9 @@
 # Native UI spike
 
-Status: proposed. Branch: `spike/native-ui`. Timebox: two weeks. This branch is
-never merged into `next`; only the measurements and the view-model crate (if it
-earns its place) come back.
+Status: **active**. Branch: `spike/native-ui`. Timebox: two weeks. This branch
+is never merged into `next` as a second UI; the measurements and the view-model
+crate (if it earns its place) come back. The spike is now the primary UI work,
+not a side experiment, because the backend contract is complete.
 
 ## Why spike now
 
