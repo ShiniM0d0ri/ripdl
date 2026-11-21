@@ -9,6 +9,18 @@ current when build commands, architecture, or conventions change.
 open-source alternative to IDM and FDM. Zero
 telemetry, zero ads, forever — non-negotiable, code it into no feature.
 
+## v2 development (branch `next`)
+
+- Read `docs/v2/README.md` FIRST for any v2 task. It is a <100-line working
+  index (current milestone, next action, decisions, document index).
+- `main` is the release line; no hotfixes there. All v2 work stays on `next`.
+- Canonical trackers: `docs/v2/ISSUES.csv`, `docs/v2/FEATURE-MATRIX.md`,
+  `docs/v2/INVARIANTS.md`. Bugs close via invariant tests, not one-off patches.
+- Every behavior PR updates the v2 index and the affected tracker in the same
+  commit. Do not add new planning docs; use the existing files in the index.
+- Method: architecture-first, settings as a typed/scoped domain, no client-side
+  rate math, screenshot QA per screen (`docs/v2/UI-QA.md`).
+
 ## Layout
 
 - `crates/ripdl-core` — pure library: HTTP engine (probe/plan, multi-segment
