@@ -1,4 +1,4 @@
-# ADR-0001: Strangler v2, not a greenfield rewrite
+# ADR-0001: Strangler next, not a greenfield rewrite
 
 - Status: accepted
 - Date: 2026-11-21
@@ -25,8 +25,8 @@ Use a strangler approach:
 1. Keep `ripdl-core`'s engine, resume format, torrent session, refresh, bundle,
    LAN, update, and the daemon's queue semantics.
 2. Introduce two new modules behind traits: `traffic` and `links`.
-3. Wire them into the daemon behind a `traffic-v2` feature flag.
-4. Add a protocol v2 snapshot while keeping v1 commands as adapters.
+3. Wire them into the daemon behind a `unified-traffic` feature flag.
+4. Add a protocol next snapshot while keeping v1 commands as adapters.
 5. Flip the default only after the conformance suite is green.
 6. Prototype a native UI in parallel, but do not let it block the truth layer.
 

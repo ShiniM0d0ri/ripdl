@@ -36,6 +36,8 @@ pub struct TorrentConfig {
     /// files in order, which makes librqbit's picker prioritize pieces at
     /// the read position (usable playback before the download completes).
     pub sequential: bool,
+    /// Optional per-task download cap passed to librqbit at add time.
+    pub download_bps: Option<u64>,
 }
 
 /// Disk artifacts of a finished torrent: the torrent's root (the file
@@ -557,6 +559,10 @@ impl TorrentSession {
             // and the task fails with "error creating a new file". Overwrite
             // + piece hash-check is the correct resume semantic.
             overwrite: true,
+            ratelimits: librqbit::limits::LimitsConfig {
+                download_bps: rate_limit(cfg.download_bps),
+                ..librqbit::limits::LimitsConfig::default()
+            },
             ..AddTorrentOptions::default()
         };
         if let Some(files) = &cfg.only_files {
@@ -1072,6 +1078,11 @@ fn emit(id: &str, st: &TorrentStats, on_progress: &mut impl FnMut(Progress)) {
 mod tests {
     use super::*;
 
+    // Several tests create a session that tries the same preferred listen
+    // ports (4240-4243). Running them in parallel makes the loopback
+    // seeder/leecher tests flake under load; serialize session creation.
+    static SESSION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A resume hash pass must be flagged as `verifying` (and a magnet still
     /// fetching metadata must not): the daemon keys its speed suppression on
     /// this flag, so checked bytes at disk speed never read as a download.
@@ -1120,6 +1131,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn loopback_seed_leech_roundtrip() {
+        let _session_guard = SESSION_LOCK.lock().await;
         use librqbit::spawn_utils::BlockingSpawner;
         use librqbit::CreateTorrentOptions;
 
@@ -1220,6 +1232,7 @@ mod tests {
             // Sequential mode on: exercises the streaming drain's piece
             // priority alongside the normal sampler loop.
             sequential: true,
+            download_bps: None,
         };
         let token = CancellationToken::new();
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1288,6 +1301,7 @@ mod tests {
     // the full file list and never touching the managed db.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preview_local_torrent_offline() {
+        let _session_guard = SESSION_LOCK.lock().await;
         use librqbit::spawn_utils::BlockingSpawner;
         use librqbit::CreateTorrentOptions;
 
@@ -1356,6 +1370,7 @@ mod tests {
     // (zero bytes) while file 1 round-trips fully. Loopback-only.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn loopback_only_files_restriction() {
+        let _session_guard = SESSION_LOCK.lock().await;
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new("info,librqbit=debug"))
             .with_test_writer()
@@ -1462,6 +1477,7 @@ mod tests {
             dest_dir: dest.clone(),
             only_files: Some(vec![want]),
             sequential: false,
+            download_bps: None,
         };
         let token = CancellationToken::new();
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));

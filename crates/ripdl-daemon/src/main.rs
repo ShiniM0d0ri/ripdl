@@ -15,12 +15,12 @@ use ripdl_core::rpc::{
     Reply, Request, Response, StaleCandidate, TaskDetailsSnapshot, TaskInfo,
 };
 use ripdl_core::task::{Progress, TaskKind, TaskState};
-#[cfg(feature = "traffic-v2")]
+#[cfg(feature = "unified-traffic")]
 use ripdl_core::traffic::{TaskTraffic, TrafficKind};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
-#[cfg(feature = "traffic-v2")]
+#[cfg(feature = "unified-traffic")]
 use ripdl_core::links::LinkSet;
-#[cfg(feature = "traffic-v2")]
+#[cfg(feature = "unified-traffic")]
 use ripdl_core::traffic::TrafficController;
 
 /// Persisted queue record.
@@ -111,9 +111,9 @@ struct QueueFileRef<'a> {
 
 struct TaskRuntime {
     token: CancellationToken,
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     traffic: Arc<TaskTraffic>,
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     run_id: u64,
 }
 
@@ -286,11 +286,11 @@ struct Daemon {
     /// Latest `sample()` snapshot for `Reply::Config.bond_links` (plain RPC
     /// mirror; the authority itself is not serializable-lockable cheaply).
     bond_links: std::sync::Mutex<Vec<ripdl_core::rpc::BondLink>>,
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     traffic: Arc<TrafficController>,
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     links: Arc<LinkSet>,
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     link_sample_at: Mutex<Option<Instant>>,
     shutdown: tokio::sync::Notify,
     sem: Arc<tokio::sync::Semaphore>,
@@ -345,7 +345,7 @@ struct LanSendState {
 type DaemonConfig = ripdl_core::rpc::DaemonSettings;
 
 /// Why a confirmed link death parks a task, beyond plain auth answers.
-#[cfg(feature = "traffic-v2")]
+#[cfg(feature = "unified-traffic")]
 fn traffic_kind(kind: TaskKind) -> TrafficKind {
     match kind {
         TaskKind::Http => TrafficKind::Http,
@@ -363,7 +363,7 @@ enum StaleCause {
 impl Daemon {
     fn new(queue_path: PathBuf, config_path: PathBuf, config: DaemonConfig) -> Result<Self> {
         let max_concurrent = config.max_concurrent();
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         let initial_speed = config.max_speed();
         let extension_status_path = config_path
             .parent()
@@ -409,11 +409,11 @@ impl Daemon {
             shutdown: tokio::sync::Notify::new(),
             bond: std::sync::Arc::new(ripdl_core::bond::Bond::new()),
             bond_links: std::sync::Mutex::new(Vec::new()),
-            #[cfg(feature = "traffic-v2")]
+            #[cfg(feature = "unified-traffic")]
             traffic: TrafficController::new(initial_speed),
-            #[cfg(feature = "traffic-v2")]
+            #[cfg(feature = "unified-traffic")]
             links: LinkSet::new(),
-            #[cfg(feature = "traffic-v2")]
+            #[cfg(feature = "unified-traffic")]
             link_sample_at: Mutex::new(None),
             sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
@@ -561,6 +561,7 @@ impl Daemon {
                 }),
                 only_files: rec.only_files.clone(),
                 sequential: false,
+                download_bps: None,
             };
             match session.ensure(&cfg, false).await {
                 Ok(_ensured) => {
@@ -676,6 +677,7 @@ impl Daemon {
                 }),
                 only_files: r.only_files.clone(),
                 sequential: false,
+                download_bps: None,
             };
             (hash, r.downloaded.max(r.total.unwrap_or(0)), cfg)
         };
@@ -1396,18 +1398,18 @@ impl Daemon {
         }
     }
 
-    /// v2: one authoritative snapshot for limits, task rates and links.
-    /// With `traffic-v2` off the domains are still created; the snapshot is
+    /// next: one authoritative snapshot for limits, task rates and links.
+    /// With `unified-traffic` off the domains are still created; the snapshot is
     /// empty so old frontends never see half-wired numbers.
     fn cmd_get_traffic_snapshot(self: &Arc<Self>, req_id: u64) -> Response {
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         let reply = Reply::TrafficSnapshot {
             controller: self.traffic.snapshot(),
             links: self.links.snapshot(),
         };
-        #[cfg(not(feature = "traffic-v2"))]
+        #[cfg(not(feature = "unified-traffic"))]
         let reply = Reply::Error {
-            message: "traffic-v2 is not enabled on this daemon".to_string(),
+            message: "unified-traffic is not enabled on this daemon".to_string(),
         };
         Response { id: req_id, reply }
     }
@@ -1613,7 +1615,7 @@ impl Daemon {
         );
         *self.config.lock().unwrap() = settings;
         let new_max = self.conf().max_concurrent();
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         {
             let conf = self.conf();
             self.traffic.set_global_rate(conf.max_speed());
@@ -1726,9 +1728,9 @@ impl Daemon {
         traffic: Option<Arc<dyn ripdl_core::traffic::Traffic>>,
     ) -> EngineConfig {
         let conf = self.conf();
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         let link_feed = Some(Arc::clone(&self.links));
-        #[cfg(not(feature = "traffic-v2"))]
+        #[cfg(not(feature = "unified-traffic"))]
         let link_feed = None;
         EngineConfig {
             max_segments: conf.max_segments(),
@@ -1800,7 +1802,7 @@ impl Daemon {
             // bound, not what the config says.
             *self.torrent_bind.lock().unwrap() = Some(bind.unwrap_or_default());
             let session = Arc::new(session);
-            #[cfg(feature = "traffic-v2")]
+            #[cfg(feature = "unified-traffic")]
             session.set_download_rate_limit(self.conf().max_speed());
             *guard = Some(session);
         }
@@ -1946,7 +1948,7 @@ impl Daemon {
         if !self.conf().bond_interfaces() {
             self.bond.set_links(&[]);
             *self.bond_links.lock().unwrap() = Vec::new();
-            #[cfg(feature = "traffic-v2")]
+            #[cfg(feature = "unified-traffic")]
             {
                 self.links.set_enabled(false);
                 *self.link_sample_at.lock().unwrap() = None;
@@ -1967,7 +1969,7 @@ impl Daemon {
                 })
                 .collect()
         };
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         {
             let now = Instant::now();
             let mut prev = self.link_sample_at.lock().unwrap();
@@ -3744,7 +3746,7 @@ impl Daemon {
         }
 
         self.set_part_state(id, index, TaskState::Running, None, None);
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         let engine_config = {
             let handle = self
                 .runtime
@@ -3758,7 +3760,7 @@ impl Daemon {
                 handle.map(|h| h as Arc<dyn ripdl_core::traffic::Traffic>),
             )
         };
-        #[cfg(not(feature = "traffic-v2"))]
+        #[cfg(not(feature = "unified-traffic"))]
         let engine_config = self.engine_config(&headers, true);
         let engine = match Engine::new(engine_config) {
             Ok(engine) => engine,
@@ -3887,7 +3889,7 @@ impl Daemon {
     /// canceling it persists a Paused sidecar, and resume replays it.
     fn spawn_runner(self: &Arc<Self>, rec: TaskRecord) {
         let token = CancellationToken::new();
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         let (traffic_handle, run_id) = {
             let host = reqwest::Url::parse(&rec.url)
                 .ok()
@@ -3905,9 +3907,9 @@ impl Daemon {
             rec.id.clone(),
             TaskRuntime {
                 token: token.clone(),
-                #[cfg(feature = "traffic-v2")]
+                #[cfg(feature = "unified-traffic")]
                 traffic: Arc::clone(&traffic_handle),
-                #[cfg(feature = "traffic-v2")]
+                #[cfg(feature = "unified-traffic")]
                 run_id,
             },
         );
@@ -4001,9 +4003,9 @@ impl Daemon {
                         url: rec.url.clone(),
                         dest_dir: rec.dest_dir.clone().unwrap_or_default(),
                         headers: rec.headers.clone(),
-                        #[cfg(feature = "traffic-v2")]
+                        #[cfg(feature = "unified-traffic")]
                         limit_bps: this.conf().max_speed(),
-                        #[cfg(not(feature = "traffic-v2"))]
+                        #[cfg(not(feature = "unified-traffic"))]
                         limit_bps: None,
                     };
                     ripdl_core::hunt::download(cfg, &token, on_progress)
@@ -4031,6 +4033,10 @@ impl Daemon {
                         }),
                         only_files: rec.only_files.clone(),
                         sequential: rec.sequential,
+                        #[cfg(feature = "unified-traffic")]
+                        download_bps: this.conf().max_speed(),
+                        #[cfg(not(feature = "unified-traffic"))]
+                        download_bps: None,
                     };
                     ripdl_core::torrent::download(&session, &cfg, &token, on_progress, {
                         // Identity lands here the moment the engine manages
@@ -4063,7 +4069,7 @@ impl Daemon {
                     // defaults; task headers live on the client and always
                     // override. Both the probe and every segment carry them.
                     let engine = {
-                        #[cfg(feature = "traffic-v2")]
+                        #[cfg(feature = "unified-traffic")]
                         let cfg = {
                             let handle = this
                                 .runtime
@@ -4077,7 +4083,7 @@ impl Daemon {
                                 handle.map(|h| h as Arc<dyn ripdl_core::traffic::Traffic>),
                             )
                         };
-                        #[cfg(not(feature = "traffic-v2"))]
+                        #[cfg(not(feature = "unified-traffic"))]
                         let cfg = this.engine_config(&rec.headers, true);
                         match Engine::new(cfg) {
                             Ok(engine) => Arc::new(engine),
@@ -4101,7 +4107,7 @@ impl Daemon {
                 }
             };
 
-            #[cfg(feature = "traffic-v2")]
+            #[cfg(feature = "unified-traffic")]
             let finished_traffic = this
                 .runtime
                 .lock()
@@ -4109,7 +4115,7 @@ impl Daemon {
                 .get(&rec.id)
                 .map(|rt| Arc::clone(&rt.traffic));
             this.runtime.lock().unwrap().remove(&rec.id);
-            #[cfg(feature = "traffic-v2")]
+            #[cfg(feature = "unified-traffic")]
             if let Some(t) = finished_traffic {
                 t.pause();
                 this.traffic.unregister_task(&rec.id);
@@ -4390,7 +4396,7 @@ impl Daemon {
             window: VecDeque::new(),
             at: now,
         });
-        #[cfg(feature = "traffic-v2")]
+        #[cfg(feature = "unified-traffic")]
         {
             let prev = entry.last.downloaded;
             let traffic_now = tokio::time::Instant::from_std(now);
@@ -4828,7 +4834,7 @@ mod tests {
         (Arc::new(daemon), dir)
     }
 
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     #[test]
     fn traffic_snapshot_is_empty_until_tasks_register() {
         let (daemon, _dir) = proposal_daemon("traffic-snapshot");
@@ -4843,7 +4849,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     #[tokio::test]
     async fn traffic_limit_change_applies_live() {
         let (daemon, _dir) = proposal_daemon("traffic-live");
@@ -4865,7 +4871,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "traffic-v2")]
+    #[cfg(feature = "unified-traffic")]
     #[tokio::test]
     async fn daemon_task_registers_and_reports_bytes() {
         let forbidden = Arc::new(std::sync::atomic::AtomicBool::new(false));

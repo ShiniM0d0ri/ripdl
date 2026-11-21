@@ -1,4 +1,4 @@
-# Extension plan (v2)
+# Extension plan (next)
 
 The extension is a first-class frontend, not a capture add-on. It is the only
 frontend that runs inside another vendor's process, so it has the tightest
@@ -28,7 +28,7 @@ missing daemon.
 - Duplicate flow uses daemon-side `propose` / `abandon` with a 60 s TTL.
 - Browser integration e2e (B0-B17) is the strongest gate in the repo.
 
-## Problems v2 must solve
+## Problems next must solve
 
 | ID | Problem | Impact |
 |---|---|---|
@@ -59,7 +59,7 @@ C4-style check proving pipe transport.
 - Daemon replies with supported protocol versions and capability flags;
   `GetConfig` keeps the existing fields for older clients.
 - If the daemon is v1, the extension uses the v1 adapters and marks itself
-  "limited mode" in options. It must never hang waiting for a v2 command.
+  "limited mode" in options. It must never hang waiting for a next command.
 
 Exit: `protocol_v1_compat`, plus an e2e test with a v1-only mock daemon.
 
@@ -109,20 +109,20 @@ Exit: an e2e B-phase check that the diagnostics contain no auth tokens.
 ### E7 - Firefox parity (later wave)
 
 - MV3 vs MV2 differences in `webRequest`, `downloads`, and native messaging.
-- Do not start until the Chromium v2 path is green.
+- Do not start until the Chromium next path is green.
 
 ## Version skew matrix
 
 | Daemon | Extension | Behavior |
 |---|---|---|
 | v0.4 (v1 only) | v0.4 (v1 only) | Current shipped behavior |
-| v0.5 (v1+v2) | v0.4 (v1 only) | v1 adapters answer; no delta, no limits accuracy claims |
-| v0.5 (v1+v2) | v0.5 (v2) | Delta snapshots, version handshake, generated types |
-| v0.6+ (v2 only) | v0.4 | Refuse with an explicit "update the extension" status, never hang |
+| v0.5 (v1+next) | v0.4 (v1 only) | v1 adapters answer; no delta, no limits accuracy claims |
+| v0.5 (v1+next) | v0.5 (next) | Delta snapshots, version handshake, generated types |
+| v0.6+ (next only) | v0.4 | Refuse with an explicit "update the extension" status, never hang |
 
 ## Gate additions (B phase)
 
-- B18+ v2 handshake and `ping`.
+- B18+ next handshake and `ping`.
 - B19 delta snapshot applies `changed` and `removed` correctly.
 - B20 200-task snapshot stays under 1 MiB or paginates cleanly.
 - B21 service-worker restart rehydrates from `since: None`.

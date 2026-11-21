@@ -1,9 +1,13 @@
-# v2 working index
+# next working index
 
-Status: **planning complete, no product code written**. Branch: `next`.
+Status: **planning complete, next-layer code landing**. Branch: `next`.
 `main` is the release line: no hotfixes there.
 
-**This file is the only v2 doc to load at session start.** The rest are
+Naming: we never shipped a "v1", so nothing here is called v2. This is the
+**next** architecture for the current v0.4.x product; the feature flag is
+`unified-traffic`, not `traffic-v2`.
+
+**This file is the only planning doc to load at session start.** The rest are
 reference docs, opened on demand. `AGENTS.md` points here.
 
 ## Goal
@@ -18,7 +22,7 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 |---|---|
 | Branch | `next` (clean) |
 | Commit | see `git log -1 --oneline` (updated each PR) |
-| Product code | M1/M2 domains; M3: daemon ownership, RPC, live policy, HTTP/bundle budget wiring |
+| Product code | M1/M2 domains; M3: daemon ownership, RPC, live policy, HTTP/bundle/torrent/video budget wiring, shared link feed |
 | Trackers | `ISSUES.csv` (73), `FEATURE-MATRIX.md`, `INVARIANTS.md` |
 | Next milestone | M3 - wire tasks/engines into the owned domains |
 
@@ -31,7 +35,7 @@ M3/M4 wire the domains into the daemon and frontends.
 
 ## Next action (M3)
 
-Wire the two domains into the daemon behind a `traffic-v2` feature flag:
+Wire the two domains into the daemon behind a `unified-traffic` feature flag:
 
 1. `Daemon` owns one `TrafficController` and one `LinkSet`.
 2. HTTP tasks, bundle parts, torrents, and video acquire from the same global
@@ -41,19 +45,20 @@ Wire the two domains into the daemon behind a `traffic-v2` feature flag:
 4. Old rate/limit/bond paths stay the default until parity tests pass.
 
 Landed so far: daemon owns `TrafficController` + `LinkSet` behind the
-`traffic-v2` Cargo feature; `Command::GetTrafficSnapshot` answers one snapshot;
+`unified-traffic` Cargo feature; `Command::GetTrafficSnapshot` answers one snapshot;
 `SetConfig` applies live global-limit and bonding changes; every task/part is
 registered with a run generation, `on_progress` feeds bytes into its
 `TaskTraffic`, and HTTP/bundle engines acquire budget from the shared handle
 instead of a private limiter. Old paths remain default; CLI keeps a v1 arm.
 
 Landed next: session-wide torrent download cap via librqbit `LimitsConfig`
-(live on `SetConfig`), yt-dlp `--limit-rate` from the global budget, and HTTP
-per-link metering into the one `LinkSet` with a measured sampler `dt`.
+(live on `SetConfig`), **per-task torrent cap at add time** through
+`AddTorrentOptions.ratelimits` (no vendor delta was needed), yt-dlp
+`--limit-rate` from the global budget, and HTTP per-link metering into the one
+`LinkSet` with a measured sampler `dt`.
 
-Remaining M3: per-task torrent cap (vendor delta), feed torrent `MeteredRead`
-into the same `LinkSet`, and replace split `bond_links`/`torrent_rates` config
-fields with the one snapshot.
+Remaining M3: feed torrent `MeteredRead` into the same `LinkSet`, and replace
+split `bond_links`/`torrent_rates` config fields with the one snapshot.
 
 Exit: two HTTP tasks + bundle + torrent + video under one cap in the daemon;
 live change applies within one tick; one link snapshot in CLI/GUI/config.
@@ -61,10 +66,12 @@ live change applies within one tick; one link snapshot in CLI/GUI/config.
 ## Decisions made
 
 - Global cap covers **all traffic** (HTTP, bundles, torrents, video).
-- Torrent per-task caps: **vendor librqbit delta now**.
+- Torrent per-task caps: librqbit already supports `LimitsConfig` in
+  `AddTorrentOptions`, so **no vendor delta is needed**. Session cap is live;
+  a per-task cap is set when the torrent is added.
 - Native spike: **egui**, no WebView2; CDP replaced by `EGUI_INSPECTION` + AccessKit.
 - Overwrite data-loss fix stays on `next`, not `main`.
-- Extension is a first-class v2 frontend: delta snapshots, generated types,
+- Extension is a first-class next frontend: delta snapshots, generated types,
   version handshake, no client-side rate math.
 
 ## Document index (read on demand)
@@ -75,14 +82,14 @@ live change applies within one tick; one link snapshot in CLI/GUI/config.
 | `SETTINGS.md` | Typed/scoped settings schema and apply policy | adding or changing a knob |
 | `QUALITY.md` | Method, layering rules, error model, CI gates, review checklist | before a PR or architectural choice |
 | `SCALABILITY.md` | Load targets, protocol sizing, generated types | touching RPC, frontends, or perf |
-| `EXTENSION-PLAN.md` | Extension v2 workstreams and version skew | working on `ext/` or the host |
+| `EXTENSION-PLAN.md` | Extension next workstreams and version skew | working on `ext/` or the host |
 | `UI-REHAUL.md` | Onboarding, screen inventory, component rules | any UI change |
 | `UI-QA.md` | Screenshot/debug loop per screen and state | before calling any screen done |
 | `FEATURE-ROADMAP.md` | v0.5 / v0.6 / v0.7 capability waves | deciding what to build next |
 | `INVARIANTS.md` | Numeric rules + failing test names | writing or reviewing a test |
 | `ISSUES.csv` | Evidence register (severity, root cause, fix) | triaging a defect |
 | `FEATURE-MATRIX.md` | Status + evidence per feature | marking work `shipped` |
-| `ADR-0001-strangler-v2.md` | Why strangler, not rewrite | questioning direction |
+| `ADR-0001-strangler-next.md` | Why strangler, not rewrite | questioning direction |
 
 ## Trackers are the source of truth
 
@@ -99,6 +106,6 @@ live change applies within one tick; one link snapshot in CLI/GUI/config.
   that already owns that topic, or in an ADR for an architectural decision.
 - Every PR that changes behavior updates this index, the affected tracker, and
   the invariant/test in the **same commit**.
-- Archive finished milestone checklists into `docs/v2/archive/`; keep this file
+- Archive finished milestone checklists into `docs/next/archive/`; keep this file
   under 100 lines.
 - If a section here grows, it belongs in one of the reference docs above.

@@ -1,10 +1,10 @@
-//! v2 traffic domain: one owner of byte accounting, rates and limits.
+//! next traffic domain: one owner of byte accounting, rates and limits.
 //!
 //! This module is pure mechanics. It performs no I/O and knows nothing about
 //! the daemon, tasks, or frontends. The daemon owns one [`TrafficController`]
 //! and hands an `Arc<TaskTraffic>` (or `Arc<PartTraffic>`) to each transfer.
 //!
-//! Invariants are named in `docs/v2/INVARIANTS.md` and encoded in the tests at
+//! Invariants are named in `docs/next/INVARIANTS.md` and encoded in the tests at
 //! the bottom of this file.
 
 use std::collections::{HashMap, VecDeque};

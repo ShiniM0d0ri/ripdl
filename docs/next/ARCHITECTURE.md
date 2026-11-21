@@ -1,4 +1,4 @@
-# v2 architecture
+# next architecture
 
 This document defines ownership. If two modules can answer the same question,
 the design is wrong.
@@ -67,7 +67,7 @@ ripdl-core
   bundle.rs           unchanged
   lan.rs              unchanged (optional traffic hook later)
   update.rs           unchanged (optional traffic hook later)
-  rpc.rs              protocol v1 + v2 snapshots
+  rpc.rs              protocol v1 + next snapshots
   task.rs             persisted task/segment state
   names.rs            unchanged
 
@@ -155,9 +155,9 @@ The daemon remains the only owner of task lifecycle:
 - progress samples carry a `run_id`/generation; a sample from an older run is
   dropped.
 
-## Protocol v2
+## Protocol next
 
-The wire protocol stays newline-delimited JSON for v1 compatibility. v2 adds:
+The wire protocol stays newline-delimited JSON for v1 compatibility. next adds:
 
 ```
 Request { id, protocol: 2, cmd }

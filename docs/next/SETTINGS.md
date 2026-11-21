@@ -1,11 +1,11 @@
-# Settings model (v2)
+# Settings model (next)
 
 Settings are a **domain**, not a bag of `Option` fields. Today `DaemonSettings`
 is a flat struct, validated only in `SetConfig`, with ad-hoc live behavior and
 one field (`extension_dir`) that cannot be applied by `apply`. That is the shape
 that produces "the setting exists but does nothing".
 
-v2 replaces it with a versioned, typed, scoped, self-describing schema.
+next replaces it with a versioned, typed, scoped, self-describing schema.
 
 ## Design principles
 
@@ -127,10 +127,10 @@ ResetSettings { scope, keys }                -> SettingsChanged
 ## Migration
 
 - `config.json` carries `schema_version`.
-- v1 -> v2 upcaster maps old flat fields to the new grouped ids.
+- v1 -> next upcaster maps old flat fields to the new grouped ids.
 - Unknown future keys are preserved verbatim and warned about; they are not
   dropped by a rewrite.
-- A backup (`.bak`) is kept before the first v2 write.
+- A backup (`.bak`) is kept before the first next write.
 - Additive fields always have schema defaults, so an older frontend can still
   call `GetSettings` and ignore what it does not know.
 

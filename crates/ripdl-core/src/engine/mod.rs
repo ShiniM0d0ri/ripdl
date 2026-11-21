@@ -132,11 +132,11 @@ pub struct EngineConfig {
     /// links are safe: the window only needs *some* progress. `None`
     /// disables the watchdog (tests only).
     pub stream_idle: Option<std::time::Duration>,
-    /// v2: optional daemon-owned traffic handle. When set, every segment
+    /// next: optional daemon-owned traffic handle. When set, every segment
     /// draws its budget from this handle (global -> task -> host) instead of
     /// the engine's private limiter. `None` keeps v1 behavior.
     pub traffic: Option<std::sync::Arc<dyn crate::traffic::Traffic>>,
-    /// v2: optional shared link set. When set, per-link bytes are metered here
+    /// next: optional shared link set. When set, per-link bytes are metered here
     /// instead of only in the private bond authority.
     pub links: Option<std::sync::Arc<crate::links::LinkSet>>,
 }
@@ -806,7 +806,7 @@ async fn run_segment(
     // link the supervisor wants it moved to.
     linkmap: Arc<Mutex<HashMap<usize, IpAddr>>>,
     migrate: Arc<Mutex<HashMap<usize, IpAddr>>>,
-    // v2: daemon-owned budget. `None` keeps the private limiter path.
+    // next: daemon-owned budget. `None` keeps the private limiter path.
     traffic: Option<Arc<dyn crate::traffic::Traffic>>,
     links: Option<Arc<crate::links::LinkSet>>,
 ) -> Result<()> {
@@ -1388,7 +1388,7 @@ async fn segment_attempt(
             },
         };
 
-        // Pace consumption: v2 draws from the daemon-owned hierarchy (global
+        // Pace consumption: next draws from the daemon-owned hierarchy (global
         // -> task -> host); v1 keeps the engine's private shared bucket.
         if let Some(t) = traffic {
             if t.acquire(chunk.len() as u64, Some(token)).await.is_err() {

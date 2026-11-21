@@ -454,7 +454,7 @@ pub enum Command {
     },
     /// Rotate this device's pairing code (paired devices must re-enter it).
     LanNewCode,
-    /// v2: one snapshot of traffic limits/rates and per-link state.
+    /// next: one snapshot of traffic limits/rates and per-link state.
     GetTrafficSnapshot,
     Shutdown,
 }
@@ -517,7 +517,7 @@ pub enum Reply {
     Tasks {
         tasks: Vec<TaskInfo>,
     },
-    /// v2: the single source of truth for limits, task rates and links.
+    /// next: the single source of truth for limits, task rates and links.
     TrafficSnapshot {
         controller: crate::traffic::ControllerSnapshot,
         links: Vec<crate::links::LinkSnapshot>,

@@ -1,4 +1,4 @@
-# Feature roadmap (v2 waves)
+# Feature roadmap (next waves)
 
 This file maps the feature matrix to release waves. It is the answer to
 "what are we building, and in what order". `FEATURE-MATRIX.md` remains the
@@ -26,7 +26,7 @@ This wave closes all S0/S1 issues and the S2 issues that mislead the user.
 | Links | NET-008, NET-009, NET-015, NET-016, NET-017, NET-021, NET-022, NET-023 | One `LinkSet`, measured dt, durable metering, no ghost NICs |
 | Refresh | REF-002, REF-003, REF-004, REF-005 | No version splicing, validated sidecar, hidden attribute |
 | Bridge | BRG-003, BRG-004 | No thread leak, no blind retries |
-| Protocol | RPC-007, RPC-008, RPC-011, NET-027, XTN-001..004 | v2 snapshot/delta, generated types, version handshake |
+| Protocol | RPC-007, RPC-008, RPC-011, NET-027, XTN-001..004 | next snapshot/delta, generated types, version handshake |
 | GUI | GUI-015, GUI-016, GUI-027, GUI-028, GUI-029 | Render snapshots; no client-side rate math |
 | Extension | XTN-001..004, B23 | Delta store, ping, pipe verification |
 | Native spike | NUI-001..004 | egui prototype + AccessKit harness; go/no-go |
@@ -62,7 +62,7 @@ Goal: the features people switch for, after the foundation is trustworthy.
 | GRB-002 | Recursive filtered site crawl | IDM's site grabber niche, reuse the same filter model |
 | BUN-011 | Auto-extract packages when part sets complete | zip/rar/7z; part-set awareness |
 | AUT-001 | Local automation API / MCP server | MDM and KGet both ship MCP; KGet also has a daemon + library |
-| AUT-002 | CLI `--json` mode on the v2 snapshot | Stable automation surface without text parsing |
+| AUT-002 | CLI `--json` mode on the next snapshot | Stable automation surface without text parsing |
 | OBS-003 | Copy diagnostics button | Product research: support-cost killer |
 | OBS-004 | Metrics/health endpoint | Debuggability at 200 tasks |
 | OSP-001 | Shell integration (right-click, "download with ripdl") | Table stakes on Windows |

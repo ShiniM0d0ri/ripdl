@@ -14,7 +14,7 @@ Status is evidence-based, not aspirational.
 Every row should name the owning module and the proof. A row without proof is
 not `shipped`.
 
-## Link domain (v2)
+## Link domain (next)
 
 | ID | Feature | Status | Evidence | Proof / gap |
 |---|---|---|---|---|
@@ -24,9 +24,9 @@ not `shipped`.
 | LNK-004 | Capacity-based weights with full-window quarantine recovery | shipped | `links.rs::sample`, `note_fail` | `weights_follow_capacity`, `quarantined_link_can_recover`, `stale_rate_does_not_weight` |
 | LNK-005 | Probe port, configurable targets, off when bonding disabled | shipped | `links.rs::Probe`, `probe_if_enabled` | `no_probes_when_bonding_off`, `probe_targets_are_configurable_or_fallback` |
 | LNK-006 | VPN/virtual adapter exclusion policy | shipped | `links.rs::is_eligible_link` | `vpn_adapters_are_excluded` |
-| LNK-007 | Wire the `LinkSet` into daemon/engine/torrent/CLI/GUI (close WP-03 issues) | partial | `daemon/main.rs` (feature `traffic-v2`) | Daemon owns one `LinkSet`; engines/probes not yet feeding it |
+| LNK-007 | Wire the `LinkSet` into daemon/engine/torrent/CLI/GUI (close WP-03 issues) | partial | `daemon/main.rs` (feature `unified-traffic`) | Daemon owns one `LinkSet`; engines/probes not yet feeding it |
 
-## Traffic domain (v2)
+## Traffic domain (next)
 
 | ID | Feature | Status | Evidence | Proof / gap |
 |---|---|---|---|---|
@@ -34,7 +34,7 @@ not `shipped`.
 | TRA-002 | Hierarchical token bucket (global -> task -> host), live rates, cancellation, bounded burst | shipped | `traffic.rs::Limiter` | `global_cap_two_tasks`, `limiter_cancel_latency`, `limiter_burst_bound`, `limit_zero_and_invalid` |
 | TRA-003 | Task and part traffic handles with run generations and live limits | shipped | `traffic.rs::TaskTraffic`, `PartTraffic` | `bundle_parts_share_task_cap`, `paused_task_has_no_live_rate`, `stale_progress_sample_is_ignored` |
 | TRA-004 | `TrafficController` and `Traffic` port with snapshots | shipped | `traffic.rs::TrafficController` | `torrent_respects_global_cap`, `video_respects_global_cap`, `limit_change_applies_live` |
-| TRA-005 | Wire the controller into engine/daemon/frontends (close WP-01 issues) | partial | `daemon/main.rs` (`traffic-v2`), `engine/mod.rs::traffic`, `rpc.rs::GetTrafficSnapshot` | HTTP/bundle tasks register and acquire from the shared budget; torrent/video cap and frontends still pending |
+| TRA-005 | Wire the controller into engine/daemon/frontends (close WP-01 issues) | partial | `daemon/main.rs` (`unified-traffic`), `engine/mod.rs::traffic`, `rpc.rs::GetTrafficSnapshot` | HTTP/bundle tasks register and acquire from the shared budget; torrent/video cap and frontends still pending |
 
 ## HTTP engine
 
@@ -169,8 +169,8 @@ not `shipped`.
 | TOR-009 | Stable listen port + UPnP | shipped | `torrent.rs` | Live verification noted in AGENTS |
 | TOR-010 | NIC bonding for peer TCP | shipped | `torrent.rs`, vendor | Torrent integration test |
 | TOR-011 | Per-link torrent rate | partial | `daemon/main.rs` | Aggregate only, no per-connection capacity |
-| TOR-012 | Global speed limit | partial | `torrent.rs::set_download_rate_limit`, daemon `traffic-v2` | Session-wide librqbit cap is live; per-task cap needs the vendor delta |
-| TOR-013 | Per-task speed limit | missing | `torrent.rs` | Not supported by the current session config |
+| TOR-012 | Global speed limit | partial | `torrent.rs::set_download_rate_limit`, daemon `unified-traffic` | Session-wide librqbit cap is live and applied on save |
+| TOR-013 | Per-task speed limit | shipped | `torrent.rs::TorrentConfig::download_bps` | Set through `AddTorrentOptions.ratelimits` at add time; no vendor delta needed |
 | TOR-014 | uTP | missing | `torrent.rs` | TCP-only listener/connect defaults |
 | TOR-015 | Download speed display | partial | `daemon/main.rs::on_progress` | 4 s byte window; tool rate is ignored |
 | TOR-016 | Adoption/resume spike guard | partial | `daemon/main.rs::adoption_jump` | Relies on the tool rate being near zero while stalled |
@@ -388,4 +388,4 @@ not `shipped`.
 | NUI-001 | Task list + status bar in a native toolkit | spike | `spike/native-ui` | Not started |
 | NUI-002 | Add URL + Settings | spike | `spike/native-ui` | Not started |
 | NUI-003 | Tray + single instance | spike | `spike/native-ui` | Not started |
-| NUI-004 | Memory/startup/accessibility report | spike | `docs/v2/UI-SPIKE.md` | Not started |
+| NUI-004 | Memory/startup/accessibility report | spike | `docs/next/UI-SPIKE.md` | Not started |

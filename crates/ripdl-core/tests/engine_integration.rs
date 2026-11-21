@@ -2051,7 +2051,7 @@ impl Traffic for CountingTraffic {
     }
 }
 
-/// v2: when a daemon-owned handle is supplied, every segment draws from it
+/// next: when a daemon-owned handle is supplied, every segment draws from it
 /// instead of the engine's private limiter.
 #[tokio::test]
 async fn engine_acquires_from_supplied_traffic() {

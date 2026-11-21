@@ -138,7 +138,7 @@ mod tests {
             total,
             accept_ranges: ranges,
             filename: name.to_string(),
-            etag: Some("\"v2\"".to_string()),
+            etag: Some("\"next\"".to_string()),
         }
     }
 
@@ -175,7 +175,7 @@ mod tests {
         let d = dest("f.bin");
         let check =
             check_compatible(&d, &state(), &info(Some(4096), true, "f.bin")).expect("compatible");
-        // The fixture etags differ ("v1" vs "v2"): adoptable, with a word of
+        // The fixture etags differ ("v1" vs "next"): adoptable, with a word of
         // caution about the file version.
         assert!(check.warning.is_some(), "etag change must warn");
     }
@@ -184,7 +184,7 @@ mod tests {
     fn same_etag_adopts_clean() {
         let d = dest("f.bin");
         let mut prev = state();
-        prev.etag = Some("\"v2\"".into());
+        prev.etag = Some("\"next\"".into());
         let check =
             check_compatible(&d, &prev, &info(Some(4096), true, "f.bin")).expect("compatible");
         assert_eq!(check.warning, None);
@@ -233,11 +233,11 @@ mod tests {
         retarget(
             &mut st,
             "https://cdn.example.com/f.bin?token=new",
-            Some("\"v2\"".into()),
+            Some("\"next\"".into()),
             Some(4096),
         );
         assert_eq!(st.url, "https://cdn.example.com/f.bin?token=new");
-        assert_eq!(st.etag.as_deref(), Some("\"v2\""));
+        assert_eq!(st.etag.as_deref(), Some("\"next\""));
         assert_eq!(st.state, TaskState::Paused);
         assert_eq!(kept_bytes(&st), kept);
         assert_eq!(kept, 3072);

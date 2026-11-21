@@ -1,4 +1,4 @@
-//! v2 links domain: one source of truth for NIC state, rates and weights.
+//! next links domain: one source of truth for NIC state, rates and weights.
 //!
 //! This replaces the two parallel systems (`bond::Bond` for HTTP and librqbit's
 //! `BindMeter` for torrents). Both engines feed the same [`LinkSet`] through
@@ -6,7 +6,7 @@
 //! `dt`. No external probing happens here - a [`Probe`] port is called only
 //! when the set is enabled.
 //!
-//! Invariants and failing test names live in `docs/v2/INVARIANTS.md`.
+//! Invariants and failing test names live in `docs/next/INVARIANTS.md`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};

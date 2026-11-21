@@ -48,7 +48,7 @@ pub struct HuntConfig {
     pub dest_dir: PathBuf,
     /// Request headers replayed into yt-dlp (cookies, referer, UA...).
     pub headers: HashMap<String, String>,
-    /// v2: daemon-wide byte cap passed to yt-dlp as `--limit-rate`.
+    /// next: daemon-wide byte cap passed to yt-dlp as `--limit-rate`.
     /// `None` leaves the sidecar uncapped.
     pub limit_bps: Option<u64>,
 }

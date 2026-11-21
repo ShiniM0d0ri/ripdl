@@ -42,14 +42,14 @@ Architecture fitness tests in CI:
 
 ## AI execution loop
 
-1. **Start**: `AGENTS.md` is auto-loaded; then read only `docs/v2/README.md`.
+1. **Start**: `AGENTS.md` is auto-loaded; then read only `docs/next/README.md`.
    Do not load every reference doc into context.
 2. **Pick** the next action from the index; open only the owning invariant and
    the one reference doc that owns the topic.
 3. **Write the failing test first**, named exactly as in `INVARIANTS.md`.
 4. **Implement the smallest change**, running `cargo check` and the targeted
    test after each step. No speculative refactors.
-5. **Update in the same commit**: the v2 index, the tracker row, and the
+5. **Update in the same commit**: the next index, the tracker row, and the
    invariant status. A commit without those is incomplete.
 6. **One work package per PR**, failing test first, prefer < 300 changed lines.
    Never mix WP-01 and WP-03 in one review unit.
@@ -71,7 +71,7 @@ Contract tests:
 
 - `error_codes_stable`: codes are additive and documented.
 - `errors_are_redacted`: no secret appears in serialized errors.
-- `rpc_error_shape`: v2 clients can switch on `code`.
+- `rpc_error_shape`: next clients can switch on `code`.
 
 ## Observability
 
@@ -146,4 +146,4 @@ Not "no bugs". It is:
 - the frontend cannot lie because it does not compute the number;
 - a new feature cannot be added without its contract, setting metadata, and
   test;
-- the next person can find all of that in `docs/v2/` without asking us.
+- the next person can find all of that in `docs/next/` without asking us.

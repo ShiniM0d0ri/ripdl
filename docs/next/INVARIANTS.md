@@ -1,4 +1,4 @@
-# v2 invariants
+# next invariants
 
 Each invariant is a test that must fail on a broken implementation. Tolerances
 are deliberately loose enough for CI timing jitter and tight enough to catch a

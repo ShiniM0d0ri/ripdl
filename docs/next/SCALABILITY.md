@@ -1,4 +1,4 @@
-# v2 scalability
+# next scalability
 
 Scalability here has three meanings. All three are design constraints, not
 future optimizations.
@@ -41,7 +41,7 @@ future optimizations.
 
 v1 `List` returns the full task array on every poll. At 200 tasks with URLs,
 paths, and detail fields that is large enough to make the native host's 1 MiB
-reply cap a real boundary. v2 fixes this by construction:
+reply cap a real boundary. next fixes this by construction:
 
 ```
 GetSnapshot { since: Option<u64> }
@@ -87,7 +87,7 @@ xtask codegen-protocol
 
 ## Scaling inside the daemon
 
-| Concern | Current risk | v2 rule |
+| Concern | Current risk | next rule |
 |---|---|---|
 | Traffic accounting | per-engine limiters | one `TrafficController`, O(1) per chunk |
 | Rate windows | duplicated in daemon/bond/torrent | one `RateWindow` implementation |
