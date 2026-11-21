@@ -104,6 +104,9 @@ xtask codegen-protocol
 
 - GUI: render on snapshot change, not on a timer that forces a full DOM diff.
   Keep only display history (graph points, sparklines) in the frontend.
+- UI render budget: a 200-row update must not drop frames or shift layout;
+  row cells are keyed by class, and volatile fields update in place. Every
+  component has a state fixture for the screenshot QA loop in `UI-QA.md`.
 - Extension: keep a local task store in the MV3 service worker; rehydrate with
   `GetSnapshot { since: None }` after a worker restart. Never hand-maintain a
   task list by polling `list`.

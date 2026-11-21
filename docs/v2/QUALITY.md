@@ -96,6 +96,8 @@ Never hit the real network in CI. Smoke URLs are manual only.
 - architecture fitness tests
 - scalability gates from `SCALABILITY.md`
 - e2e gate is manual, documented, and run before every release
+- visual QA gate from `UI-QA.md`: every changed screen has a passing screenshot
+  with tree assertions; a failed or missing screenshot blocks the PR
 
 ## Review checklist
 

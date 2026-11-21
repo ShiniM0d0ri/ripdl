@@ -71,6 +71,27 @@ Goal: the features people switch for, after the foundation is trustworthy.
 | XTN-007 | Extension diagnostics UI | Supportability |
 | TOR-014 | uTP metering/bonding | Only if measurements show it matters |
 
+## Standing track: UXD (UI rehaul + onboarding)
+
+This track runs across waves; it is not a single release. Detailed screen and
+component inventory is in `UI-REHAUL.md`; the screenshot/debug loop is in
+`UI-QA.md`.
+
+| ID | Capability | Wave | Notes |
+|---|---|---|---|
+| UXD-001 | First-run onboarding (3 skippable screens) | v0.5 | Folder, optional browser, optional network |
+| UXD-002 | Honest empty states | v0.5 | One CTA: paste a link or drop a .torrent |
+| UXD-003 | Generated Settings form from `GetSchema` | v0.5 | Kills orphan fields and drift |
+| UXD-004 | Default column set + optional advanced columns | v0.5 | Anti-clutter |
+| UXD-005 | Component/token system with state fixtures | v0.6 | Shared by Tauri UI and native spike |
+| UXD-006 | Full screen rehaul (all UXD-001..015 in `UI-REHAUL.md`) | v0.6 | Screenshot-gated |
+| UXD-007 | Screenshot QA harness and sidecar artifacts | v0.6 | `UI-QA.md`, CI on Windows |
+| UXD-008 | Themes, density, localization-ready layout | v0.7 | After behavior is correct |
+| UXD-009 | Native parity with the same screen inventory | v0.6/7 | Only if the spike wins |
+
+Rule: no UXD screen moves to `shipped` until every state has a passing
+screenshot with tree assertions, per `UI-QA.md`.
+
 ## Explicitly not planned
 
 - Debrid account integrations, captcha services, hoster plugin marketplaces:

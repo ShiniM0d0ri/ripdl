@@ -236,6 +236,15 @@ not `shipped`.
 | GUI-027 | Total speed is the daemon total | broken | `ui/app.js::liveSpeed` | Sums per-row values, including queued rows with stale tracks |
 | GUI-028 | Paused/queued rows report no rate | partial | `daemon/main.rs::task_info_of` | `live` includes `Queued`; a stale track can leak a rate |
 | GUI-029 | No client-side rate math | missing | `ui/app.js` | Graph and totals derive from row values |
+| UXD-001 | First-run onboarding (3 skippable screens) | missing | `UI-REHAUL.md` | No test yet; add onboarding flow e2e |
+| UXD-002 | Honest empty states with one CTA | missing | `UI-REHAUL.md` | Screenshot gate pending |
+| UXD-003 | Settings form generated from `GetSchema` | missing | `SETTINGS.md` | Needs schema codegen first |
+| UXD-004 | Default column set + optional advanced columns | partial | `ui/app.js` | Advanced columns exist; defaults need review |
+| UXD-005 | Shared component/token system with state fixtures | missing | `UI-REHAUL.md` | Fixture harness pending |
+| UXD-006 | Full screen rehaul | missing | `UI-REHAUL.md` | Screen inventory UXD-001..015 |
+| UXD-007 | Screenshot QA loop with tree assertions | missing | `UI-QA.md` | Iterate per screen/state until green |
+| UXD-008 | Themes/density/localization-ready layout | missing | `UI-REHAUL.md` | v0.7 |
+| UXD-009 | Native UI parity with the same screens | missing | `UI-SPIKE.md` | Only if the spike wins |
 
 ## CLI
 

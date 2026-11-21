@@ -54,7 +54,10 @@ Settings are part of the architecture, not a UI afterthought. `SETTINGS.md`
 defines a versioned, typed, scoped schema with live-apply metadata; frontends
 generate their forms from it. `SCALABILITY.md` defines the load targets and
 protocol sizing so the extension is not an afterthought. `FEATURE-ROADMAP.md`
-groups capabilities into waves, not bug fixes.
+groups capabilities into waves, not bug fixes. `UI-REHAUL.md` and `UI-QA.md`
+make onboarding, low-clutter design, and screenshot-driven UI debugging part
+of the definition of done - no screen ships until every state has been driven,
+inspected, captured, and approved.
 
 ## What stays
 
@@ -193,6 +196,8 @@ Rules:
 - `FEATURE-ROADMAP.md`: which feature IDs land in v0.5, v0.6, and v0.7.
 - `SETTINGS.md`: granular, typed, scoped settings schema and apply policy.
 - `QUALITY.md`: engineering rules, layering, error model, CI gates, review checklist.
+- `UI-REHAUL.md`: onboarding-first, uncluttered screen and component design.
+- `UI-QA.md`: screen-by-screen debugging and screenshot gate - iterate until green.
 
 Exit: every feature marked `shipped` has a code path and a test; every headline
 bug has a failing-test sketch.
