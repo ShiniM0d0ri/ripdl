@@ -19,6 +19,7 @@ pub mod refresh;
 pub mod rpc;
 pub mod task;
 pub mod torrent;
+pub mod traffic;
 pub mod transport;
 pub mod update;
 pub mod util;

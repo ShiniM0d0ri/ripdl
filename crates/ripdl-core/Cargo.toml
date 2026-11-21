@@ -39,6 +39,8 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
+# Pausable time for the traffic domain's rate/limit tests.
+tokio = { workspace = true, features = ["test-util"] }
 # Loopback seeder↔leecher trace output: librqbit's internal decisions
 # (piece selection, only_files handling) are only visible via tracing.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }

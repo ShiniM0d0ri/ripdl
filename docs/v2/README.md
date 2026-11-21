@@ -17,24 +17,28 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 | Item | Value |
 |---|---|
 | Branch | `next` (clean) |
-| Commit | `bf8475c` |
-| Product code | untouched |
+| Commit | see `git log -1 --oneline` (updated each PR) |
+| Product code | M1 Traffic domain landed (`traffic.rs`), not yet wired into daemon |
 | Trackers | `ISSUES.csv` (73), `FEATURE-MATRIX.md`, `INVARIANTS.md` |
-| Next milestone | M1 - Traffic domain |
+| Next milestone | M2 - Link domain (`LinkSet`) |
 
-## Next action (M1)
+M1 exit met: 12 traffic tests pass; global cap, bundle share, torrent/video
+coverage, live limits, cancellation, burst, retry rollback, resume guard, and
+stale run ids are proven at domain level. WP-01 issues remain open until M3/M4
+wire the controller into the daemon and frontends.
 
-Work package **WP-01 Traffic truth** (grouping in `FEATURE-ROADMAP.md`).
-Implement the **Traffic domain** first, not a limiter patch:
+## Next action (M2)
 
-1. `Meter` - monotonic durable bytes, compensated rollback.
-2. `RateWindow` - measured `dt`, gap reset, monotonic guard.
-3. `Limiter` - global -> task -> host buckets, cancellation-aware, live rates.
-4. `TrafficController` - policy, live updates, snapshots.
-5. Contract tests from `INVARIANTS.md` (TR-001..012) must fail before the fix.
+Work package **WP-03 Link & NIC truth** (grouping in `FEATURE-ROADMAP.md`).
+Implement the **Link domain** as a standalone module, not a bond patch:
 
-Exit: cap holds for two HTTP tasks + bundle + torrent + video; live change
-applies within 2 s; pause < 300 ms at 10 KB/s.
+1. `LinkSet` - one link set, one meter, one rate estimator, one weight model.
+2. Measured `dt` from the sampler loop; durable-byte feeding from both engines.
+3. Prune departed links and per-connection counters; no probes when off.
+4. Contract tests from `INVARIANTS.md` (LN-001..014).
+
+Exit: per-link rates sum to the aggregate; no ghost links; CLI and daemon can
+share the same link snapshot.
 
 ## Decisions made
 

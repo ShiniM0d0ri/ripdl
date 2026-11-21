@@ -14,6 +14,16 @@ Status is evidence-based, not aspirational.
 Every row should name the owning module and the proof. A row without proof is
 not `shipped`.
 
+## Traffic domain (v2)
+
+| ID | Feature | Status | Evidence | Proof / gap |
+|---|---|---|---|---|
+| TRA-001 | Monotonic meter and measured rate window with rollback/reset | shipped | `traffic.rs::Meter`, `RateWindow` | `retry_does_not_double_count`, `resume_has_no_adoption_spike` |
+| TRA-002 | Hierarchical token bucket (global -> task -> host), live rates, cancellation, bounded burst | shipped | `traffic.rs::Limiter` | `global_cap_two_tasks`, `limiter_cancel_latency`, `limiter_burst_bound`, `limit_zero_and_invalid` |
+| TRA-003 | Task and part traffic handles with run generations and live limits | shipped | `traffic.rs::TaskTraffic`, `PartTraffic` | `bundle_parts_share_task_cap`, `paused_task_has_no_live_rate`, `stale_progress_sample_is_ignored` |
+| TRA-004 | `TrafficController` and `Traffic` port with snapshots | shipped | `traffic.rs::TrafficController` | `torrent_respects_global_cap`, `video_respects_global_cap`, `limit_change_applies_live` |
+| TRA-005 | Wire the controller into engine/daemon/frontends (close WP-01 issues) | missing | - | M3/M4; until then the old per-engine limiter is still live |
+
 ## HTTP engine
 
 | ID | Feature | Status | Evidence | Proof / gap |
