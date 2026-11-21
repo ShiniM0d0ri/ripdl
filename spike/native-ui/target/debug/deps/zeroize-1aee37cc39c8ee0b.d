@@ -1,0 +1,10 @@
+D:\ripdl\spike\native-ui\target\debug\deps\zeroize-1aee37cc39c8ee0b.d: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\x86.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\barrier.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\bulk.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\stack.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\../README.md
+
+D:\ripdl\spike\native-ui\target\debug\deps\libzeroize-1aee37cc39c8ee0b.rmeta: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\x86.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\barrier.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\bulk.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\stack.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\../README.md
+
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\lib.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\x86.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\barrier.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\bulk.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\stack.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeroize-1.9.2\src\../README.md:

@@ -1,0 +1,8 @@
+D:\ripdl\spike\native-ui\target\debug\deps\rustls_platform_verifier-2ce655d8718e5f01.d: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\verification\mod.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\verification\windows.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\../README.md
+
+D:\ripdl\spike\native-ui\target\debug\deps\librustls_platform_verifier-2ce655d8718e5f01.rmeta: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\verification\mod.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\verification\windows.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\../README.md
+
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\lib.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\verification\mod.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\verification\windows.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\rustls-platform-verifier-0.7.1\src\../README.md:

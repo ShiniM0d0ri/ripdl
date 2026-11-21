@@ -1,0 +1,10 @@
+D:\ripdl\spike\native-ui\target\debug\deps\ecolor-736936ab16b64108.d: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\color32.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hsva_gamma.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hsva.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\rgba.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hex_color_runtime.rs
+
+D:\ripdl\spike\native-ui\target\debug\deps\libecolor-736936ab16b64108.rmeta: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\color32.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hsva_gamma.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hsva.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\rgba.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hex_color_runtime.rs
+
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\lib.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\color32.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hsva_gamma.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hsva.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\rgba.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ecolor-0.37.0\src\hex_color_runtime.rs:

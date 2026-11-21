@@ -1,0 +1,10 @@
+D:\ripdl\spike\native-ui\target\debug\deps\polycool-eaaf38c942ee7325.d: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\cubic.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\poly.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\poly_dyn.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\quadratic.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\yuksel.rs
+
+D:\ripdl\spike\native-ui\target\debug\deps\libpolycool-eaaf38c942ee7325.rmeta: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\cubic.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\poly.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\poly_dyn.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\quadratic.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\yuksel.rs
+
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\lib.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\cubic.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\poly.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\poly_dyn.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\quadratic.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\polycool-0.4.0\src\yuksel.rs:

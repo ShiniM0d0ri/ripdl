@@ -1,0 +1,9 @@
+D:\ripdl\spike\native-ui\target\debug\deps\egui_winit-02b24a60ebef712a.d: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\clipboard.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\dropped_file.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\safe_area.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\window_settings.rs
+
+D:\ripdl\spike\native-ui\target\debug\deps\libegui_winit-02b24a60ebef712a.rmeta: C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\lib.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\clipboard.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\dropped_file.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\safe_area.rs C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\window_settings.rs
+
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\lib.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\clipboard.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\dropped_file.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\safe_area.rs:
+C:\Users\DarkFlameMaster\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-winit-0.37.0\src\window_settings.rs:
