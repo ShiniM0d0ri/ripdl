@@ -40,6 +40,22 @@ Architecture fitness tests in CI:
 - `every_port_has_contract_test`;
 - `no_adapter_to_adapter_use`.
 
+## AI execution loop
+
+1. **Start**: `AGENTS.md` is auto-loaded; then read only `docs/v2/README.md`.
+   Do not load every reference doc into context.
+2. **Pick** the next action from the index; open only the owning invariant and
+   the one reference doc that owns the topic.
+3. **Write the failing test first**, named exactly as in `INVARIANTS.md`.
+4. **Implement the smallest change**, running `cargo check` and the targeted
+   test after each step. No speculative refactors.
+5. **Update in the same commit**: the v2 index, the tracker row, and the
+   invariant status. A commit without those is incomplete.
+6. **One work package per PR**, failing test first, prefer < 300 changed lines.
+   Never mix WP-01 and WP-03 in one review unit.
+7. **If blocked**, record the decision in the index or an ADR. Do not invent a
+   new planning document.
+
 ## Error model
 
 - Domain/application errors are typed enums with stable codes.

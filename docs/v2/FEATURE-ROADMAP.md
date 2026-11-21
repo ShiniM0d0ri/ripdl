@@ -86,7 +86,9 @@ component inventory is in `UI-REHAUL.md`; the screenshot/debug loop is in
 | UXD-005 | Component/token system with state fixtures | v0.6 | Shared by Tauri UI and native spike |
 | UXD-006 | Full screen rehaul (all UXD-001..015 in `UI-REHAUL.md`) | v0.6 | Screenshot-gated |
 | UXD-007 | Screenshot QA harness and sidecar artifacts | v0.6 | `UI-QA.md`, CI on Windows |
-| UXD-008 | Themes, density, localization-ready layout | v0.7 | After behavior is correct |
+| UXD-008 | Themes, density, localization-ready layout | v0.6 | Layout must be i18n-ready before strings are translated |
+| UXD-010 | Undo for destructive actions (remove/move) | v0.6 | Toast with Undo instead of confirm-dialog spam |
+| UXD-011 | Contextual coach marks for torrent/bundle/video | v0.7 | First-use hints, dismissible, never blocking |
 | UXD-009 | Native parity with the same screen inventory | v0.6/7 | Only if the spike wins |
 
 Rule: no UXD screen moves to `shipped` until every state has a passing

@@ -23,6 +23,10 @@ early, but no screen is called done until it passes `UI-QA.md`.
    every interactive element; WCAG AA contrast; 100/150/200% DPI correct.
 7. **Density without noise.** Default columns: name, size, progress, speed,
    status, kind. Optional columns off by default.
+8. **Reversible actions.** Destructive operations offer Undo where safe instead
+   of a confirming modal every time.
+9. **i18n-ready layout.** Text is never baked into fixed-width layouts; labels
+   can grow without clipping before any translation exists.
 
 ## First-run onboarding (three screens, all skippable)
 
