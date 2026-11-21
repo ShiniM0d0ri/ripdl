@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
+use ts_rs::TS;
 
 use crate::traffic::{Meter, RateWindow, DEFAULT_RATE_WINDOW};
 
@@ -27,20 +28,24 @@ pub const DEFAULT_EXPLORE_EVERY: Duration = Duration::from_secs(60);
 const DIAL_FAIL_SKIP: u32 = 2;
 
 /// One bindable uplink address.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 pub struct LinkInfo {
+    #[ts(as = "String")]
     pub ip: IpAddr,
     pub name: String,
     pub default_route: bool,
 }
 
 /// Serializable view of one link. This is the only shape frontends receive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct LinkSnapshot {
     pub name: String,
+    #[ts(as = "String")]
     pub ip: IpAddr,
     pub default_route: bool,
+    #[ts(as = "f64")]
     pub rate_bps: u64,
+    #[ts(as = "f64")]
     pub capacity_bps: u64,
     pub weight: u32,
     pub in_use: u32,

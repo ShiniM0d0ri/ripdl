@@ -289,7 +289,7 @@ not `shipped`.
 | CLI-015 | `plugin` | shipped | `cli/main.rs` | `plugins.test.mjs` |
 | CLI-016 | Direct `--bond` parity | broken | `cli/main.rs` | Builds a bond authority but never samples it |
 | CLI-017 | Shell completion | missing | - | - |
-| CLI-018 | JSON output mode | missing | - | Automation relies on text parsing |
+| CLI-018 | JSON output mode | shipped | `cli/main.rs::Cmd::Traffic` | `ripdl traffic --json` prints the `GetTrafficSnapshot` payload |
 
 ## Config
 

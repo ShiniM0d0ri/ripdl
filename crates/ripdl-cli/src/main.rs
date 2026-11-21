@@ -141,6 +141,11 @@ enum Cmd {
     },
     /// List tasks known to the daemon.
     Ls,
+    /// Show the daemon's one traffic/link snapshot (JSON for automation).
+    Traffic {
+        #[arg(long)]
+        json: bool,
+    },
     /// Pause a running task.
     Pause { id: String },
     /// Resume a paused or failed task.
@@ -458,6 +463,23 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::RegisterHost { ext_id, host, force } => register_host(&ext_id, &host, force),
         Cmd::Ls => rpc(Command::List).await,
+        Cmd::Traffic { json } => {
+            let reply = rpc_reply(Command::GetTrafficSnapshot).await?;
+            if json {
+                if let Reply::TrafficSnapshot { controller, links } = reply {
+                    let view = serde_json::json!({
+                        "controller": controller,
+                        "links": links,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                    Ok(())
+                } else {
+                    print_reply(reply)
+                }
+            } else {
+                print_reply(reply)
+            }
+        }
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
@@ -854,8 +876,35 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Reply::TrafficSnapshot { .. } => {
-            println!("unified-traffic snapshot is available; use a next frontend to render it");
+        Reply::TrafficSnapshot { controller, links } => {
+            println!(
+                "global limit:         {}",
+                controller
+                    .global_limit_bps
+                    .map(humans)
+                    .unwrap_or_else(|| "unlimited".to_string())
+            );
+            println!("total rate:           {}/s", humans(controller.total_bps as u64));
+            for task in &controller.tasks {
+                println!(
+                    "task {}:            {}/s (limit {}, {})",
+                    task.id,
+                    humans(task.rate_bps.unwrap_or(0.0) as u64),
+                    task.limit_bps.map(humans).unwrap_or_else(|| "none".into()),
+                    format!("{:?}", task.state).to_lowercase()
+                );
+            }
+            for link in &links {
+                println!(
+                    "link {}:            {}/s (capacity {}/s, weight {}, {} conn{})",
+                    link.name,
+                    humans(link.rate_bps),
+                    humans(link.capacity_bps),
+                    link.weight,
+                    link.in_use,
+                    if link.in_use == 1 { "" } else { "s" }
+                );
+            }
         }
         Reply::Error { message } => bail!("{message}"),
         Reply::Config {

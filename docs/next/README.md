@@ -69,7 +69,10 @@ live changes apply within one tick; one link snapshot feeds config and CLI.
 
 Render that snapshot in every frontend, with no client-side rate math:
 
-- CLI: `--json` from `GetTrafficSnapshot`; keep the human text arm.
+- CLI: `ripdl traffic [--json]` landed. It calls `GetTrafficSnapshot`, prints a
+  human table by default and the snapshot as JSON with `--json`.
+- Generated types: `tools/xtask` exports `protocol.d.ts` into the extension and
+  Tauri UI from the Rust types; CI checks them with `--check`.
 - Tauri GUI: remove `liveSpeed`/`speedText` derivation; status bar and
   per-NIC chips read `traffic_links` + `TaskInfo`.
 - Extension: delta store, `Ping` instead of `list`, generated `protocol.d.ts`,

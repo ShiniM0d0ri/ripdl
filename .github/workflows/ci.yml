@@ -33,6 +33,10 @@ jobs:
       - name: Check (all targets)
         run: cargo check --workspace --all-targets
 
+      # Generated TypeScript bindings must match the Rust RPC types.
+      - name: Generated protocol types are current
+        run: cargo run -p xtask -- protocol -- --check
+
       - name: Test (fully offline)
         run: cargo test --workspace
 

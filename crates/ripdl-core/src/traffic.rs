@@ -16,6 +16,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use ts_rs::TS;
 
 /// Default burst window. A bucket holds at most `rate * burst` tokens, so a
 /// short burst is absorbed without letting a 2 s display window read far above
@@ -225,7 +226,7 @@ impl Limiter {
 }
 
 /// The kind of transfer, used only for diagnostics and tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficKind {
     Http,
@@ -234,7 +235,7 @@ pub enum TrafficKind {
     Video,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum TrafficState {
     Running,
@@ -486,22 +487,29 @@ impl Traffic for PartTraffic {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct TaskTrafficSnapshot {
     pub id: TaskId,
+    #[ts(inline)]
     pub kind: TrafficKind,
+    #[ts(inline)]
     pub state: TrafficState,
+    #[ts(as = "f64")]
     pub run_id: u64,
+    #[ts(as = "f64")]
     pub downloaded: u64,
     pub rate_bps: Option<f64>,
+    #[ts(as = "Option<f64>")]
     pub limit_bps: Option<u64>,
     pub throttled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct ControllerSnapshot {
+    #[ts(as = "Option<f64>")]
     pub global_limit_bps: Option<u64>,
     pub total_bps: f64,
+    #[ts(inline)]
     pub tasks: Vec<TaskTrafficSnapshot>,
 }
 

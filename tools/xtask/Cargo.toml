@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+description = "Repository chores: generated protocol types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ripdl-core = { workspace = true }
+ts-rs = { workspace = true }
+anyhow = { workspace = true }
