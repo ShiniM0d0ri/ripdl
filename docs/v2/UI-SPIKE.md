@@ -63,6 +63,47 @@ first, but the second half must talk to the real daemon.
   temporary `GetSnapshot` adapter if needed.
 - No feature that the Tauri UI does not already have.
 
+## Debugging and UI automation
+
+**No, CDP cannot be reused.** Chrome DevTools Protocol speaks to a
+Chromium/WebView2 renderer. An egui/iced app renders to a native window with
+wgpu/glow; there is no DOM, no JS runtime, and no DevTools endpoint. The
+existing `research/ext-e2e-cdp.js` and the C4 GUI checks in
+`ext/test/e2e/run.mjs` are Tauri-WebView-specific and will not transfer.
+
+What replaces it:
+
+- **egui inspection port.** eframe has an `inspection` feature: set
+  `EGUI_INSPECTION` (or `EGUI_INSPECTION_ADDR`) and eframe opens a TCP port that
+  lets an external tool read the **AccessKit tree**, inject input, and capture
+  screenshots. That is the closest native equivalent to CDP's DOM/inject/
+  screenshot surface, and it is off by default. This is a concrete reason to
+  prototype on egui first; nothing equivalent was found in iced's feature set.
+- **AccessKit tree in-process.** With eframe's `accesskit` feature, the same
+  tree is available to Rust code, so we can write assertions like "the row with
+  this name has state `seeding` and speed `1.2 MiB/s`" without pixels. On
+  Windows, `accesskit_windows` maps that tree to UI Automation, so screen
+  readers and OS-level automation tools see the app too.
+- **Native debugger.** WinDbg/Visual Studio/gdb with symbols, breakpoints, and
+  watch windows. This is better than CDP for logic bugs in Rust code.
+- **In-app debug panel.** A hidden panel (shortcut) that dumps the last RPC
+  snapshot, view-model state, frame time, and link rates. Cheap to build and
+  the fastest way to answer "is the UI wrong or is the daemon wrong?"
+- **tracing.** The daemon already logs; the spike should log to a file and show
+  a small log window rather than depending on a console.
+- **Frame/GPU tools.** egui shows frame time/CPU/GPU stats; RenderDoc/PIX can
+  capture a frame when needed. Not required for the decision.
+
+Consequence for the schedule: a native UI needs a **new automation harness**.
+Budget it explicitly; do not assume the C4 GUI checks can be ported by changing
+a URL. The first milestone of the spike is therefore "can a test read the
+AccessKit tree and assert a row", not "does the window look nice".
+
+Add one more go/no-go item:
+
+- the inspection/AccessKit harness can assert the task list and drive
+  pause/resume without pixel matching, and it runs in CI on Windows.
+
 ## Metrics
 
 Measure the same scenarios on the current Tauri build and the spike:
@@ -89,6 +130,7 @@ Adopt native only if **all** of these hold:
 - visible RSS and hidden RSS beat Tauri by at least 30%;
 - cold start beats Tauri;
 - the keyboard and Narrator flows are usable without a regression;
+- the AccessKit/inspection harness proves the UI can be tested without CDP;
 - the table remains smooth at 200 tasks and 2 Hz;
 - the spike reaches feature parity for the scope above in two weeks.
 

@@ -46,8 +46,8 @@ Legend: **C** = confirmed defect today, **S** = suspected/untested today.
 
 | ID | Invariant | Test | Today |
 |---|---|---|---|
-| EN-001 | A gzip-encoded response is downloaded as the exact bytes the server names: `Content-Length`, durable bytes, and SHA-256 agree. | `gzip_identity_and_hash` | C |
-| EN-002 | Range requests are never combined with transparent content decoding. | `range_with_identity_encoding` | C |
+| EN-001 | A gzip-encoded response is downloaded as the exact bytes the server names: `Content-Length`, durable bytes, and SHA-256 agree. | `gzip_identity_and_hash` | S |
+| EN-002 | Range requests are never combined with transparent content decoding, and the client does not rely on a third-party library quirk to achieve that. | `range_with_identity_encoding` | S |
 | EN-003 | An existing file is never truncated by a new download with the same name; a free name is chosen or the user is asked. | `no_silent_overwrite` | C |
 | EN-004 | Resume validates the probe's total against the sidecar's total; a mismatch starts fresh. | `resume_total_mismatch_starts_fresh` | C |
 | EN-005 | Resume validates the on-disk file length against the sidecar offsets; a truncated file does not become a sparse hole. | `resume_file_length_validated` | C |

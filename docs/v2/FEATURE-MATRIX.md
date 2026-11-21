@@ -38,7 +38,7 @@ not `shipped`.
 | ENG-018 | Live limit reconfiguration | missing | `engine/mod.rs` | The rate is fixed at `Engine::new`; running tasks ignore changes |
 | ENG-019 | Limiter cancellation latency | partial | `engine/limiter.rs` | Sleeps are capped at 250 ms, but a large chunk at a low cap can loop for seconds |
 | ENG-020 | Limiter burst bound | partial | `engine/limiter.rs` | Bucket capacity is one second of rate; a 2 s display window can read above the cap |
-| ENG-021 | Content-Encoding identity for downloads | broken | `Cargo.toml`, `engine/mod.rs` | `reqwest` gzip is enabled with no `Accept-Encoding: identity`; `Content-Length` and decoded bytes can disagree |
+| ENG-021 | Content-Encoding identity for downloads | partial | `Cargo.toml`, `engine/mod.rs` | `reqwest` gzip is enabled with no `no_gzip()`; ranged GETs are incidentally protected because reqwest skips `Accept-Encoding` when `Range` is present, but HEAD probes and non-compliant servers are not |
 | ENG-022 | Content-Disposition filename parsing | shipped | `engine/planner.rs` | `carries_headers_and_uses_cd_filename` |
 | ENG-023 | Headers, cookies, referer, User-Agent pass-through | shipped | `engine/mod.rs` | Integration tests |
 | ENG-024 | Redirect following | untested | `reqwest` default | No test for a redirect chain or loop |

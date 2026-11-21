@@ -65,6 +65,65 @@ These are frozen unless a v2 test exposes a correctness bug:
 - `SetConfig` best-effort live apply -> explicit `TrafficController::set_limits`
   and `LinkSet::set_policy` calls.
 
+## Readiness check (2026-11-21)
+
+Branch `next` is clean; the Phase 0 documents are committed. Nothing has been
+changed in the engine or daemon yet.
+
+### Verified from source, not assumed
+
+- `EngineConfig.max_speed` is copied into a new `Limiter` in `Engine::new`, and
+  the daemon builds one engine per task and per bundle part. The "total" limit
+  is genuinely per engine.
+- The torrent session leaves `SessionOptions::ratelimits` at its default, and
+  `hunt.rs` never passes `--limit-rate`. Both bypass the setting.
+- `DaemonSettings::apply` has no `extension_dir` branch.
+- `plan_fresh` forces two segments when `max_segments = 1` and divides by
+  `min_segment_size` without a zero check.
+- `download_named` opens a new destination with `truncate(true)` with no
+  free-name check. A different URL with the same filename overwrites the file.
+- `feed_http_bond` passes a hardcoded 5 s `dt` to `Bond::sample`, while
+  `refresh_uplinks` can take up to 1.2 s before the sampler runs.
+- `bind_rates` and the librqbit `BindMeter` counter map are both append-only.
+- The daemon calls `refresh_uplinks` every 5 s regardless of `bond_interfaces`,
+  so external reachability probes happen with bonding off.
+- `Cargo.lock` shows no `h2` dependency for `reqwest 0.12.28`, confirming the
+  HTTP client is HTTP/1.1-only.
+
+### Corrected during analysis
+
+- The gzip issue was initially filed S0. reqwest 0.12 only adds
+  `Accept-Encoding: gzip` when the request **has no `Range` header**, so ranged
+  segment GETs are incidentally protected. The remaining risk is HEAD probes
+  and non-compliant servers. It is now **S2** in `ISSUES.csv`. The fix is still
+  `no_gzip()` plus `Accept-Encoding: identity`; we just should not claim a
+  universal corruption bug.
+
+### Decisions needed before M1
+
+1. Does the global cap include torrents and video from day one, or do we ship an
+   HTTP-only v2 cap first? The plan assumes all traffic.
+2. Per-task torrent limits: librqbit exposes session-wide `LimitsConfig`; a
+   per-task cap would need another vendor delta. Accept session-wide for v2?
+3. Native toolkit for the spike: egui is recommended because eframe has an
+   `inspection` TCP port that exposes the AccessKit tree, injects input, and
+   captures screenshots - the closest analogue to CDP we found.
+4. How long do v1 RPC adapters remain? The plan says until CLI, GUI, and
+   extension all migrate.
+5. Is the `name (1)` overwrite fix an S0 hotfix on `main`, or does it land in
+   v2 M4? Data loss argues for a `main` hotfix.
+6. Is LAN brute-force throttling in v2 scope, or a separate security pass?
+
+### Risks
+
+- Two rate systems live at once during `traffic-v2`; the flag must be
+  bulletproof and the old path must remain the default until parity.
+- The native UI needs a new test harness; CDP checks do not transfer.
+- Config validation can change behavior for users with hand-edited files;
+  every rejection needs a warning and a documented fallback.
+- The event/snapshot protocol can bloat at 2 Hz with 200 tasks; measure before
+  committing to a wire format.
+
 ## Issue register
 
 `ISSUES.csv` is the single defect list. Severity:
