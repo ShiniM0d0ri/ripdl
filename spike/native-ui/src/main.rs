@@ -164,19 +164,26 @@ struct SpikeApp {
     add_open: bool,
     url: String,
     dest: String,
+    notice: String,
     settings_open: bool,
 }
 
 impl SpikeApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let screen = std::env::var("RIPDL_QA_SCREEN").unwrap_or_default();
         Self {
             state: spawn_poller(),
-            category: "all".into(),
+            category: if screen == "completed" {
+                "completed".into()
+            } else {
+                "all".into()
+            },
             selected: None,
-            add_open: false,
+            add_open: screen == "add",
             url: String::new(),
             dest: String::new(),
-            settings_open: false,
+            notice: String::new(),
+            settings_open: screen == "settings",
         }
     }
 
@@ -194,10 +201,14 @@ impl SpikeApp {
             }
         }
         ui.separator();
-        if ui.button("Add URL").clicked() {
+        let big = egui::vec2(124.0, 26.0);
+        if ui.add(egui::Button::new("Add URL").min_size(big)).clicked() {
             self.add_open = true;
         }
-        if ui.button("Settings").clicked() {
+        if ui
+            .add(egui::Button::new("Settings").min_size(big))
+            .clicked()
+        {
             self.settings_open = true;
         }
     }
@@ -212,6 +223,14 @@ impl SpikeApp {
                 _ => true,
             })
             .collect();
+        if rows.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.heading("Nothing here yet");
+                ui.label("Add a URL or drop a .torrent file to start a download.");
+            });
+            return;
+        }
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("tasks")
                 .num_columns(5)
@@ -291,18 +310,27 @@ impl SpikeApp {
             let mut cancel = false;
             let url = &mut self.url;
             let dest = &mut self.dest;
+            let notice = &mut self.notice;
             egui::Window::new("Add URL")
                 .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .default_width(460.0)
                 .show(ctx, |ui| {
                     ui.label("URL");
                     ui.text_edit_singleline(url);
                     ui.label("Save to (optional)");
                     ui.text_edit_singleline(dest);
+                    if !notice.is_empty() {
+                        ui.label(notice.as_str());
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
-                        ui.add_enabled(false, egui::Button::new("Download"));
+                        if ui.button("Download").clicked() {
+                            *notice = "UI spike: add is not wired yet".to_string();
+                        }
                     });
                 });
             self.add_open = open && !cancel;
@@ -312,6 +340,9 @@ impl SpikeApp {
             let settings = self.state.lock().unwrap().settings.clone();
             egui::Window::new("Settings")
                 .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .default_width(460.0)
                 .show(ctx, |ui| {
                     ui.heading("Network");
                     if let Some(s) = &settings {
@@ -340,12 +371,15 @@ impl SpikeApp {
 
 impl eframe::App for SpikeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(font) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Body) {
+            font.size = 15.0;
+        }
         let snap = { self.state.lock().unwrap().clone() };
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, &snap));
         egui::Panel::left("nav").show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Downloads");
             self.task_list(ui, &snap);
-            self.status_bar(ui, &snap);
         });
         let ctx = ui.ctx().clone();
         self.dialogs(&ctx);
@@ -354,7 +388,10 @@ impl eframe::App for SpikeApp {
 }
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(1200.0, 800.0)),
+        ..Default::default()
+    };
     eframe::run_native(
         "ripdl native UI spike",
         options,

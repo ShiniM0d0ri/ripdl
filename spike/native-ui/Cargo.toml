@@ -14,7 +14,9 @@ librqbit = { path = "../../vendor/librqbit" }
 
 [dependencies]
 ripdl-core = { path = "../../crates/ripdl-core" }
-eframe = "0.37"
+eframe = { version = "0.37", features = ["inspection"] }
 egui = "0.37"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+egui_inspection = "0.37"
+anyhow = "1"
