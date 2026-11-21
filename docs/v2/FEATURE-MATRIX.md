@@ -34,7 +34,7 @@ not `shipped`.
 | TRA-002 | Hierarchical token bucket (global -> task -> host), live rates, cancellation, bounded burst | shipped | `traffic.rs::Limiter` | `global_cap_two_tasks`, `limiter_cancel_latency`, `limiter_burst_bound`, `limit_zero_and_invalid` |
 | TRA-003 | Task and part traffic handles with run generations and live limits | shipped | `traffic.rs::TaskTraffic`, `PartTraffic` | `bundle_parts_share_task_cap`, `paused_task_has_no_live_rate`, `stale_progress_sample_is_ignored` |
 | TRA-004 | `TrafficController` and `Traffic` port with snapshots | shipped | `traffic.rs::TrafficController` | `torrent_respects_global_cap`, `video_respects_global_cap`, `limit_change_applies_live` |
-| TRA-005 | Wire the controller into engine/daemon/frontends (close WP-01 issues) | partial | `daemon/main.rs` (feature `traffic-v2`), `rpc.rs::GetTrafficSnapshot` | Daemon owns the controller and answers one snapshot; tasks/engines not yet registered |
+| TRA-005 | Wire the controller into engine/daemon/frontends (close WP-01 issues) | partial | `daemon/main.rs` (`traffic-v2`), `engine/mod.rs::traffic`, `rpc.rs::GetTrafficSnapshot` | HTTP/bundle tasks register and acquire from the shared budget; torrent/video cap and frontends still pending |
 
 ## HTTP engine
 

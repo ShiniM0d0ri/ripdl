@@ -9,11 +9,13 @@
 //! Everything here is offline; no test touches a real network.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use ripdl_core::engine::retry::RetryConfig;
+use ripdl_core::traffic::{Cancelled, Traffic};
 use ripdl_core::{Engine, EngineConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -2010,5 +2012,90 @@ async fn expired_link_reports_auth_status_and_keeps_sidecar() {
     assert!(
         !names.iter().any(|n| n.ends_with(".ripdl.json")),
         "sidecar must be removed on success: {names:?}"
+    );
+}
+
+#[derive(Debug, Default)]
+struct CountingTraffic {
+    calls: AtomicU64,
+    bytes: AtomicU64,
+    reported: AtomicU64,
+}
+
+impl Traffic for CountingTraffic {
+    fn acquire<'a>(
+        &'a self,
+        n: u64,
+        _token: Option<&'a CancellationToken>,
+    ) -> BoxFuture<'a, Result<(), Cancelled>> {
+        let calls = &self.calls;
+        let bytes = &self.bytes;
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(n, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+    fn report(&self, _run_id: u64, bytes: u64, _now: tokio::time::Instant) -> bool {
+        self.reported.fetch_add(bytes, Ordering::Relaxed);
+        true
+    }
+    fn rollback(&self, _run_id: u64, _bytes: u64, _now: tokio::time::Instant) -> bool {
+        true
+    }
+    fn rate_bps(&self) -> Option<f64> {
+        None
+    }
+    fn downloaded(&self) -> u64 {
+        self.reported.load(Ordering::Relaxed)
+    }
+}
+
+/// v2: when a daemon-owned handle is supplied, every segment draws from it
+/// instead of the engine's private limiter.
+#[tokio::test]
+async fn engine_acquires_from_supplied_traffic() {
+    let total = 256 * KIB;
+    let state = Arc::new(ServerState {
+        total,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+    let counter = Arc::new(CountingTraffic::default());
+    let cfg = EngineConfig {
+        traffic: Some(counter.clone() as Arc<dyn Traffic>),
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(cfg).expect("engine");
+    let tmp = temp_dir("supplied-traffic");
+    let dest = engine
+        .download(&url, Some(tmp.clone()), CancellationToken::new(), |_p| {})
+        .await
+        .expect("download with supplied traffic");
+    verify(&dest, total);
+    assert!(counter.calls.load(Ordering::Relaxed) > 0, "no traffic acquire calls");
+    assert_eq!(
+        counter.bytes.load(Ordering::Relaxed),
+        total,
+        "all body bytes must be reserved through the shared handle"
     );
 }

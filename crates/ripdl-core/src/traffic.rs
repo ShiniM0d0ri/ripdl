@@ -8,11 +8,11 @@
 //! the bottom of this file.
 
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -429,12 +429,12 @@ impl PartTraffic {
 }
 
 /// Port implemented by tasks and parts so callers do not care which they hold.
-pub trait Traffic: Send + Sync {
+pub trait Traffic: Send + Sync + std::fmt::Debug {
     fn acquire<'a>(
         &'a self,
         n: u64,
         token: Option<&'a CancellationToken>,
-    ) -> impl Future<Output = Result<(), Cancelled>> + Send + 'a;
+    ) -> BoxFuture<'a, Result<(), Cancelled>>;
 
     fn report(&self, run_id: u64, bytes: u64, now: Instant) -> bool;
     fn rollback(&self, run_id: u64, bytes: u64, now: Instant) -> bool;
@@ -447,8 +447,8 @@ impl Traffic for TaskTraffic {
         &'a self,
         n: u64,
         token: Option<&'a CancellationToken>,
-    ) -> impl Future<Output = Result<(), Cancelled>> + Send + 'a {
-        TaskTraffic::acquire(self, n, token)
+    ) -> BoxFuture<'a, Result<(), Cancelled>> {
+        Box::pin(TaskTraffic::acquire(self, n, token))
     }
     fn report(&self, run_id: u64, bytes: u64, now: Instant) -> bool {
         TaskTraffic::report(self, run_id, bytes, now)
@@ -469,8 +469,8 @@ impl Traffic for PartTraffic {
         &'a self,
         n: u64,
         token: Option<&'a CancellationToken>,
-    ) -> impl Future<Output = Result<(), Cancelled>> + Send + 'a {
-        PartTraffic::acquire(self, n, token)
+    ) -> BoxFuture<'a, Result<(), Cancelled>> {
+        Box::pin(PartTraffic::acquire(self, n, token))
     }
     fn report(&self, run_id: u64, bytes: u64, now: Instant) -> bool {
         PartTraffic::report(self, run_id, bytes, now)

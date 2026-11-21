@@ -18,7 +18,7 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 |---|---|
 | Branch | `next` (clean) |
 | Commit | see `git log -1 --oneline` (updated each PR) |
-| Product code | M1/M2 domains; M3 first slice (daemon ownership + `GetTrafficSnapshot`) |
+| Product code | M1/M2 domains; M3: daemon ownership, RPC, live policy, HTTP/bundle budget wiring |
 | Trackers | `ISSUES.csv` (73), `FEATURE-MATRIX.md`, `INVARIANTS.md` |
 | Next milestone | M3 - wire tasks/engines into the owned domains |
 
@@ -42,12 +42,14 @@ Wire the two domains into the daemon behind a `traffic-v2` feature flag:
 
 Landed so far: daemon owns `TrafficController` + `LinkSet` behind the
 `traffic-v2` Cargo feature; `Command::GetTrafficSnapshot` answers one snapshot;
-`SetConfig` applies live global-limit and bonding changes; the old paths remain
-default and the CLI has a v1-compatible arm.
+`SetConfig` applies live global-limit and bonding changes; every task/part is
+registered with a run generation, `on_progress` feeds bytes into its
+`TaskTraffic`, and HTTP/bundle engines acquire budget from the shared handle
+instead of a private limiter. Old paths remain default; CLI keeps a v1 arm.
 
-Remaining M3: register each task/part/torrent/video with the controller, feed
-the `LinkSet` from HTTP + torrent connections, apply live limit/link changes,
-and replace the split `bond_links`/`torrent_rates` config fields.
+Remaining M3: torrent and video budget enforcement (librqbit `LimitsConfig`,
+`--limit-rate`), feed `LinkSet` from real HTTP/torrent connections, and replace
+split `bond_links`/`torrent_rates` config fields with the one snapshot.
 
 Exit: two HTTP tasks + bundle + torrent + video under one cap in the daemon;
 live change applies within one tick; one link snapshot in CLI/GUI/config.

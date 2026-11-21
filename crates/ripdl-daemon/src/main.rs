@@ -15,6 +15,8 @@ use ripdl_core::rpc::{
     Reply, Request, Response, StaleCandidate, TaskDetailsSnapshot, TaskInfo,
 };
 use ripdl_core::task::{Progress, TaskKind, TaskState};
+#[cfg(feature = "traffic-v2")]
+use ripdl_core::traffic::{TaskTraffic, TrafficKind};
 use ripdl_core::{atomic_write_json, Engine, EngineConfig};
 #[cfg(feature = "traffic-v2")]
 use ripdl_core::links::LinkSet;
@@ -109,6 +111,10 @@ struct QueueFileRef<'a> {
 
 struct TaskRuntime {
     token: CancellationToken,
+    #[cfg(feature = "traffic-v2")]
+    traffic: Arc<TaskTraffic>,
+    #[cfg(feature = "traffic-v2")]
+    run_id: u64,
 }
 
 /// One active seeding watcher. The generation makes stale watchers harmless:
@@ -337,6 +343,16 @@ struct LanSendState {
 type DaemonConfig = ripdl_core::rpc::DaemonSettings;
 
 /// Why a confirmed link death parks a task, beyond plain auth answers.
+#[cfg(feature = "traffic-v2")]
+fn traffic_kind(kind: TaskKind) -> TrafficKind {
+    match kind {
+        TaskKind::Http => TrafficKind::Http,
+        TaskKind::Bundle => TrafficKind::Bundle,
+        TaskKind::Torrent => TrafficKind::Torrent,
+        TaskKind::Video => TrafficKind::Video,
+    }
+}
+
 enum StaleCause {
     Auth,
     Changed { new: u64, old: u64 },
@@ -1693,6 +1709,15 @@ impl Daemon {
         headers: &std::collections::HashMap<String, String>,
         bond: bool,
     ) -> EngineConfig {
+        self.engine_config_with_traffic(headers, bond, None)
+    }
+
+    fn engine_config_with_traffic(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+        bond: bool,
+        traffic: Option<Arc<dyn ripdl_core::traffic::Traffic>>,
+    ) -> EngineConfig {
         let conf = self.conf();
         EngineConfig {
             max_segments: conf.max_segments(),
@@ -1708,6 +1733,7 @@ impl Daemon {
             // from this same link set, so measured weights and skips are
             // shared across tasks instead of re-discovered per engine.
             bond_state: Some(self.bond.clone()),
+            traffic,
             ..EngineConfig::default()
         }
     }
@@ -3679,7 +3705,23 @@ impl Daemon {
         }
 
         self.set_part_state(id, index, TaskState::Running, None, None);
-        let engine = match Engine::new(self.engine_config(&headers, true)) {
+        #[cfg(feature = "traffic-v2")]
+        let engine_config = {
+            let handle = self
+                .runtime
+                .lock()
+                .unwrap()
+                .get(id)
+                .map(|rt| Arc::clone(&rt.traffic));
+            self.engine_config_with_traffic(
+                &headers,
+                true,
+                handle.map(|h| h as Arc<dyn ripdl_core::traffic::Traffic>),
+            )
+        };
+        #[cfg(not(feature = "traffic-v2"))]
+        let engine_config = self.engine_config(&headers, true);
+        let engine = match Engine::new(engine_config) {
             Ok(engine) => engine,
             Err(e) => {
                 let msg = e.to_string();
@@ -3806,10 +3848,30 @@ impl Daemon {
     /// canceling it persists a Paused sidecar, and resume replays it.
     fn spawn_runner(self: &Arc<Self>, rec: TaskRecord) {
         let token = CancellationToken::new();
-        self.runtime
-            .lock()
-            .unwrap()
-            .insert(rec.id.clone(), TaskRuntime { token: token.clone() });
+        #[cfg(feature = "traffic-v2")]
+        let (traffic_handle, run_id) = {
+            let host = reqwest::Url::parse(&rec.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string));
+            let handle = self.traffic.register_task(
+                rec.id.clone(),
+                traffic_kind(rec.kind),
+                None,
+                host.as_deref(),
+            );
+            let id = handle.begin_run();
+            (handle, id)
+        };
+        self.runtime.lock().unwrap().insert(
+            rec.id.clone(),
+            TaskRuntime {
+                token: token.clone(),
+                #[cfg(feature = "traffic-v2")]
+                traffic: Arc::clone(&traffic_handle),
+                #[cfg(feature = "traffic-v2")]
+                run_id,
+            },
+        );
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
@@ -3958,6 +4020,21 @@ impl Daemon {
                     // defaults; task headers live on the client and always
                     // override. Both the probe and every segment carry them.
                     let engine = {
+                        #[cfg(feature = "traffic-v2")]
+                        let cfg = {
+                            let handle = this
+                                .runtime
+                                .lock()
+                                .unwrap()
+                                .get(&rec.id)
+                                .map(|rt| Arc::clone(&rt.traffic));
+                            this.engine_config_with_traffic(
+                                &rec.headers,
+                                true,
+                                handle.map(|h| h as Arc<dyn ripdl_core::traffic::Traffic>),
+                            )
+                        };
+                        #[cfg(not(feature = "traffic-v2"))]
                         let cfg = this.engine_config(&rec.headers, true);
                         match Engine::new(cfg) {
                             Ok(engine) => Arc::new(engine),
@@ -3981,7 +4058,19 @@ impl Daemon {
                 }
             };
 
+            #[cfg(feature = "traffic-v2")]
+            let finished_traffic = this
+                .runtime
+                .lock()
+                .unwrap()
+                .get(&rec.id)
+                .map(|rt| Arc::clone(&rt.traffic));
             this.runtime.lock().unwrap().remove(&rec.id);
+            #[cfg(feature = "traffic-v2")]
+            if let Some(t) = finished_traffic {
+                t.pause();
+                this.traffic.unregister_task(&rec.id);
+            }
             match result {
                 Ok(file) => {
                     this.set_completed(&rec.id, file);
@@ -4258,6 +4347,18 @@ impl Daemon {
             window: VecDeque::new(),
             at: now,
         });
+        #[cfg(feature = "traffic-v2")]
+        {
+            let prev = entry.last.downloaded;
+            let traffic_now = tokio::time::Instant::from_std(now);
+            if let Some(rt) = self.runtime.lock().unwrap().get(id) {
+                if p.downloaded >= prev {
+                    let _ = rt.traffic.report(rt.run_id, p.downloaded - prev, traffic_now);
+                } else {
+                    let _ = rt.traffic.rollback(rt.run_id, prev - p.downloaded, traffic_now);
+                }
+            }
+        }
         // Resume/recheck hash pass: `downloaded` counts verified bytes and
         // climbs at disk speed, so a derived rate would show hundreds of MB/s
         // and poison the 60 s speed graph. Report no speed and drop the
@@ -4719,6 +4820,47 @@ mod tests {
             }
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "traffic-v2")]
+    #[tokio::test]
+    async fn daemon_task_registers_and_reports_bytes() {
+        let forbidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let base = spawn_refresh_server(Arc::clone(&forbidden), None).await;
+        let (daemon, dir) = proposal_daemon("traffic-task");
+        let resp = daemon.cmd_add(
+            1,
+            format!("{base}/file.bin"),
+            Some(dir.clone()),
+            HashMap::new(),
+            None,
+            TaskKind::Http,
+            false,
+            None,
+            DuplicatePolicy::Report,
+        );
+        let id = match resp.reply {
+            Reply::Added { id } => id,
+            other => panic!("expected Added, got {other:?}"),
+        };
+        let mut seen = false;
+        for _ in 0..200 {
+            let snap = daemon.cmd_get_traffic_snapshot(9);
+            if let Reply::TrafficSnapshot { controller, .. } = snap.reply {
+                if controller
+                    .tasks
+                    .iter()
+                    .any(|t| t.id == id && t.downloaded > 0)
+                {
+                    seen = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(seen, "registered task never reported bytes to the controller");
+        let _ = daemon.cmd_pause(10, &id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Loopback server for handoff probes: HEAD reports `len` bytes, while the

@@ -132,6 +132,10 @@ pub struct EngineConfig {
     /// links are safe: the window only needs *some* progress. `None`
     /// disables the watchdog (tests only).
     pub stream_idle: Option<std::time::Duration>,
+    /// v2: optional daemon-owned traffic handle. When set, every segment
+    /// draws its budget from this handle (global -> task -> host) instead of
+    /// the engine's private limiter. `None` keeps v1 behavior.
+    pub traffic: Option<std::sync::Arc<dyn crate::traffic::Traffic>>,
 }
 
 impl Default for EngineConfig {
@@ -146,6 +150,7 @@ impl Default for EngineConfig {
             bond: Bond::Off,
             bond_state: None,
             stream_idle: Some(std::time::Duration::from_secs(30)),
+            traffic: None,
         }
     }
 }
@@ -337,6 +342,7 @@ impl Engine {
         // whose dials fail is skipped on the spot, and when nothing can be
         // picked the OS default route carries the attempt.
         let dialer = self.dialer.clone();
+        let traffic = self.cfg.traffic.clone();
 
         // On-the-fly bond rebalancing state, shared by the workers and the
         // migration supervisor below.
@@ -360,6 +366,7 @@ impl Engine {
             let linkmap = linkmap.clone();
             let migrate = migrate.clone();
             let stream_idle = self.cfg.stream_idle;
+            let traffic = traffic.clone();
             // Ramp-in (the part-start lag spike): every segment used to
             // open its first handshake at the same moment, which read as a
             // hard CPU/AV hitch at every part start. First dials are spaced
@@ -386,6 +393,7 @@ impl Engine {
                     stream_idle,
                     linkmap,
                     migrate,
+                    traffic,
                 )
                 .await;
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -791,6 +799,8 @@ async fn run_segment(
     // link the supervisor wants it moved to.
     linkmap: Arc<Mutex<HashMap<usize, IpAddr>>>,
     migrate: Arc<Mutex<HashMap<usize, IpAddr>>>,
+    // v2: daemon-owned budget. `None` keeps the private limiter path.
+    traffic: Option<Arc<dyn crate::traffic::Traffic>>,
 ) -> Result<()> {
     let mut attempt = 0u32;
     // A migration order the previous attempt ended with: the next dial must
@@ -912,6 +922,7 @@ async fn run_segment(
             &token,
             stream_idle,
             &migrate,
+            traffic.as_deref(),
         )
         .await
         {
@@ -1109,6 +1120,7 @@ async fn segment_attempt(
     token: &CancellationToken,
     stream_idle: Option<Duration>,
     migrate: &Mutex<HashMap<usize, IpAddr>>,
+    traffic: Option<&dyn crate::traffic::Traffic>,
 ) -> Result<()> {
     let mut file: Option<std::fs::File> = Some(
         std::fs::OpenOptions::new()
@@ -1366,8 +1378,16 @@ async fn segment_attempt(
             },
         };
 
-        // Pace consumption: all segments draw from one shared budget.
-        limiter.acquire(chunk.len() as u64).await;
+        // Pace consumption: v2 draws from the daemon-owned hierarchy (global
+        // -> task -> host); v1 keeps the engine's private shared bucket.
+        if let Some(t) = traffic {
+            if t.acquire(chunk.len() as u64, Some(token)).await.is_err() {
+                rollback!();
+                return Err(Error::Cancelled);
+            }
+        } else {
+            limiter.acquire(chunk.len() as u64).await;
+        }
         // Attribute the bytes to the link this connection dialed through;
         // the sampler folds deltas into per-link rate EMAs.
         if let Some((bond, link)) = &bond_ctx {
