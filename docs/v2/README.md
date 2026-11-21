@@ -24,6 +24,7 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 
 ## Next action (M1)
 
+Work package **WP-01 Traffic truth** (grouping in `FEATURE-ROADMAP.md`).
 Implement the **Traffic domain** first, not a limiter patch:
 
 1. `Meter` - monotonic durable bytes, compensated rollback.

@@ -92,6 +92,28 @@ component inventory is in `UI-REHAUL.md`; the screenshot/debug loop is in
 Rule: no UXD screen moves to `shipped` until every state has a passing
 screenshot with tree assertions, per `UI-QA.md`.
 
+## Work packages (grouped fixes and enhancements)
+
+`ISSUES.csv` has a `work_package` column. This is how defects and enhancements
+are grouped: one root cause, one design change, many issues closed together.
+No issue is fixed alone; it is closed by its package's invariant tests.
+
+| WP | Name | Root cause | Issue IDs | Wave | Exit |
+|---|---|---|---|---|---|
+| WP-01 | Traffic truth | Limiter is owned per `Engine`; no live policy or shared meter; torrent/video/bundle bypass it | 001-007, 052, 060 | v0.5 | TR-001..012; two tasks + bundle + torrent + video under one cap |
+| WP-02 | Byte & resume integrity | Sidecar and `Content-Length` trusted; destination truncated; gzip decoding | 008-013, 038 | v0.5 | EN-001..012; gzip hash match, no overwrite, corrupt sidecar recovers |
+| WP-03 | Link & NIC truth | Two link systems (`Bond` + `BindMeter`), hardcoded `dt`, read-time metering, no pruning | 018-029, 034-037, 057, 058, 065 | v0.5 | LN-001..014; per-link sum = aggregate; no ghost NICs; no probes when off |
+| WP-04 | Refresh integrity | Refresh checks identity but not version or segment bounds | 066-068 | v0.5 | EN-013..015; no version splicing, validated sidecar, hidden attribute |
+| WP-05 | Config & settings governance | Flat `Option` bag, validation only in `SetConfig`, no schema or bounds | 015, 030, 051, 053, 071-073 | v0.5/6 | CFG-001..012 + `SETTINGS.md`; every knob typed, scoped, validated, generated |
+| WP-06 | Engine correctness & capability | Planner/client config gaps; retry policy contradicts its comment | 014, 016, 017, 047-050, 059, 064 | v0.6 | EN-008..012 + new tests; planner bounds, HTTP/2, proxy, checksum, per-host limits |
+| WP-07 | Queue & process lifecycle | No run generation; progress map not pruned; unbounded reconcile/walk | 039-041, 056, 062 | v0.6 | RP-003 + lifecycle tests; no stale samples, bounded maps and budgets |
+| WP-08 | Protocol & frontend contract | Frontends compute rates; no version/delta; no generated types | 031-033, 042, 043, 054, 055, 061, 063 + XTN | v0.5/6 | RP-001..006, UI-001..006; one snapshot, generated types, no client math |
+| WP-09 | Bridge, LAN & update hardening | Resource leaks, no throttles, no update cache | 044-046, 069, 070 | v0.6 | RP-005/006 + LAN tests; no leaked threads, code throttle, cached update check |
+
+WP-01..04 are the v0.5 truth layer. WP-05..09 finish in v0.6; they are grouped
+here so a fix never lands as a lone patch. The UXD standing track runs across
+all waves.
+
 ## Explicitly not planned
 
 - Debrid account integrations, captcha services, hoster plugin marketplaces:

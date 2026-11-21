@@ -104,6 +104,8 @@ Never hit the real network in CI. Smoke URLs are manual only.
 Every PR must answer:
 
 - Which matrix feature id does this implement, and what is its new status?
+- Which work package (`FEATURE-ROADMAP.md`) does this belong to? Does it close
+  the package's invariant, not just one repro?
 - Which invariant does it add or protect? Which test encodes it?
 - Does it change a port or protocol? If so, where is the ADR?
 - Does it add a setting? If so, is it in `SETTINGS.md` with metadata and tests?
