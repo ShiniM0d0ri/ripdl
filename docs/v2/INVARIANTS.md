@@ -81,3 +81,15 @@ Legend: **C** = confirmed defect today, **S** = suspected/untested today.
 | UI-004 | The per-NIC chips show the same link set and rates as `ripdl config`, including torrent traffic. | `chips_match_config` | C |
 | UI-005 | A 0 B/s rate renders as `0 B/s`, not as `-` (which means unknown). | `zero_rate_renders` | S |
 | UI-006 | The Settings "Total speed limit" label is true: it caps all traffic, not one task. | `settings_limit_is_global` | C |
+
+## Phase 0 follow-up
+
+| ID | Invariant | Test | Today |
+|---|---|---|---|
+| EN-013 | Refresh never adopts kept bytes when the ETag changed; a warning is not sufficient. | `refresh_etag_mismatch_rejected` | C |
+| EN-014 | Refresh validates every segment's bounds and `kept_bytes <= total` before retargeting. | `refresh_validates_sidecar_bounds` | C |
+| EN-015 | A refresh sidecar keeps the Windows hidden attribute. | `refresh_sidecar_stays_hidden` | C |
+| RP-005 | A bridge RPC timeout does not leave a thread blocked on the dead stream. | `bridge_timeout_no_thread_leak` | C |
+| RP-006 | The bridge retries only connect/timeout failures, not auth or protocol errors. | `bridge_no_retry_on_auth_failure` | C |
+| CFG-011 | `max_concurrent` from a hand-edited config is clamped to a documented maximum. | `max_concurrent_bound` | C |
+| CFG-012 | Non-finite `seed_ratio` and short LAN codes are rejected at load. | `config_load_validation` | S |

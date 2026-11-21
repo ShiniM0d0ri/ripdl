@@ -62,6 +62,21 @@ not `shipped`.
 | ENG-042 | POST/form/body downloads | missing | - | - |
 | ENG-043 | Download filename collision suffix | broken | `engine/mod.rs` | No `name (1)` policy for normal adds |
 
+## Refresh and bridge
+
+| ID | Feature | Status | Evidence | Proof / gap |
+|---|---|---|---|---|
+| REF-001 | Retarget a paused HTTP task to a fresh URL | shipped | `refresh.rs` | `retarget_keeps_progress_and_swaps_identity` |
+| REF-002 | Reject a new address with a different ETag | broken | `refresh.rs:99-108` | Only warns; `retarget` swaps the ETag and keeps old offsets, splicing two file versions |
+| REF-003 | Validate sidecar bounds on refresh | broken | `refresh.rs:64-109` | No segment index/end/done or kept-bytes check |
+| REF-004 | Windows hidden attribute after refresh | broken | `refresh.rs:32-35` | `save` writes without `hide_on_windows` |
+| REF-005 | Corrupt refresh sidecar recovery | broken | `refresh.rs::load` | Parse error propagates and blocks the refresh |
+| BRG-001 | Native-messaging host framing | shipped | `bridge.rs` | `handoff.test.mjs`, e2e B phase |
+| BRG-002 | Daemon spawn rate limit | shipped | `bridge.rs::spawn_daemon_bg` | 3 s global cooldown |
+| BRG-003 | RPC timeout does not leak threads | broken | `bridge.rs:345-362` | A timed-out reply leaves a detached reader thread blocked forever |
+| BRG-004 | Retry only transient errors | partial | `bridge.rs:269-287` | All errors retry 20 times, including bad token and malformed reply |
+| BRG-005 | 1 MiB reply cap | shipped | `bridge.rs` | `write_frame` refuses oversized replies |
+
 ## Networking and bonding
 
 | ID | Feature | Status | Evidence | Proof / gap |
@@ -288,6 +303,7 @@ not `shipped`.
 | UPD-006 | Elevation handling | shipped | `daemon/main.rs` | Live verification |
 | UPD-007 | Speed limit for update download | missing | `update.rs` | Uses the same uncapped client |
 | UPD-008 | Cryptographic signature | missing | `update.rs` | SHA-256 only |
+| UPD-009 | Check-result cache / backoff | missing | `update.rs` | Every GUI launch performs a fresh GitHub GET |
 | PKG-001 | Windows Inno setup | shipped | `packaging/windows` | Release v0.2.0 |
 | PKG-002 | Portable zip | shipped | `.github/workflows` | Release v0.2.0 |
 | PKG-003 | Linux tar/deb/rpm | shipped | `packaging/linux` | Release v0.2.0 |

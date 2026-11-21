@@ -20,6 +20,11 @@ Tauri. Tauri is still the default. The spike is a measurement, not a verdict.
 
 ## Toolkit choice
 
+Decision: **egui/eframe**. It does **not** use WebView2 - eframe renders through
+`winit` + `wgpu`/`glow` directly, so there is no Chromium/Edge runtime, no
+WebView2 install dependency, and no CDP. This matches the requirement that the
+native spike not require WebView2.
+
 Start with **egui/eframe**:
 
 - fastest path to a table-heavy task list (`egui_extras::TableBuilder`);
