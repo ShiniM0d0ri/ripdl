@@ -1,5 +1,5 @@
 //! Native UI spike for ripdl: IDM-style shell, adapted to ripdl features.
-//! eframe/egui, no WebView2. All numbers come from the daemon snapshot.
+//! eframe/egui, no WebView2. All real numbers come from the daemon snapshot.
 
 use std::io::{BufRead, Write};
 use std::net::TcpStream;
@@ -25,6 +25,7 @@ struct TaskRow {
     id: String,
     name: String,
     kind: String,
+    source: String,
     state: String,
     downloaded: u64,
     total: Option<u64>,
@@ -62,6 +63,13 @@ fn kind_icon(kind: &str) -> &'static str {
         "bundle" => "[B]",
         _ => "[D]",
     }
+}
+
+fn host_of(url: &str) -> String {
+    url.split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+        .unwrap_or(url)
+        .to_string()
 }
 
 static RPC_ID: AtomicU64 = AtomicU64::new(0);
@@ -120,6 +128,7 @@ fn poll_once() -> Snapshot {
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                     .unwrap_or_else(|| t.url.clone()),
                 kind: format!("{:?}", t.kind).to_lowercase(),
+                source: host_of(&t.url),
                 state: if t.seeding {
                     "seeding".to_string()
                 } else {
@@ -161,11 +170,43 @@ fn poll_once() -> Snapshot {
     snap
 }
 
-fn spawn_poller() -> Arc<Mutex<Snapshot>> {
-    let state = Arc::new(Mutex::new(poll_once()));
+fn fixture_snapshot() -> Snapshot {
+    Snapshot {
+        daemon: "fixture".into(),
+        tasks: (0..200)
+            .map(|i| TaskRow {
+                id: format!("fixture-{i}"),
+                name: format!("download-{i:03}.bin"),
+                kind: if i % 5 == 0 { "torrent" } else { "http" }.into(),
+                source: format!("cdn-{}.example.com", i % 8),
+                state: if i % 3 == 0 { "running" } else { "queued" }.into(),
+                downloaded: (i as u64) * 1024 * 1024,
+                total: Some(100 * 1024 * 1024),
+                speed_bps: Some(1_048_576.0),
+                last_try: if i % 17 == 0 {
+                    "expired link".into()
+                } else {
+                    String::new()
+                },
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn spawn_poller(dense: bool) -> Arc<Mutex<Snapshot>> {
+    let state = Arc::new(Mutex::new(if dense {
+        fixture_snapshot()
+    } else {
+        poll_once()
+    }));
     let shared = Arc::clone(&state);
     std::thread::spawn(move || loop {
-        let next = poll_once();
+        let next = if dense {
+            fixture_snapshot()
+        } else {
+            poll_once()
+        };
         *shared.lock().unwrap() = next;
         std::thread::sleep(Duration::from_secs(1));
     });
@@ -177,59 +218,117 @@ struct SpikeApp {
     category: String,
     selected: Option<String>,
     add_open: bool,
+    advanced_open: bool,
     url: String,
     dest: String,
+    category_text: String,
+    headers_text: String,
+    video: bool,
+    torrent: bool,
+    sequential: bool,
     notice: String,
     settings_open: bool,
     settings_tab: String,
     scheduler_open: bool,
     scheduler_tab: String,
+    selected_queue: String,
 }
 
 impl SpikeApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let screen = std::env::var("RIPDL_QA_SCREEN").unwrap_or_default();
+        let dense = screen == "dense" || std::env::var("RIPDL_QA_FIXTURE").as_deref() == Ok("200");
+        let state = spawn_poller(dense);
         Self {
-            state: spawn_poller(),
-            category: "all".into(),
+            state,
+            category: if screen == "empty" {
+                "torrent".into()
+            } else {
+                "all".into()
+            },
             selected: None,
             add_open: screen == "add",
+            advanced_open: false,
             url: String::new(),
             dest: String::new(),
+            category_text: String::new(),
+            headers_text: String::new(),
+            video: false,
+            torrent: false,
+            sequential: false,
             notice: String::new(),
             settings_open: screen == "settings",
             settings_tab: "General".into(),
             scheduler_open: screen == "scheduler",
             scheduler_tab: "Schedule".into(),
+            selected_queue: "default".into(),
         }
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for label in ["Tasks", "File", "Downloads", "View", "Tools", "Help"] {
-                let _ = ui.button(label);
-            }
+            let _ = ui.menu_button("Tasks", |ui| {
+                let _ = ui.button("Add URL");
+                let _ = ui.button("Add torrent");
+                let _ = ui.button("Add bundle");
+                ui.separator();
+                let _ = ui.button("Pause all");
+                let _ = ui.button("Resume all");
+            });
+            let _ = ui.menu_button("File", |ui| {
+                let _ = ui.button("Open file");
+                let _ = ui.button("Open folder");
+                let _ = ui.button("Remove");
+            });
+            let _ = ui.menu_button("Downloads", |ui| {
+                let _ = ui.button("Start queue");
+                let _ = ui.button("Stop queue");
+                let _ = ui.button("Scheduler");
+            });
+            let _ = ui.menu_button("View", |ui| {
+                let _ = ui.button("Columns");
+                let _ = ui.button("Theme");
+            });
+            let _ = ui.menu_button("Tools", |ui| {
+                let _ = ui.button("Options");
+                let _ = ui.button("Send & Receive");
+            });
+            let _ = ui.menu_button("Help", |ui| {
+                let _ = ui.button("About ripdl");
+                let _ = ui.button("Run setup again");
+            });
         });
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let actions: [(&str, &str); 11] = [
-            ("+", "Add URL"),
-            ("R", "Resume"),
-            ("S", "Stop"),
-            ("SA", "Stop All"),
-            ("X", "Delete"),
-            ("XC", "Delete C..."),
-            ("G", "Options"),
-            ("C", "Scheduler"),
-            ("PQ", "Start Qu..."),
-            ("SQ", "Stop Qu..."),
-            ("F", "Refresh"),
+            ("✚", "Add URL"),
+            ("▶", "Resume"),
+            ("■", "Stop"),
+            ("⏹", "Stop All"),
+            ("✖", "Delete"),
+            ("✓", "Delete C..."),
+            ("⚙", "Options"),
+            ("◷", "Scheduler"),
+            ("▶Q", "Start Qu..."),
+            ("⏹Q", "Stop Qu..."),
+            ("⟳", "Refresh"),
         ];
         ui.horizontal(|ui| {
-            for (icon, label) in actions {
+            for (icon, label) in actions.iter() {
                 let text = format!("{icon}\n{label}");
-                ui.add(egui::Button::new(text).min_size(egui::vec2(66.0, 48.0)));
+                let btn = ui
+                    .add(egui::Button::new(text).min_size(egui::vec2(68.0, 50.0)))
+                    .on_hover_text(*label);
+                if *label == "Options" && btn.clicked() {
+                    self.settings_open = true;
+                }
+                if *label == "Scheduler" && btn.clicked() {
+                    self.scheduler_open = true;
+                }
+                if *label == "Add URL" && btn.clicked() {
+                    self.add_open = true;
+                }
             }
         });
     }
@@ -237,7 +336,7 @@ impl SpikeApp {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.heading("Categories");
         ui.separator();
-        let categories = [
+        for (id, label) in [
             ("all", "All Downloads"),
             ("downloading", "Downloading"),
             ("completed", "Completed"),
@@ -247,8 +346,7 @@ impl SpikeApp {
             ("unfinished", "Unfinished"),
             ("grabber", "Grabber projects"),
             ("queues", "Queues"),
-        ];
-        for (id, label) in categories {
+        ] {
             if ui.selectable_label(self.category == id, label).clicked() {
                 self.category = id.to_string();
             }
@@ -256,7 +354,7 @@ impl SpikeApp {
         ui.separator();
         ui.collapsing("All Downloads", |ui| {
             for sub in ["Compressed", "Documents", "Music", "Programs"] {
-                ui.label(sub);
+                let _ = ui.selectable_label(false, sub);
             }
         });
         if ui.button("Send & Receive").clicked() {
@@ -269,9 +367,7 @@ impl SpikeApp {
             .tasks
             .iter()
             .filter(|t| match self.category.as_str() {
-                "downloading" => {
-                    t.state == "running" || t.state == "queued" || t.state == "connecting"
-                }
+                "downloading" => matches!(t.state.as_str(), "running" | "queued" | "connecting"),
                 "completed" => t.state == "completed" || t.state == "seeding",
                 "torrent" => t.kind == "torrent",
                 "bundle" => t.kind == "bundle",
@@ -285,6 +381,9 @@ impl SpikeApp {
                 ui.add_space(70.0);
                 ui.heading("Nothing here yet");
                 ui.label("Add a URL or drop a .torrent file to start a download.");
+                if ui.button("Add URL").clicked() {
+                    self.add_open = true;
+                }
             });
             return;
         }
@@ -319,7 +418,8 @@ impl SpikeApp {
                             self.selected = Some(id);
                         }
                         ui.label(format!("{} {}", kind_icon(&t.kind), t.kind));
-                        ui.label(t.total.map(humans).unwrap_or_else(|| "?".into()));
+                        ui.label(t.total.map(humans).unwrap_or_else(|| "?".into()))
+                            .on_hover_text(format!("{} done", humans(t.downloaded)));
                         ui.label(&t.state);
                         ui.label("-");
                         ui.label(
@@ -327,16 +427,8 @@ impl SpikeApp {
                                 .map(|v| format!("{}/s", humans(v as u64)))
                                 .unwrap_or_else(|| "-".into()),
                         );
-                        ui.label(if t.last_try.is_empty() {
-                            "-"
-                        } else {
-                            &t.last_try
-                        });
-                        ui.label(format!(
-                            "{}/{}",
-                            humans(t.downloaded),
-                            t.total.map(humans).unwrap_or_else(|| "?".into())
-                        ));
+                        ui.label(&t.last_try);
+                        ui.label(&t.source);
                         ui.end_row();
                     }
                 });
@@ -377,17 +469,36 @@ impl SpikeApp {
         let mut cancel = false;
         let url = &mut self.url;
         let dest = &mut self.dest;
+        let cat = &mut self.category_text;
+        let headers = &mut self.headers_text;
+        let video = &mut self.video;
+        let torrent = &mut self.torrent;
+        let sequential = &mut self.sequential;
+        let advanced = &mut self.advanced_open;
         let notice = &mut self.notice;
         egui::Window::new("Add URL")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
-            .default_width(460.0)
+            .default_width(500.0)
             .show(ctx, |ui| {
                 ui.label("URL");
                 ui.text_edit_singleline(url);
                 ui.label("Save to (optional)");
                 ui.text_edit_singleline(dest);
+                ui.separator();
+                if ui.button("Advanced ▾").clicked() {
+                    *advanced = !*advanced;
+                }
+                if *advanced {
+                    ui.label("Category");
+                    ui.text_edit_singleline(cat);
+                    ui.checkbox(video, "Video/stream page (yt-dlp)");
+                    ui.checkbox(torrent, "Torrent payload");
+                    ui.checkbox(sequential, "Torrent: sequential download");
+                    ui.label("Extra headers (Name: value, one per line)");
+                    ui.add(egui::TextEdit::multiline(headers).desired_rows(2));
+                }
                 if !notice.is_empty() {
                     ui.label(notice.as_str());
                 }
@@ -403,6 +514,14 @@ impl SpikeApp {
         self.add_open = open && !cancel;
     }
 
+    fn setting_row(ui: &mut egui::Ui, label: &str, value: String) {
+        ui.horizontal(|ui| {
+            ui.strong(label);
+            ui.label(value);
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn show_settings(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -422,55 +541,192 @@ impl SpikeApp {
             "Updates",
             "Diagnostics",
         ];
+        let notice = &mut self.notice;
         egui::Window::new("Options")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
-            .default_size(egui::vec2(620.0, 420.0))
+            .default_size(egui::vec2(860.0, 520.0))
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for t in tabs {
-                        if ui.selectable_label(*tab == t, t).clicked() {
-                            *tab = t.to_string();
+                for row in tabs.chunks(5) {
+                    ui.horizontal(|ui| {
+                        for t in row {
+                            if ui.selectable_label(*tab == *t, *t).clicked() {
+                                *tab = (*t).to_string();
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading(tab.as_str());
                     if let Some(s) = &settings {
                         match tab.as_str() {
                             "General" => {
-                                ui.label(format!("download folder: {}", s.default_download_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(user Downloads)".into())));
-                                ui.label(format!("hide to tray: {}", s.hide_to_tray.unwrap_or(true)));
+                                Self::setting_row(
+                                    ui,
+                                    "download folder:",
+                                    s.default_download_dir
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_else(|| "(user Downloads)".into()),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "hide to tray:",
+                                    s.hide_to_tray.unwrap_or(true).to_string(),
+                                );
+                                Self::setting_row(ui, "start with OS:", "not configured".into());
+                            }
+                            "File Types" => {
+                                Self::setting_row(
+                                    ui,
+                                    "capture types:",
+                                    "documents, archives, media, video".into(),
+                                );
+                                Self::setting_row(ui, "site exclusions:", "none".into());
+                                Self::setting_row(ui, "address exceptions:", "none".into());
                             }
                             "Connection" => {
-                                ui.label(format!("total speed limit: {}", s.max_speed_bytes.map(humans).unwrap_or_else(|| "unlimited".into())));
-                                ui.label(format!("connections per download: {}", s.max_segments.unwrap_or(8)));
-                                ui.label(format!("min segment: {}", humans(s.min_segment_size.unwrap_or(1024 * 1024))));
-                                ui.label(format!("bonding: {}", if s.bond_interfaces.unwrap_or(false) { "on" } else { "off" }));
+                                Self::setting_row(
+                                    ui,
+                                    "total speed limit:",
+                                    s.max_speed_bytes
+                                        .map(humans)
+                                        .unwrap_or_else(|| "unlimited".into()),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "connections/download:",
+                                    s.max_segments.unwrap_or(8).to_string(),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "min segment:",
+                                    humans(s.min_segment_size.unwrap_or(1024 * 1024)),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "bonding:",
+                                    if s.bond_interfaces.unwrap_or(false) {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    }
+                                    .into(),
+                                );
+                                Self::setting_row(ui, "per-host limits:", "daemon policy".into());
+                                Self::setting_row(ui, "proxy:", "not configured".into());
+                            }
+                            "Save To" => {
+                                Self::setting_row(
+                                    ui,
+                                    "default folder:",
+                                    s.default_download_dir
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_else(|| "(user Downloads)".into()),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "temp directory:",
+                                    "alongside download".into(),
+                                );
+                                Self::setting_row(ui, "remember last path:", "per category".into());
+                            }
+                            "Downloads" => {
+                                for (k, v) in [
+                                    ("progress dialog", "inline in task list"),
+                                    ("complete dialog", "toast + row state"),
+                                    ("silent mode", "no modal storms"),
+                                    ("start immediately", "explicit after Add"),
+                                    ("resume mtime check", "daemon policy"),
+                                    ("AV hook", "post-download hooks later"),
+                                ] {
+                                    Self::setting_row(ui, k, v.into());
+                                }
                             }
                             "Torrents" => {
-                                ui.label(format!("seeding: {}", if s.seed_enabled.unwrap_or(true) { "on" } else { "off" }));
-                                ui.label(format!("seed ratio: {}", s.seed_ratio.unwrap_or(1.0)));
-                                ui.label(format!("seed time (min): {}", s.seed_time_min.unwrap_or(0)));
+                                Self::setting_row(
+                                    ui,
+                                    "seeding:",
+                                    if s.seed_enabled.unwrap_or(true) {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    }
+                                    .into(),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "seed ratio:",
+                                    s.seed_ratio.unwrap_or(1.0).to_string(),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "seed time (min):",
+                                    s.seed_time_min.unwrap_or(0).to_string(),
+                                );
+                                Self::setting_row(ui, "per-task cap:", "add-time policy".into());
+                                Self::setting_row(ui, "fastresume:", "on".into());
+                            }
+                            "Bundles" => {
+                                Self::setting_row(ui, "auto-extract:", "policy planned".into());
+                                Self::setting_row(
+                                    ui,
+                                    "part-set policy:",
+                                    "wait for complete set".into(),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "default folder:",
+                                    "<dest>/<bundle name>".into(),
+                                );
                             }
                             "Browser" => {
-                                ui.label("extension status: available");
-                                ui.label("capture policy: user-confirmable");
+                                Self::setting_row(ui, "extension:", "connected".into());
+                                Self::setting_row(ui, "capture:", "user-confirmable".into());
+                                Self::setting_row(ui, "referer rules:", "offer-first".into());
                             }
                             "Updates" => {
-                                ui.label(format!("update check: {}", if s.update_check.unwrap_or(true) { "on" } else { "off" }));
-                                ui.label(format!("auto-install: {}", if s.update_auto_install.unwrap_or(false) { "on" } else { "off" }));
+                                Self::setting_row(
+                                    ui,
+                                    "check:",
+                                    if s.update_check.unwrap_or(true) {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    }
+                                    .into(),
+                                );
+                                Self::setting_row(
+                                    ui,
+                                    "auto-install:",
+                                    if s.update_auto_install.unwrap_or(false) {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    }
+                                    .into(),
+                                );
+                                Self::setting_row(ui, "verification:", "SHA256SUMS".into());
                             }
-                            _ => {
-                                ui.label("Settings are generated from the daemon schema in the final UI.");
+                            "Diagnostics" => {
+                                Self::setting_row(ui, "log level:", "info".into());
+                                Self::setting_row(ui, "telemetry:", "off (fixed)".into());
+                                if ui.button("Copy diagnostics").clicked() {
+                                    *notice = "UI spike: diagnostics not wired yet".into();
+                                }
                             }
+                            _ => {}
                         }
                     } else {
                         ui.label("settings unavailable");
                     }
                 });
+                if !notice.is_empty() {
+                    ui.label(notice.as_str());
+                }
             });
         self.settings_open = open;
     }
@@ -481,43 +737,60 @@ impl SpikeApp {
         }
         let mut open = true;
         let tab = &mut self.scheduler_tab;
+        let queue = &mut self.selected_queue;
         let mut one_time = true;
         egui::Window::new("Scheduler")
             .open(&mut open)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
-            .default_size(egui::vec2(620.0, 420.0))
+            .default_size(egui::vec2(760.0, 460.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(*tab == "Schedule", "Schedule")
-                        .clicked()
-                    {
-                        *tab = "Schedule".into();
-                    }
-                    if ui
-                        .selectable_label(*tab == "Files in the queue", "Files in the queue")
-                        .clicked()
-                    {
-                        *tab = "Files in the queue".into();
-                    }
-                });
-                ui.separator();
-                if tab == "Schedule" {
-                    ui.horizontal(|ui| {
-                        let _ = ui.button("Start Now");
-                        let _ = ui.button("Stop");
+                    ui.vertical(|ui| {
+                        ui.heading("Queues");
+                        for q in ["default", "fast", "slow"] {
+                            if ui.selectable_label(*queue == q, q).clicked() {
+                                *queue = q.to_string();
+                            }
+                        }
                     });
-                    ui.label("Queue: default");
-                    ui.checkbox(&mut one_time, "One-time downloading");
-                    ui.label("Start download at: -");
-                    ui.label("Stop download at: -");
-                    ui.label("Number of retries for each file: engine default");
-                    ui.label("Files at the same time: daemon setting");
-                    ui.label("Turn off computer when done: excluded in ripdl");
-                } else {
-                    ui.label("No files in queue (spike view).");
-                }
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(*tab == "Schedule", "Schedule")
+                                .clicked()
+                            {
+                                *tab = "Schedule".into();
+                            }
+                            if ui
+                                .selectable_label(
+                                    *tab == "Files in the queue",
+                                    "Files in the queue",
+                                )
+                                .clicked()
+                            {
+                                *tab = "Files in the queue".into();
+                            }
+                        });
+                        ui.separator();
+                        if tab == "Schedule" {
+                            ui.horizontal(|ui| {
+                                let _ = ui.button("Start Now");
+                                let _ = ui.button("Stop");
+                            });
+                            ui.label(format!("Queue: {queue}"));
+                            ui.checkbox(&mut one_time, "One-time downloading");
+                            Self::setting_row(ui, "Start download at:", "-".into());
+                            Self::setting_row(ui, "Stop download at:", "-".into());
+                            Self::setting_row(ui, "Retries per file:", "engine default".into());
+                            Self::setting_row(ui, "Files at once:", "daemon setting".into());
+                            Self::setting_row(ui, "On finish:", "hooks later".into());
+                        } else {
+                            ui.label("Files in this queue appear here.");
+                        }
+                    });
+                });
             });
         self.scheduler_open = open;
     }
@@ -545,6 +818,14 @@ impl eframe::App for SpikeApp {
 }
 
 fn main() -> eframe::Result<()> {
+    let _ = std::fs::write(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("qa/screen-debug.txt"),
+        format!(
+            "screen={:?} fixture={:?}",
+            std::env::var("RIPDL_QA_SCREEN"),
+            std::env::var("RIPDL_QA_FIXTURE")
+        ),
+    );
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(1180.0, 720.0)),
         ..Default::default()
