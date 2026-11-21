@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=D:\ripdl\spike\native-ui\target\debug\build\mime_guess-d5c05c77184e2ec3\out\mime_types_generated.rs
