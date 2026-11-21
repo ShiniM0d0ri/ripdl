@@ -36,7 +36,7 @@
 "IDM-035","S13","states","empty_state","Plain empty grid","Honest empty state with one CTA","Keep our better empty state","P1","Do not copy IDM's bare grid","UI-REHAUL"
 "IDM-036","S13","states","error_column","Errors in Status/Last Try columns","stale_reason in details and RPC","Add visible Last Try column","P1","-"
 "IDM-037","S14","onboarding","no_in_app_wizard","No app setup wizard; browser prompt only","Our 3-screen first-run flow","Keep skippable; do not add more steps","P1","-"
-"IDM-038","S15","business","registration","Trial, registration menu, purchase nags","No registration, no ads, no telemetry","Never add; About dialog only","P0","Non-negotiable from AGENTS.md","AGENTS.md"
+"IDM-038","S15","business","registration","Trial, registration menu, purchase nags; excluded from this map","No registration, no ads, no telemetry","Never add; About dialog only","excluded","Upgrade/registration popups are explicitly ignored","AGENTS.md"
 "RIP-039","S01","torrent","torrent_category","Not applicable in IDM","Torrent rows and details exist","Add Torrents sidebar category and seed state chips","P1","Our addition","FEATURE-MATRIX"
 "RIP-040","S01","bundle","bundle_category","Not applicable","Bundle task exists","Add Bundles category with parts count","P1","Our addition","FEATURE-MATRIX"
 "RIP-041","S02","bundle","paste_bundle","Not applicable","Add multi-part dialog exists","Simple paste-list then package review","P1","Our addition","BUN-*"

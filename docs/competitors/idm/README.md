@@ -21,10 +21,17 @@ live in `research/idm-portable/` and are gitignored.
 
 ## Documents
 
-- `UI-MAP.md` — every screen and its controls, one by one.
+- `MAP-INDEX.md` — **start here**. One line per screen card; load one card at a time.
+- `SHARED.md` — shared rules, read once.
+- `cards/S01..S14.md` — self-contained implementation cards: behavior, state
+  model, interactions, acceptance criteria and work IDs. Only one card should
+  be open while implementing a screen.
 - `FEATURES.csv` — machine-readable feature mapping to ripdl work items.
+- `UI-MAP.md` — the full visual inventory (reference, not for context loading).
 - `ONBOARDING.md` — how the post-install browser-integration popup works and
   how ripdl should replicate the pattern.
+
+Upgrade/registration/trial popups are intentionally excluded (IDM-038).
 
 ## Reading rule for future agents
 
