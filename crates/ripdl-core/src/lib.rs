@@ -13,6 +13,7 @@ pub mod error;
 pub mod extplug;
 pub mod hunt;
 pub mod lan;
+pub mod links;
 pub mod names;
 pub mod queue;
 pub mod refresh;

@@ -14,6 +14,18 @@ Status is evidence-based, not aspirational.
 Every row should name the owning module and the proof. A row without proof is
 not `shipped`.
 
+## Link domain (v2)
+
+| ID | Feature | Status | Evidence | Proof / gap |
+|---|---|---|---|---|
+| LNK-001 | One `LinkSet` with per-link meters, rates, and snapshots | shipped | `links.rs::LinkSet` | `link_rates_sum_to_task`, `cli_bond_matches_daemon` |
+| LNK-002 | Measured `dt` sampler, durable + uTP byte feeding | shipped | `links.rs::sample`, `ConnectionGuard` | `link_rate_measured_dt`, `utp_is_metered_or_excluded` |
+| LNK-003 | Departed-link pruning and bounded connection counters | shipped | `links.rs::set_links`, `connection_counters` | `departed_link_is_pruned`, `bind_meter_is_pruned` |
+| LNK-004 | Capacity-based weights with full-window quarantine recovery | shipped | `links.rs::sample`, `note_fail` | `weights_follow_capacity`, `quarantined_link_can_recover`, `stale_rate_does_not_weight` |
+| LNK-005 | Probe port, configurable targets, off when bonding disabled | shipped | `links.rs::Probe`, `probe_if_enabled` | `no_probes_when_bonding_off`, `probe_targets_are_configurable_or_fallback` |
+| LNK-006 | VPN/virtual adapter exclusion policy | shipped | `links.rs::is_eligible_link` | `vpn_adapters_are_excluded` |
+| LNK-007 | Wire the `LinkSet` into daemon/engine/torrent/CLI/GUI (close WP-03 issues) | missing | - | M3/M4; old Bond + BindMeter are still live |
+
 ## Traffic domain (v2)
 
 | ID | Feature | Status | Evidence | Proof / gap |

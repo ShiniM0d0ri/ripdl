@@ -18,27 +18,30 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 |---|---|
 | Branch | `next` (clean) |
 | Commit | see `git log -1 --oneline` (updated each PR) |
-| Product code | M1 Traffic domain landed (`traffic.rs`), not yet wired into daemon |
+| Product code | M1 traffic + M2 links domains landed, not yet wired into daemon |
 | Trackers | `ISSUES.csv` (73), `FEATURE-MATRIX.md`, `INVARIANTS.md` |
-| Next milestone | M2 - Link domain (`LinkSet`) |
+| Next milestone | M3 - daemon integration behind `traffic-v2` |
 
-M1 exit met: 12 traffic tests pass; global cap, bundle share, torrent/video
-coverage, live limits, cancellation, burst, retry rollback, resume guard, and
-stale run ids are proven at domain level. WP-01 issues remain open until M3/M4
-wire the controller into the daemon and frontends.
+M1 and M2 exits met: 12 traffic tests + 14 link tests pass. Global cap, bundle
+share, torrent/video coverage, live limits, cancellation, burst, retry
+rollback, resume guard, stale run ids; one `LinkSet` with measured `dt`,
+durable/per-connection capacity weights, pruning, bounded counters, explicit
+uTP metering, and no probes when disabled. WP-01/WP-03 issues remain open until
+M3/M4 wire the domains into the daemon and frontends.
 
-## Next action (M2)
+## Next action (M3)
 
-Work package **WP-03 Link & NIC truth** (grouping in `FEATURE-ROADMAP.md`).
-Implement the **Link domain** as a standalone module, not a bond patch:
+Wire the two domains into the daemon behind a `traffic-v2` feature flag:
 
-1. `LinkSet` - one link set, one meter, one rate estimator, one weight model.
-2. Measured `dt` from the sampler loop; durable-byte feeding from both engines.
-3. Prune departed links and per-connection counters; no probes when off.
-4. Contract tests from `INVARIANTS.md` (LN-001..014).
+1. `Daemon` owns one `TrafficController` and one `LinkSet`.
+2. HTTP tasks, bundle parts, torrents, and video acquire from the same global
+   budget; live limit changes call `set_global_rate` / `set_task_rate`.
+3. The `LinkSet` replaces `bond_links` / `torrent_rates` / `bind_rates` in
+   `Reply::Config` with one snapshot; probing runs only when bonding is on.
+4. Old rate/limit/bond paths stay the default until parity tests pass.
 
-Exit: per-link rates sum to the aggregate; no ghost links; CLI and daemon can
-share the same link snapshot.
+Exit: two HTTP tasks + bundle + torrent + video under one cap in the daemon;
+live change applies within one tick; one link snapshot in CLI/GUI/config.
 
 ## Decisions made
 
