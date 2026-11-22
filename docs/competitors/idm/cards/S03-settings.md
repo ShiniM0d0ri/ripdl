@@ -1,6 +1,8 @@
 # S03 - Settings / Options
 
-Status: `spec ready` (schema and codegen landed; UI to build). Read `SHARED.md`
+Status: `spike partial` (left tab shell + offline defaults; editable
+General/Connection/Torrents/Updates with Save via `SetConfig`; remaining tabs
+read-only). Read `SHARED.md`
 and `SETTINGS.csv` for the individual 50 options; this card is only the screen
 shell.
 

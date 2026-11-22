@@ -1,6 +1,7 @@
 # S13 - Empty, loading and error states
 
-Status: `spec ready`. Read `SHARED.md`, `S01-main.md`.
+Status: `spike partial` (empty state + offline settings fallback; loading and
+error states open). Read `SHARED.md`, `S01-main.md`.
 
 ## Goal
 

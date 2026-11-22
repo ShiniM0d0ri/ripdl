@@ -1,6 +1,7 @@
 # S07 - Task details and progress
 
-Status: `spec ready` (Tauri dialog exists). Read `SHARED.md`, `S01-main.md`.
+Status: `spike implemented` (Files/Peers/Trackers/Segments, file and part
+progress, open file/folder). Read `SHARED.md`, `S01-main.md`.
 
 ## Goal
 

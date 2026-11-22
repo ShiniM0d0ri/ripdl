@@ -7,20 +7,27 @@ Upgrade/registration/trial popups are **excluded** from this map.
 
 | Card | Screen | ripdl status | Depends on |
 |---|---|---|---|
-| S01 | Main window + task table | spike partial (IDM shell landed) | SHARED |
-| S02 | Add URL | spec ready, spike shell only | S01 |
-| S03 | Settings / Options | spike partial (IDM tab strip landed) | SHARED, S01, SETTINGS.csv |
-| S04 | Scheduler | spike partial (IDM dialog shell landed) | S02, S03 |
+| S01 | Main window + task table | spike implemented (shell/table/actions/status; sort/resize/multi-select open) | SHARED |
+| S02 | Add URL | spike implemented (form + advanced + Add RPC; duplicate review open) | S01 |
+| S03 | Settings / Options | spike partial (editable General/Connection/Torrents/Updates + Save; remaining tabs read-only) | SHARED, S01, SETTINGS.csv |
+| S04 | Scheduler | spike shell (queue list + schedule fields static) | S02, S03 |
 | S05 | Link grabber / bundles | spec ready, bundle engine exists | S02, S01 |
 | S06 | Queues | spec ready, single queue today | S01 |
-| S07 | Task details / progress | spec ready, Tauri dialog exists | S01 |
+| S07 | Task details / progress | spike implemented (tabs, part/file progress, open file/folder) | S01 |
 | S08 | Browser-integration welcome | spec ready in ONBOARDING.md | extension R1-R6 |
 | S09 | Tray + mini panel | spec ready, Tauri tray exists | S01 |
-| S10 | Categories + filters | spec ready, categories exist | S01 |
-| S11 | Context menus + selection | spec ready | S01 |
-| S12 | Speed display + graph | spec ready, daemon truth landed | S01 |
-| S13 | Empty / error states | spec ready | S01 |
+| S10 | Categories + filters | spike partial (categories + counts) | S01 |
+| S11 | Context menus + selection | spike partial (row selection + actions; context menu open) | S01 |
+| S12 | Speed display + graph | spike partial (status-strip rate; graph open) | S01 |
+| S13 | Empty / error states | spike partial (empty + offline defaults; loading/errors open) | S01 |
 | S14 | First-run onboarding | spec ready, 3-screen flow planned | S02, S03 |
+
+## UI review ledger
+
+`UI-REVIEW.csv` is the grouped, screenshot-backed review ledger. It contains
+implemented-feature rows (`F-*`) and findings (`R-*`) with severity, status
+(`fixed/verified`, `open`) and evidence. The spike screenshots live in
+`spike/native-ui/qa/shots/`.
 
 ## How to use
 

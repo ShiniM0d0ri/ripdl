@@ -1,6 +1,7 @@
 # S04 - Scheduler
 
-Status: `spec ready`. Read `SHARED.md`, `S02-add-url.md`, `S03-settings.md`.
+Status: `spike shell` (queue list + schedule fields static; daemon queue and
+scheduling API open). Read `SHARED.md`, `S02-add-url.md`, `S03-settings.md`.
 
 ## Goal
 

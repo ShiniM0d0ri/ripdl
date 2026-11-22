@@ -1,0 +1,36 @@
+id,group,type,severity,screen,element,finding,expected,status,evidence
+F-01,Shell,feature,,All,Menu bar,"Menus with dropdowns; Add URL, Pause all, Resume all, Open file, Open folder, Options and Scheduler are wired where the daemon supports them",Truthful menu with no silent stubs,present,main.png
+F-02,Shell,feature,,Main,Toolbar,Nine labeled actions; primary Add URL uses accent fill; selection-dependent actions disable without a selection,Primary action + disabled states + no dead controls,verified,main.png
+F-03,Shell,feature,,Main,Status strip,Running count + downloaded + rate + limit + link chips; debug daemon text removed,No internal protocol labels exposed,verified,main.png
+F-04,Sidebar,feature,,Main,Categories,All/Downloading/Completed/Torrents/Bundles/Video/Unfinished with live counts,Counts and selected state update from the snapshot,present,main.png
+F-05,Table,feature,,Main,Task table,File name/kind/size/progress/status/rate/last try/actions,Dense readable table; sorting + resizing still open,present,main.png
+F-06,Table,feature,,Main,Row actions,State-aware Pause/Resume/Open plus Delete; text labels,No ambiguous glyphs; accessible labels,verified,main.png
+F-07,Table,feature,,Main,Progress,Green fill for completed; blue/teal for active; percentage inside the bar,Completion is visible without reading status text,verified,main.png
+F-08,Add,feature,,Add URL,Form,Address/save folder/category/advanced; video/torrent/sequential/headers; Download calls Command::Add,Add works end to end at the RPC layer; duplicate-review UX open,partial,add.png
+F-09,Options,feature,,Options,Ten tabs + editable key settings,General/Connection/Torrents/Updates are editable and Save calls Command::SetConfig; File Types/Downloads/Bundles/Browser/Diagnostics stay read-only,Editable schema-backed controls; remaining tabs labeled as planned,partial,settings-connection.png
+F-10,Scheduler,feature,,Scheduler,Queue shell,default/fast/slow queues; Schedule and Files in the queue tabs; schedule fields,Static shell; daemon queue scheduling API open,partial,scheduler.png
+F-11,Details,feature,,Details,Tabs,Files/Peers/Trackers/Segments; bundle parts with progress bars; open file/folder,Details is usable and scrolls long lists,verified,details.png
+F-12,States,feature,,Empty,Empty state,No downloads message plus compact Add URL action,Actionable empty state,verified,empty.png
+F-13,States,feature,,Dense,200-row fixture,Striped table; 200 rows render and scroll,Fixture survives the 1 s poller,verified,dense200.png
+F-14,Accessibility,feature,,Main,Tooltips + labels,Every toolbar action has a visible label; row actions are text,No icon-only controls in the main path,verified,main.png
+R-01,Toolbar,finding,high,Main,Action hierarchy,All actions had equal weight; Refresh was dead; selection actions stayed enabled with nothing selected,Primary Add URL; remove dead actions; disable irrelevant actions,fixed/verified,main.png
+R-02,Table,finding,high,Main,Time left,Column was permanently '-' because no ETA is in the snapshot,Remove the column until the daemon supplies ETA,fixed/verified,main.png
+R-03,Table,finding,medium,Main,Progress,Completed rows had the same blue bar as active work,Fill completed bars green,fixed/verified,main.png
+R-04,Table,finding,medium,Main,Row actions,Glyph-only actions were ambiguous and bad for screen readers,State-aware text actions,fixed/verified,main.png
+R-05,Status,finding,medium,Main,Status strip,'connected (legacy daemon)' and 'n/a' leaked internals,Hide debug state; use an em dash for unavailable values,fixed/verified,main.png
+R-06,Empty,finding,medium,Empty,Empty state,No primary action was offered,Compact Add URL action,fixed/verified,empty.png
+R-07,Add,finding,medium,Add URL,Dialog,Dead vertical space and a weak primary action,Reduce dead space; accent Download,fixed/verified,add.png
+R-08,Options,finding,high,Options,Settings,Read-only values could not be changed or saved,Typed controls for key tabs + Save calls Command::SetConfig; save click not exercised,fixed,settings-connection.png
+R-09,Scheduler,finding,high,Scheduler,Queue actions,Start/Stop and schedule fields are static,Wire queue scheduling or mark spec-only,open,scheduler.png
+R-10,Table,finding,medium,Main,Columns,"No sorting, column resizing, or multi-select",Add column resize/sort and multi-select,open,main.png
+R-11,Menu,finding,high,All,Menu stubs,"Add torrent/bundle, View, Help and Send & Receive are stubs",Disable with an explicit label or wire them,open,main.png
+R-12,Details,finding,low,Details,Address/File,Raw paths and URL are truncated but not copyable,Add copy buttons and explicit reveal,open,details.png
+R-13,A11y,finding,medium,All,Theme/contrast,Stock egui dark palette; no product token layer or light theme,Apply a coherent light/dark token layer,open,main.png
+R-14,Sidebar,finding,low,Main,Send & Receive,Send & Receive is a stub button,Wire the LAN dialog or remove it,open,main.png
+R-15,Table,finding,medium,Main,Density,200 rows fine; no virtualization for huge queues,Measure 10k rows or virtualize,open,dense200.png
+R-16,Add,finding,medium,Add URL,Duplicates,No duplicate-review flow when the daemon reports Report/Merge,Use Reply::Duplicate/Report and offer replace/resume,open,add.png
+R-17,Main,finding,medium,Main,Selection,Selection/focus is not visually obvious in captured QA,Stronger selected row + keyboard focus ring,open,selected.png
+R-18,Global,finding,high,All,Missing screens,"Tray/mini panel, browser welcome, grabber, queue detail and speed graph are not implemented",See MAP-INDEX cards S05/S08/S09/S12,open,MAP-INDEX.md
+R-19,Scheduler,finding,low,Scheduler,Empty pane,'Files in the queue' has no table,Show queue contents or explain the empty queue,open,scheduler.png
+R-20,Add,finding,low,Add URL,Folder picker,Save folder is free text only,Add a native browse action,open,add.png
+R-21,Options,finding,medium,Options,Settings coverage,File Types/Downloads/Bundles/Browser/Diagnostics remain read-only,Wire the remaining schema fields or label them planned,open,settings.png

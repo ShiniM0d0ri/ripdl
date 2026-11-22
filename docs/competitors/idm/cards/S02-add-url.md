@@ -1,6 +1,7 @@
 # S02 - Add URL
 
-Status: `spec ready` (native spike has a shell only). Read `SHARED.md`, `S01-main.md`.
+Status: `spike implemented` (form + advanced + Add RPC; duplicate-review UX
+open). Read `SHARED.md`, `S01-main.md`.
 
 Screenshot: IDM add dialog is a separate window; ripdl spike: `research/idm-portable/../spike/native-ui/qa/shots/add.png`
 
