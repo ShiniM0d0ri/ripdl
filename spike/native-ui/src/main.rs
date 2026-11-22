@@ -12,6 +12,28 @@ use eframe::egui;
 use ripdl_core::rpc::{Command, Reply, Request, Response, TaskDetailsSnapshot};
 use ripdl_core::torrent::TorrentDetailsSnapshot;
 
+mod metrics {
+    pub const SPACE_1: f32 = 4.0;
+    pub const SPACE_2: f32 = 8.0;
+    pub const SPACE_3: f32 = 12.0;
+    pub const SPACE_4: f32 = 16.0;
+    pub const CONTROL_H: f32 = 32.0;
+    pub const ROW_H: f32 = 40.0;
+    pub const HEADER_H: f32 = 22.0;
+    pub const LABEL_W: f32 = 210.0;
+    pub const SIDEBAR_W: f32 = 200.0;
+    pub const TABLE_COLUMNS: [(&str, f32); 8] = [
+        ("File Name", 260.0),
+        ("Kind", 84.0),
+        ("Size", 64.0),
+        ("Progress", 88.0),
+        ("Status", 88.0),
+        ("Rate", 58.0),
+        ("Last Try", 76.0),
+        ("Actions", 118.0),
+    ];
+}
+
 #[derive(Clone, Default)]
 struct Snapshot {
     daemon: String,
@@ -105,6 +127,10 @@ fn accent() -> egui::Color32 {
     egui::Color32::from_rgb(15, 118, 110)
 }
 
+fn accent_soft() -> egui::Color32 {
+    egui::Color32::from_rgb(230, 244, 241)
+}
+
 fn ui_bg() -> egui::Color32 {
     egui::Color32::from_rgb(244, 246, 248)
 }
@@ -159,7 +185,6 @@ fn light_visuals() -> egui::Visuals {
     v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(17, 94, 89));
     v.widgets.open = v.widgets.active;
-    v.override_text_color = Some(text_primary());
     v
 }
 
@@ -256,6 +281,81 @@ fn fixed_cell(ui: &mut egui::Ui, width: f32, height: f32, add: impl FnOnce(&mut 
             add(ui);
         },
     );
+}
+
+fn nav_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    glyph: &str,
+    label: &str,
+    count: Option<usize>,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), metrics::CONTROL_H),
+        egui::Sense::click(),
+    );
+    let bg = if selected {
+        accent_soft()
+    } else if response.hovered() {
+        egui::Color32::from_rgb(248, 250, 252)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let fg = if selected {
+        egui::Color32::from_rgb(17, 94, 89)
+    } else {
+        text_secondary()
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::same(6), bg);
+    painter.text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        glyph,
+        egui::FontId::proportional(14.0),
+        if selected { accent() } else { text_muted() },
+    );
+    painter.text(
+        egui::pos2(rect.left() + 32.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.5),
+        fg,
+    );
+    if let Some(count) = count {
+        let chip = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 32.0, rect.center().y - 9.0),
+            egui::vec2(24.0, 18.0),
+        );
+        painter.rect_filled(
+            chip,
+            egui::CornerRadius::same(9),
+            if selected {
+                egui::Color32::from_rgb(207, 233, 228)
+            } else {
+                egui::Color32::from_rgb(241, 245, 249)
+            },
+        );
+        painter.text(
+            chip.center(),
+            egui::Align2::CENTER_CENTER,
+            count.to_string(),
+            egui::FontId::proportional(10.0),
+            if selected { fg } else { text_muted() },
+        );
+    }
+    response.clicked()
+}
+
+fn toolbar_sep(ui: &mut egui::Ui) {
+    ui.add_space(metrics::SPACE_1);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 22.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_rgb(201, 213, 223),
+    );
+    ui.add_space(metrics::SPACE_1);
 }
 
 fn host_of(url: &str) -> String {
@@ -507,6 +607,18 @@ impl SpikeApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.horizontal(|ui| {
+            let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(mark, egui::CornerRadius::same(5), accent());
+            ui.painter().text(
+                mark.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{e896}",
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+            ui.label(egui::RichText::new("ripdl").size(13.0).strong());
+            ui.add_space(metrics::SPACE_1);
             let _ = ui.menu_button("Tasks", |ui| {
                 if ui.button("Add URL").clicked() {
                     self.add_open = true;
@@ -611,7 +723,7 @@ impl SpikeApp {
             .iter()
             .any(|t| t.state == "completed" || t.state == "seeding");
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = metrics::SPACE_1;
             for (icon, label) in actions.iter() {
                 let enabled = match *label {
                     "Add URL" | "Options" | "Scheduler" => true,
@@ -621,12 +733,16 @@ impl SpikeApp {
                     _ => true,
                 };
                 let primary = *label == "Add URL";
-                let mut text = egui::RichText::new(format!("{icon}  {label}")).size(12.5);
-                if primary {
-                    text = text.color(egui::Color32::WHITE);
-                }
+                let color = if !enabled {
+                    egui::Color32::from_rgb(148, 163, 184)
+                } else if primary {
+                    egui::Color32::WHITE
+                } else {
+                    text_secondary()
+                };
+                let text = egui::RichText::new(*icon).size(16.0).color(color);
                 let mut button = egui::Button::new(text)
-                    .min_size(egui::vec2(0.0, 32.0))
+                    .min_size(egui::vec2(metrics::CONTROL_H, metrics::CONTROL_H))
                     .corner_radius(6.0);
                 if primary {
                     button = button.fill(accent()).frame(true);
@@ -634,8 +750,8 @@ impl SpikeApp {
                     button = button.frame(false);
                 }
                 let btn = ui.add_enabled(enabled, button).on_hover_text(*label);
-                if *label == "Add URL" || *label == "Stop All" {
-                    ui.separator();
+                if matches!(*label, "Add URL" | "Stop All" | "Delete Completed") {
+                    toolbar_sep(ui);
                 }
                 if !btn.clicked() {
                     continue;
@@ -732,8 +848,7 @@ impl SpikeApp {
                     _ => true,
                 })
                 .count();
-            let text = egui::RichText::new(format!("{glyph}   {label}   ·   {count}")).size(12.5);
-            if ui.selectable_label(self.category == id, text).clicked() {
+            if nav_row(ui, self.category == id, glyph, label, Some(count)) {
                 self.category = id.to_string();
             }
         }
@@ -747,8 +862,7 @@ impl SpikeApp {
                 .color(text_muted()),
         );
         ui.add_space(3.0);
-        let net = egui::RichText::new("\u{e71b}   Send & Receive").size(12.5);
-        if ui.selectable_label(false, net).clicked() {
+        if nav_row(ui, false, "\u{e71b}", "Send & Receive", None) {
             self.notice = "LAN drop box is available from the daemon".into();
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -808,7 +922,7 @@ impl SpikeApp {
                 );
             });
         });
-        ui.add_space(12.0);
+        ui.add_space(metrics::SPACE_3);
     }
 
     fn task_list(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
@@ -866,7 +980,7 @@ impl SpikeApp {
             .fill(egui::Color32::WHITE)
             .stroke(egui::Stroke::new(1.0, border()))
             .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(12, 2));
+            .inner_margin(egui::Margin::symmetric(metrics::SPACE_3 as i8, 2));
         table.show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.set_min_height(ui.available_height());
@@ -874,19 +988,10 @@ impl SpikeApp {
                 egui::Grid::new("tasks")
                     .num_columns(8)
                     .striped(true)
-                    .spacing([10.0, 8.0])
+                    .spacing([metrics::SPACE_2, metrics::SPACE_1])
                     .show(ui, |ui| {
-                        for (header, width) in [
-                            ("File Name", 260.0),
-                            ("Kind", 84.0),
-                            ("Size", 64.0),
-                            ("Progress", 88.0),
-                            ("Status", 88.0),
-                            ("Rate", 58.0),
-                            ("Last Try", 76.0),
-                            ("Actions", 118.0),
-                        ] {
-                            fixed_cell(ui, width, 18.0, |ui| {
+                        for (header, width) in metrics::TABLE_COLUMNS {
+                            fixed_cell(ui, width, metrics::HEADER_H, |ui| {
                                 ui.label(
                                     egui::RichText::new(header)
                                         .size(10.5)
@@ -899,10 +1004,10 @@ impl SpikeApp {
                         for t in rows {
                             let id = t.id.clone();
                             ui.allocate_ui_with_layout(
-                                egui::vec2(260.0, 38.0),
+                                egui::vec2(metrics::TABLE_COLUMNS[0].1, metrics::ROW_H),
                                 egui::Layout::top_down(egui::Align::LEFT),
                                 |ui| {
-                                    ui.set_width(260.0);
+                                    ui.set_width(metrics::TABLE_COLUMNS[0].1);
                                     let sel = ui.selectable_label(
                                         self.selected.as_deref() == Some(id.as_str()),
                                         egui::RichText::new(&t.name).size(12.5).strong(),
@@ -923,7 +1028,7 @@ impl SpikeApp {
                                     );
                                 },
                             );
-                            fixed_cell(ui, 84.0, 28.0, |ui| {
+                            fixed_cell(ui, metrics::TABLE_COLUMNS[1].1, metrics::ROW_H, |ui| {
                                 egui::Frame::default()
                                     .fill(kind_soft(&t.kind))
                                     .corner_radius(egui::CornerRadius::same(10))
@@ -940,7 +1045,7 @@ impl SpikeApp {
                                         );
                                     });
                             });
-                            fixed_cell(ui, 64.0, 28.0, |ui| {
+                            fixed_cell(ui, metrics::TABLE_COLUMNS[2].1, metrics::ROW_H, |ui| {
                                 ui.label(
                                     egui::RichText::new(
                                         t.total.map(humans).unwrap_or_else(|| "?".into()),
@@ -956,7 +1061,7 @@ impl SpikeApp {
                             } else {
                                 status_color("running")
                             };
-                            fixed_cell(ui, 88.0, 28.0, |ui| {
+                            fixed_cell(ui, metrics::TABLE_COLUMNS[3].1, metrics::ROW_H, |ui| {
                                 ui.add(
                                     egui::ProgressBar::new(task_ratio(t))
                                         .desired_width(64.0)
@@ -964,14 +1069,14 @@ impl SpikeApp {
                                         .show_percentage(),
                                 );
                             });
-                            fixed_cell(ui, 88.0, 28.0, |ui| {
+                            fixed_cell(ui, metrics::TABLE_COLUMNS[4].1, metrics::ROW_H, |ui| {
                                 ui.label(
                                     egui::RichText::new(format!("● {}", display_state(&t.state)))
                                         .size(11.5)
                                         .color(status_color(&t.state)),
                                 );
                             });
-                            fixed_cell(ui, 58.0, 28.0, |ui| {
+                            fixed_cell(ui, metrics::TABLE_COLUMNS[5].1, metrics::ROW_H, |ui| {
                                 ui.label(
                                     egui::RichText::new(
                                         t.speed_bps
@@ -982,7 +1087,7 @@ impl SpikeApp {
                                     .color(text_secondary()),
                                 );
                             });
-                            fixed_cell(ui, 76.0, 28.0, |ui| {
+                            fixed_cell(ui, metrics::TABLE_COLUMNS[6].1, metrics::ROW_H, |ui| {
                                 ui.label(
                                     egui::RichText::new(if t.last_try.is_empty() {
                                         "—".to_string()
@@ -993,7 +1098,7 @@ impl SpikeApp {
                                     .color(text_muted()),
                                 );
                             });
-                            fixed_cell(ui, 118.0, 28.0, |ui| {
+                            fixed_cell(ui, metrics::TABLE_COLUMNS[7].1, metrics::ROW_H, |ui| {
                                 let action = match t.state.as_str() {
                                     "running" | "queued" | "connecting" => "Pause",
                                     "paused" | "failed" | "stale" => "Resume",
@@ -1148,7 +1253,12 @@ impl SpikeApp {
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new("Download").fill(accent()))
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Download").color(egui::Color32::WHITE),
+                            )
+                            .fill(accent()),
+                        )
                         .clicked()
                     {
                         if url.trim().is_empty() {
@@ -1547,7 +1657,7 @@ impl SpikeApp {
 impl SpikeApp {
     fn control_label(ui: &mut egui::Ui, label: &str) {
         ui.add_sized(
-            egui::vec2(210.0, 18.0),
+            egui::vec2(metrics::LABEL_W, 18.0),
             egui::Label::new(egui::RichText::new(label).strong()),
         );
     }
@@ -2077,7 +2187,15 @@ impl SpikeApp {
                             });
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.add(egui::Button::new("Save").fill(accent())).clicked() {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Save").color(egui::Color32::WHITE),
+                                    )
+                                    .fill(accent()),
+                                )
+                                .clicked()
+                            {
                                 save = true;
                             }
                             if ui.button("Revert").clicked() {
@@ -2195,7 +2313,7 @@ impl eframe::App for SpikeApp {
             )
             .show(ui, |ui| self.status_bar(ui, &snap));
         egui::Panel::left("categories")
-            .default_size(198.0)
+            .default_size(metrics::SIDEBAR_W)
             .frame(
                 egui::Frame::default()
                     .fill(egui::Color32::WHITE)
@@ -2206,7 +2324,10 @@ impl eframe::App for SpikeApp {
             .frame(
                 egui::Frame::default()
                     .fill(ui_bg())
-                    .inner_margin(egui::Margin::symmetric(18, 14)),
+                    .inner_margin(egui::Margin::symmetric(
+                        metrics::SPACE_4 as i8,
+                        metrics::SPACE_3 as i8,
+                    )),
             )
             .show(ui, |ui| self.task_list(ui, &snap));
         let ctx = ui.ctx().clone();

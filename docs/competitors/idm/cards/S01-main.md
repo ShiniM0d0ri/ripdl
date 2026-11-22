@@ -1,8 +1,8 @@
 # S01 - Main window and task table
 
-Status: `spike implemented` (menu/toolbar/table/status/actions, light
-Segoe/Fluent design tokens and search; sorting, resizing and multi-select
-open). Read `SHARED.md` first.
+Status: `spike implemented` (menu/icon toolbar with hover labels/table/status/
+actions, light Segoe/Fluent design tokens and search; sorting, resizing and
+multi-select open). Read `SHARED.md` first.
 
 Screenshot: `research/idm-portable/shots/idm-main.png`
 
