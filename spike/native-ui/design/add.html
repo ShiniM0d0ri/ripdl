@@ -1,0 +1,25 @@
+<div class="board dialog-board" style="width:700px;height:430px">
+  <div class="dialog">
+    <div class="dialog-title">Add URL<button class="close"><svg class="ico"><use href="#i-x"/></svg></button></div>
+    <div class="dialog-body">
+      <div class="form">
+        <div class="field"><label>Address</label><div class="input placeholder">https://…<span class="hint">Ctrl+V</span></div></div>
+        <div class="field"><label>Save to</label><div class="field-row"><div class="input placeholder">C:\Users\DarkFlameMaster\Downloads</div><button class="btn subtle">Browse</button></div></div>
+        <div class="field"><label>Category</label><div class="select">All downloads<span class="chev" style="margin-left:auto">⌄</span></div></div>
+        <div class="adv">
+          <div class="adv-head"><svg class="ico" style="width:12px;height:12px;transform:rotate(90deg)"><use href="#i-chevron"/></svg>Advanced</div>
+          <div class="adv-body">
+            <div class="adv-row">
+              <span class="status"><span class="check on"><svg class="ico"><use href="#i-check"/></svg></span>Video / stream page</span>
+              <span class="status"><span class="check"></span>Torrent payload</span>
+              <span class="status"><span class="check"></span>Sequential download</span>
+            </div>
+            <div class="field" style="grid-template-columns:118px minmax(0,1fr)"><label>Extra headers</label><div class="input placeholder" style="height:46px;align-items:flex-start;padding-top:8px">Name: value, one per line</div></div>
+          </div>
+        </div>
+        <div style="color:var(--muted);font-size:10.5px">The daemon probes the address, then queues the task. Existing duplicates are shared.</div>
+      </div>
+    </div>
+    <div class="dialog-foot"><button class="btn subtle">Cancel</button><button class="btn primary">Download</button></div>
+  </div>
+</div>

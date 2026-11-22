@@ -7,7 +7,7 @@ F-05,Table,feature,,Main,Task table,File name/kind/size/progress/status/rate/las
 F-06,Table,feature,,Main,Row actions,State-aware Pause/Resume/Open plus Delete; text labels,No ambiguous glyphs; accessible labels,verified,main.png
 F-07,Table,feature,,Main,Progress,Green fill for completed; blue/teal for active; percentage inside the bar,Completion is visible without reading status text,verified,main.png
 F-08,Add,feature,,Add URL,Form,Address/save folder/category/advanced; video/torrent/sequential/headers; Download calls Command::Add,Add works end to end at the RPC layer; duplicate-review UX open,partial,add.png
-F-09,Options,feature,,Options,Ten tabs + editable key settings,General/Connection/Torrents/Updates are editable and Save calls Command::SetConfig; File Types/Downloads/Bundles/Browser/Diagnostics stay read-only,Editable schema-backed controls; remaining tabs labeled as planned,partial,settings-connection.png
+F-09,Options,feature,,Options,Tabs + editable settings,"All 20 daemon-backed settings are exposed, including LAN, yt-dlp path, bond exclusions and extension folder; Save calls Command::SetConfig; IDM-only options are tracked in UI-OPTIONS.csv",Daemon settings complete; planned options explicit,partial,settings-lan.png
 F-10,Scheduler,feature,,Scheduler,Queue shell,default/fast/slow queues; Schedule and Files in the queue tabs; schedule fields,Static shell; daemon queue scheduling API open,partial,scheduler.png
 F-11,Details,feature,,Details,Tabs,Files/Peers/Trackers/Segments; bundle parts with progress bars; open file/folder,Details is usable and scrolls long lists,verified,details.png
 F-12,States,feature,,Empty,Empty state,No downloads message plus compact Add URL action,Actionable empty state,verified,empty.png
@@ -20,17 +20,20 @@ R-04,Table,finding,medium,Main,Row actions,Glyph-only actions were ambiguous and
 R-05,Status,finding,medium,Main,Status strip,'connected (legacy daemon)' and 'n/a' leaked internals,Hide debug state; use an em dash for unavailable values,fixed/verified,main.png
 R-06,Empty,finding,medium,Empty,Empty state,No primary action was offered,Compact Add URL action,fixed/verified,empty.png
 R-07,Add,finding,medium,Add URL,Dialog,Dead vertical space and a weak primary action,Reduce dead space; accent Download,fixed/verified,add.png
-R-08,Options,finding,high,Options,Settings,Read-only values could not be changed or saved,Typed controls for key tabs + Save calls Command::SetConfig; save click not exercised,fixed,settings-connection.png
+R-08,Options,finding,high,Options,Settings,Read-only values could not be changed or saved,"All daemon-backed settings are now editable and Save calls Command::SetConfig; button click not exercised",fixed,settings-lan.png
 R-09,Scheduler,finding,high,Scheduler,Queue actions,Start/Stop and schedule fields are static,Wire queue scheduling or mark spec-only,open,scheduler.png
 R-10,Table,finding,medium,Main,Columns,"No sorting, column resizing, or multi-select",Add column resize/sort and multi-select,open,main.png
 R-11,Menu,finding,high,All,Menu stubs,"Add torrent/bundle, View, Help and Send & Receive are stubs",Disable with an explicit label or wire them,open,main.png
 R-12,Details,finding,low,Details,Address/File,Raw paths and URL are truncated but not copyable,Add copy buttons and explicit reveal,open,details.png
-R-13,A11y,finding,medium,All,Theme/contrast,Stock egui dark palette; no product token layer or light theme,Apply a coherent light/dark token layer,open,main.png
+R-13,A11y,finding,medium,All,Theme/contrast,"Stock egui dark palette; no product token layer or light theme","Segoe UI + Fluent icons + light design tokens applied",fixed/verified,main.png
 R-14,Sidebar,finding,low,Main,Send & Receive,Send & Receive is a stub button,Wire the LAN dialog or remove it,open,main.png
 R-15,Table,finding,medium,Main,Density,200 rows fine; no virtualization for huge queues,Measure 10k rows or virtualize,open,dense200.png
 R-16,Add,finding,medium,Add URL,Duplicates,No duplicate-review flow when the daemon reports Report/Merge,Use Reply::Duplicate/Report and offer replace/resume,open,add.png
-R-17,Main,finding,medium,Main,Selection,Selection/focus is not visually obvious in captured QA,Stronger selected row + keyboard focus ring,open,selected.png
+R-17,Main,finding,medium,Main,Selection,Selection/focus is not visually obvious in captured QA,Stronger selected row styling,verified,selected.png
 R-18,Global,finding,high,All,Missing screens,"Tray/mini panel, browser welcome, grabber, queue detail and speed graph are not implemented",See MAP-INDEX cards S05/S08/S09/S12,open,MAP-INDEX.md
 R-19,Scheduler,finding,low,Scheduler,Empty pane,'Files in the queue' has no table,Show queue contents or explain the empty queue,open,scheduler.png
 R-20,Add,finding,low,Add URL,Folder picker,Save folder is free text only,Add a native browse action,open,add.png
-R-21,Options,finding,medium,Options,Settings coverage,File Types/Downloads/Bundles/Browser/Diagnostics remain read-only,Wire the remaining schema fields or label them planned,open,settings.png
+R-21,Options,finding,medium,Options,Settings coverage,31 IDM-only or not-yet-backed options remain,Tracked per tab in UI-OPTIONS.csv with ui_status,partial,UI-OPTIONS.csv
+F-16,Main,feature,,Main,Search and filter,Search box filters rows by file name and source,Local filter only; no daemon query,present,main.png
+F-17,Shell,feature,,All,Light design tokens,Segoe UI + Segoe MDL2 icons + teal light palette,Matches the design reference,verified,main.png
+F-18,Design,feature,,All,UICanvas design source,UICanvas 1.3.0 local infinite canvas used to author and render the reference; no model or cloud,Design source committed under spike/native-ui/design,present,spike/native-ui/qa/design/main.png

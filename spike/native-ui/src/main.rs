@@ -60,10 +60,19 @@ fn humans(bytes: u64) -> String {
 
 fn kind_icon(kind: &str) -> &'static str {
     match kind {
-        "torrent" => "◈",
-        "video" => "▷",
-        "bundle" => "▤",
-        _ => "↓",
+        "torrent" => "\u{e71b}",
+        "video" => "\u{e768}",
+        "bundle" => "\u{e8b7}",
+        _ => "\u{e896}",
+    }
+}
+
+fn kind_soft(kind: &str) -> egui::Color32 {
+    match kind {
+        "torrent" => egui::Color32::from_rgb(230, 244, 241),
+        "video" => egui::Color32::from_rgb(243, 232, 255),
+        "bundle" => egui::Color32::from_rgb(255, 244, 229),
+        _ => egui::Color32::from_rgb(234, 241, 255),
     }
 }
 
@@ -93,26 +102,135 @@ fn display_state(state: &str) -> String {
 }
 
 fn accent() -> egui::Color32 {
-    egui::Color32::from_rgb(0, 128, 116)
+    egui::Color32::from_rgb(15, 118, 110)
+}
+
+fn ui_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(244, 246, 248)
+}
+
+fn border() -> egui::Color32 {
+    egui::Color32::from_rgb(219, 227, 234)
+}
+
+fn text_primary() -> egui::Color32 {
+    egui::Color32::from_rgb(15, 23, 42)
+}
+
+fn text_secondary() -> egui::Color32 {
+    egui::Color32::from_rgb(51, 65, 85)
+}
+
+fn text_muted() -> egui::Color32 {
+    egui::Color32::from_rgb(100, 116, 139)
+}
+
+fn light_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+    let surface = egui::Color32::WHITE;
+    let soft = egui::Color32::from_rgb(248, 250, 252);
+    let hover = egui::Color32::from_rgb(241, 245, 249);
+    let accent = accent();
+    let accent_soft = egui::Color32::from_rgb(230, 244, 241);
+    v.panel_fill = surface;
+    v.window_fill = surface;
+    v.faint_bg_color = soft;
+    v.extreme_bg_color = hover;
+    v.selection.bg_fill = accent_soft;
+    v.selection.stroke = egui::Stroke::new(1.0, accent);
+    v.hyperlink_color = accent;
+    v.window_corner_radius = egui::CornerRadius::same(8);
+    v.menu_corner_radius = egui::CornerRadius::same(6);
+    v.window_stroke = egui::Stroke::new(1.0, border());
+    v.widgets.noninteractive.bg_fill = surface;
+    v.widgets.noninteractive.weak_bg_fill = surface;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border());
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_primary());
+    v.widgets.inactive.bg_fill = soft;
+    v.widgets.inactive.weak_bg_fill = soft;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border());
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_secondary());
+    v.widgets.hovered.bg_fill = hover;
+    v.widgets.hovered.weak_bg_fill = hover;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(201, 213, 223));
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text_primary());
+    v.widgets.active.bg_fill = accent_soft;
+    v.widgets.active.weak_bg_fill = accent_soft;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(17, 94, 89));
+    v.widgets.open = v.widgets.active;
+    v.override_text_color = Some(text_primary());
+    v
+}
+
+fn configure_style(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+        fonts.font_data.insert(
+            "segoe".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "segoe".to_owned());
+    }
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segmdl2.ttf") {
+        fonts.font_data.insert(
+            "fluent_icons".to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("fluent_icons".to_owned());
+    }
+    ctx.set_fonts(fonts);
+
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::new(20.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::new(12.5, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+    );
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(9.0, 4.0);
+    style.spacing.interact_size = egui::vec2(24.0, 24.0);
+    style.visuals = light_visuals();
+    ctx.set_style_of(egui::Theme::Light, style);
+    ctx.set_theme(egui::ThemePreference::Light);
 }
 
 fn kind_color(kind: &str) -> egui::Color32 {
     match kind {
-        "torrent" => egui::Color32::from_rgb(45, 200, 170),
-        "video" => egui::Color32::from_rgb(90, 160, 240),
-        "bundle" => egui::Color32::from_rgb(180, 180, 180),
-        _ => egui::Color32::from_rgb(130, 170, 210),
+        "torrent" => egui::Color32::from_rgb(15, 118, 110),
+        "video" => egui::Color32::from_rgb(126, 34, 206),
+        "bundle" => egui::Color32::from_rgb(180, 83, 9),
+        _ => egui::Color32::from_rgb(37, 99, 235),
     }
 }
 
 fn status_color(state: &str) -> egui::Color32 {
     match state {
-        "completed" => egui::Color32::from_rgb(76, 200, 120),
-        "running" => egui::Color32::from_rgb(90, 170, 250),
-        "queued" | "connecting" => egui::Color32::from_rgb(165, 175, 180),
-        "paused" => egui::Color32::from_rgb(235, 190, 80),
-        "failed" | "stale" => egui::Color32::from_rgb(235, 100, 100),
-        _ => egui::Color32::from_rgb(190, 190, 190),
+        "completed" => egui::Color32::from_rgb(21, 128, 61),
+        "running" => egui::Color32::from_rgb(37, 99, 235),
+        "queued" | "connecting" => egui::Color32::from_rgb(100, 116, 139),
+        "paused" => egui::Color32::from_rgb(180, 83, 9),
+        "failed" | "stale" => egui::Color32::from_rgb(220, 38, 38),
+        _ => egui::Color32::from_rgb(100, 116, 139),
     }
 }
 
@@ -127,6 +245,17 @@ fn task_ratio(t: &TaskRow) -> f32 {
     } else {
         0.0
     }
+}
+
+fn fixed_cell(ui: &mut egui::Ui, width: f32, height: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_width(width);
+            add(ui);
+        },
+    );
 }
 
 fn host_of(url: &str) -> String {
@@ -280,6 +409,7 @@ fn spawn_poller(dense: bool) -> Arc<Mutex<Snapshot>> {
 struct SpikeApp {
     state: Arc<Mutex<Snapshot>>,
     category: String,
+    search: String,
     selected: Option<String>,
     details_id: Option<String>,
     details_tab: String,
@@ -297,6 +427,11 @@ struct SpikeApp {
     settings_tab: String,
     settings_edit: Option<ripdl_core::rpc::DaemonSettings>,
     settings_dir_text: String,
+    settings_ytdlp_text: String,
+    settings_extension_text: String,
+    settings_lan_dir_text: String,
+    settings_lan_code_text: String,
+    settings_bond_exclude_text: String,
     settings_dirty: bool,
     scheduler_open: bool,
     scheduler_tab: String,
@@ -304,7 +439,8 @@ struct SpikeApp {
 }
 
 impl SpikeApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_style(&cc.egui_ctx);
         let screen = std::env::var("RIPDL_QA_SCREEN").unwrap_or_default();
         let dense = screen == "dense" || std::env::var("RIPDL_QA_FIXTURE").as_deref() == Ok("200");
         let state = spawn_poller(dense);
@@ -326,6 +462,7 @@ impl SpikeApp {
             } else {
                 "all".into()
             },
+            search: String::new(),
             selected,
             details_id,
             details_tab: "Files".into(),
@@ -343,12 +480,18 @@ impl SpikeApp {
             settings_tab: match screen.as_str() {
                 "settings-connection" => "Connection",
                 "settings-torrents" => "Torrents",
+                "settings-lan" => "LAN",
                 "settings-updates" => "Updates",
                 _ => "General",
             }
             .into(),
             settings_edit: None,
             settings_dir_text: String::new(),
+            settings_ytdlp_text: String::new(),
+            settings_extension_text: String::new(),
+            settings_lan_dir_text: String::new(),
+            settings_lan_code_text: String::new(),
+            settings_bond_exclude_text: String::new(),
             settings_dirty: false,
             scheduler_open: screen == "scheduler",
             scheduler_tab: "Schedule".into(),
@@ -448,15 +591,15 @@ impl SpikeApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         let actions: [(&str, &str); 9] = [
-            ("+", "Add URL"),
-            ("▷", "Resume"),
-            ("■", "Stop"),
-            ("■", "Stop All"),
-            ("✕", "Delete"),
-            ("✓", "Delete Completed"),
-            ("⚙", "Options"),
-            ("◷", "Scheduler"),
-            ("◗", "Details"),
+            ("\u{e710}", "Add URL"),
+            ("\u{e768}", "Resume"),
+            ("\u{e71a}", "Stop"),
+            ("\u{e71a}", "Stop All"),
+            ("\u{e74d}", "Delete"),
+            ("\u{e73e}", "Delete Completed"),
+            ("\u{e713}", "Options"),
+            ("\u{e787}", "Scheduler"),
+            ("\u{e946}", "Details"),
         ];
         let has_selection = self.selected.is_some();
         let has_active = snap
@@ -477,14 +620,23 @@ impl SpikeApp {
                     "Delete Completed" => has_completed,
                     _ => true,
                 };
-                let mut button =
-                    egui::Button::new(egui::RichText::new(format!("{icon} {label}")).size(13.0))
-                        .min_size(egui::vec2(0.0, 30.0))
-                        .corner_radius(6.0);
-                if *label == "Add URL" {
-                    button = button.fill(accent());
+                let primary = *label == "Add URL";
+                let mut text = egui::RichText::new(format!("{icon}  {label}")).size(12.5);
+                if primary {
+                    text = text.color(egui::Color32::WHITE);
+                }
+                let mut button = egui::Button::new(text)
+                    .min_size(egui::vec2(0.0, 32.0))
+                    .corner_radius(6.0);
+                if primary {
+                    button = button.fill(accent()).frame(true);
+                } else {
+                    button = button.frame(false);
                 }
                 let btn = ui.add_enabled(enabled, button).on_hover_text(*label);
+                if *label == "Add URL" || *label == "Stop All" {
+                    ui.separator();
+                }
                 if !btn.clicked() {
                     continue;
                 }
@@ -548,15 +700,22 @@ impl SpikeApp {
 
     fn sidebar(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         let nav: [(&str, &str, &str); 7] = [
-            ("all", "All", "▣"),
-            ("downloading", "Downloading", "▼"),
-            ("completed", "Completed", "✓"),
-            ("torrent", "Torrents", "◈"),
-            ("bundle", "Bundles", "▤"),
-            ("video", "Video", "▶"),
-            ("unfinished", "Unfinished", "○"),
+            ("all", "All downloads", "\u{e896}"),
+            ("downloading", "Downloading", "\u{e768}"),
+            ("completed", "Completed", "\u{e73e}"),
+            ("torrent", "Torrents", "\u{e71b}"),
+            ("bundle", "Bundles", "\u{e8b7}"),
+            ("video", "Video", "\u{e768}"),
+            ("unfinished", "Unfinished", "\u{e823}"),
         ];
-        ui.add_space(4.0);
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("LIBRARY")
+                .size(10.0)
+                .strong()
+                .color(text_muted()),
+        );
+        ui.add_space(3.0);
         for (id, label, glyph) in nav {
             let count = snap
                 .tasks
@@ -573,21 +732,88 @@ impl SpikeApp {
                     _ => true,
                 })
                 .count();
-            if ui
-                .selectable_label(self.category == id, format!("{glyph}  {label}  ({count})"))
-                .clicked()
-            {
+            let text = egui::RichText::new(format!("{glyph}   {label}   ·   {count}")).size(12.5);
+            if ui.selectable_label(self.category == id, text).clicked() {
                 self.category = id.to_string();
             }
         }
         ui.add_space(10.0);
         ui.separator();
-        if ui.button("Send & Receive").clicked() {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("NETWORK")
+                .size(10.0)
+                .strong()
+                .color(text_muted()),
+        );
+        ui.add_space(3.0);
+        let net = egui::RichText::new("\u{e71b}   Send & Receive").size(12.5);
+        if ui.selectable_label(false, net).clicked() {
             self.notice = "LAN drop box is available from the daemon".into();
+        }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.label(
+                egui::RichText::new("●  Connected")
+                    .size(10.5)
+                    .color(text_muted()),
+            );
+            ui.add_space(4.0);
+        });
+    }
+
+    fn category_title(&self) -> &'static str {
+        match self.category.as_str() {
+            "downloading" => "Downloading",
+            "completed" => "Completed",
+            "torrent" => "Torrents",
+            "bundle" => "Bundles",
+            "video" => "Video",
+            "unfinished" => "Unfinished",
+            _ => "All downloads",
         }
     }
 
+    fn content_head(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("LIBRARY")
+                        .size(10.0)
+                        .strong()
+                        .color(text_muted()),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(self.category_title())
+                        .size(22.0)
+                        .strong()
+                        .color(text_primary()),
+                );
+                let total: u64 = snap.tasks.iter().map(|t| t.downloaded).sum();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} tasks · {} downloaded",
+                        snap.tasks.len(),
+                        humans(total)
+                    ))
+                    .size(11.0)
+                    .color(text_muted()),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("Search downloads")
+                        .desired_width(210.0),
+                );
+            });
+        });
+        ui.add_space(12.0);
+    }
+
     fn task_list(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        self.content_head(ui, snap);
+        let needle = self.search.trim().to_lowercase();
         let rows: Vec<&TaskRow> = snap
             .tasks
             .iter()
@@ -600,115 +826,208 @@ impl SpikeApp {
                 "unfinished" => t.state != "completed" && t.state != "seeding",
                 _ => true,
             })
+            .filter(|t| {
+                needle.is_empty()
+                    || t.name.to_lowercase().contains(&needle)
+                    || t.source.to_lowercase().contains(&needle)
+            })
             .collect();
         if rows.is_empty() {
-            ui.add_space(16.0);
-            ui.weak("No downloads yet.");
-            ui.weak("Drop a .torrent file here or press Add URL.");
-            ui.add_space(6.0);
+            ui.add_space(28.0);
+            ui.label(
+                egui::RichText::new("No downloads yet")
+                    .size(17.0)
+                    .strong()
+                    .color(text_primary()),
+            );
+            ui.label(
+                egui::RichText::new("Drop a .torrent file here or press Add URL.")
+                    .size(11.5)
+                    .color(text_muted()),
+            );
+            ui.add_space(8.0);
             if ui
-                .add(egui::Button::new("Add URL").fill(accent()))
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("+  Add URL").color(egui::Color32::WHITE),
+                    )
+                    .fill(accent())
+                    .min_size(egui::vec2(0.0, 32.0))
+                    .corner_radius(6.0),
+                )
                 .clicked()
             {
                 self.add_open = true;
             }
             return;
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("tasks")
-                .num_columns(8)
-                .striped(true)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    for header in [
-                        "File Name",
-                        "Kind",
-                        "Size",
-                        "Progress",
-                        "Status",
-                        "Rate",
-                        "Last Try",
-                        "Actions",
-                    ] {
-                        ui.strong(header);
-                    }
-                    ui.end_row();
-                    for t in rows {
-                        let id = t.id.clone();
-                        let sel = ui.selectable_label(
-                            self.selected.as_deref() == Some(id.as_str()),
-                            &t.name,
-                        );
-                        if sel.double_clicked() {
-                            self.details_id = Some(id.clone());
+
+        let table = egui::Frame::default()
+            .fill(egui::Color32::WHITE)
+            .stroke(egui::Stroke::new(1.0, border()))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 2));
+        table.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.set_min_height(ui.available_height());
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("tasks")
+                    .num_columns(8)
+                    .striped(true)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        for (header, width) in [
+                            ("File Name", 260.0),
+                            ("Kind", 84.0),
+                            ("Size", 64.0),
+                            ("Progress", 88.0),
+                            ("Status", 88.0),
+                            ("Rate", 58.0),
+                            ("Last Try", 76.0),
+                            ("Actions", 118.0),
+                        ] {
+                            fixed_cell(ui, width, 18.0, |ui| {
+                                ui.label(
+                                    egui::RichText::new(header)
+                                        .size(10.5)
+                                        .strong()
+                                        .color(text_muted()),
+                                );
+                            });
                         }
-                        if sel.clicked() {
-                            self.selected = Some(id.clone());
-                        }
-                        sel.on_hover_text(format!("source: {}", t.source));
-                        ui.colored_label(
-                            kind_color(&t.kind),
-                            format!("{} {}", kind_icon(&t.kind), display_kind(&t.kind)),
-                        );
-                        ui.label(t.total.map(humans).unwrap_or_else(|| "?".into()))
-                            .on_hover_text(format!("{} done", humans(t.downloaded)));
-                        let done = t.state == "completed" || t.state == "seeding";
-                        let fill = if done {
-                            status_color("completed")
-                        } else {
-                            status_color("running")
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(task_ratio(t))
-                                .desired_width(64.0)
-                                .fill(fill)
-                                .show_percentage(),
-                        );
-                        ui.colored_label(status_color(&t.state), display_state(&t.state));
-                        ui.label(
-                            t.speed_bps
-                                .map(|v| format!("{}/s", humans(v as u64)))
-                                .unwrap_or_else(|| "—".into()),
-                        );
-                        ui.label(if t.last_try.is_empty() {
-                            "—".to_string()
-                        } else {
-                            t.last_try.clone()
-                        });
-                        ui.horizontal(|ui| {
-                            let action = match t.state.as_str() {
-                                "running" | "queued" | "connecting" => "Pause",
-                                "paused" | "failed" | "stale" => "Resume",
-                                "completed" | "seeding" => "Open",
-                                _ => "Resume",
-                            };
-                            if ui.small_button(action).clicked() {
-                                match action {
-                                    "Pause" => {
-                                        self.rpc_action(Command::Pause { id: id.clone() });
-                                    }
-                                    "Resume" => {
-                                        self.rpc_action(Command::Resume { id: id.clone() });
-                                    }
-                                    "Open" => {
-                                        self.rpc_action(Command::Open {
-                                            id: id.clone(),
-                                            folder: t.kind == "bundle",
-                                        });
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if ui.small_button("Delete").clicked() {
-                                self.rpc_action(Command::Remove {
-                                    id: id.clone(),
-                                    delete_files: false,
-                                });
-                            }
-                        });
                         ui.end_row();
-                    }
-                });
+                        for t in rows {
+                            let id = t.id.clone();
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(260.0, 38.0),
+                                egui::Layout::top_down(egui::Align::LEFT),
+                                |ui| {
+                                    ui.set_width(260.0);
+                                    let sel = ui.selectable_label(
+                                        self.selected.as_deref() == Some(id.as_str()),
+                                        egui::RichText::new(&t.name).size(12.5).strong(),
+                                    );
+                                    if sel.double_clicked() {
+                                        self.details_id = Some(id.clone());
+                                    }
+                                    if sel.clicked() {
+                                        self.selected = Some(id.clone());
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&t.source)
+                                                .size(10.5)
+                                                .color(text_muted()),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            fixed_cell(ui, 84.0, 28.0, |ui| {
+                                egui::Frame::default()
+                                    .fill(kind_soft(&t.kind))
+                                    .corner_radius(egui::CornerRadius::same(10))
+                                    .inner_margin(egui::Margin::symmetric(6, 1))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} {}",
+                                                kind_icon(&t.kind),
+                                                display_kind(&t.kind)
+                                            ))
+                                            .size(10.5)
+                                            .color(kind_color(&t.kind)),
+                                        );
+                                    });
+                            });
+                            fixed_cell(ui, 64.0, 28.0, |ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        t.total.map(humans).unwrap_or_else(|| "?".into()),
+                                    )
+                                    .size(12.0)
+                                    .color(text_secondary()),
+                                )
+                                .on_hover_text(format!("{} done", humans(t.downloaded)));
+                            });
+                            let done = t.state == "completed" || t.state == "seeding";
+                            let fill = if done {
+                                status_color("completed")
+                            } else {
+                                status_color("running")
+                            };
+                            fixed_cell(ui, 88.0, 28.0, |ui| {
+                                ui.add(
+                                    egui::ProgressBar::new(task_ratio(t))
+                                        .desired_width(64.0)
+                                        .fill(fill)
+                                        .show_percentage(),
+                                );
+                            });
+                            fixed_cell(ui, 88.0, 28.0, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("● {}", display_state(&t.state)))
+                                        .size(11.5)
+                                        .color(status_color(&t.state)),
+                                );
+                            });
+                            fixed_cell(ui, 58.0, 28.0, |ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        t.speed_bps
+                                            .map(|v| format!("{}/s", humans(v as u64)))
+                                            .unwrap_or_else(|| "—".into()),
+                                    )
+                                    .size(11.5)
+                                    .color(text_secondary()),
+                                );
+                            });
+                            fixed_cell(ui, 76.0, 28.0, |ui| {
+                                ui.label(
+                                    egui::RichText::new(if t.last_try.is_empty() {
+                                        "—".to_string()
+                                    } else {
+                                        t.last_try.clone()
+                                    })
+                                    .size(10.8)
+                                    .color(text_muted()),
+                                );
+                            });
+                            fixed_cell(ui, 118.0, 28.0, |ui| {
+                                let action = match t.state.as_str() {
+                                    "running" | "queued" | "connecting" => "Pause",
+                                    "paused" | "failed" | "stale" => "Resume",
+                                    "completed" | "seeding" => "Open",
+                                    _ => "Resume",
+                                };
+                                if ui.small_button(action).clicked() {
+                                    match action {
+                                        "Pause" => {
+                                            self.rpc_action(Command::Pause { id: id.clone() });
+                                        }
+                                        "Resume" => {
+                                            self.rpc_action(Command::Resume { id: id.clone() });
+                                        }
+                                        "Open" => {
+                                            self.rpc_action(Command::Open {
+                                                id: id.clone(),
+                                                folder: t.kind == "bundle",
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if ui.small_button("Delete").clicked() {
+                                    self.rpc_action(Command::Remove {
+                                        id: id.clone(),
+                                        delete_files: false,
+                                    });
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
         });
     }
 
@@ -717,19 +1036,19 @@ impl SpikeApp {
         let total: u64 = snap.tasks.iter().map(|t| t.downloaded).sum();
         ui.horizontal_centered(|ui| {
             ui.label("●");
-            ui.strong(format!("{running} running"));
+            ui.strong(format!("{running} active"));
             ui.separator();
-            ui.label("rate");
+            ui.label("Rate");
             ui.strong(
                 snap.total_bps
                     .map(|v| format!("{}/s", humans(v as u64)))
                     .unwrap_or_else(|| "—".into()),
             );
             ui.separator();
-            ui.label("downloaded");
+            ui.label("Downloaded");
             ui.strong(humans(total));
             ui.separator();
-            ui.label("limit");
+            ui.label("Limit");
             ui.strong(
                 snap.global_limit
                     .map(|v| format!("{}/s", humans(v)))
@@ -1236,8 +1555,12 @@ impl SpikeApp {
     fn dir_row(ui: &mut egui::Ui, label: &str, text: &mut String) -> bool {
         ui.horizontal(|ui| {
             Self::control_label(ui, label);
-            ui.add(egui::TextEdit::singleline(text).desired_width(320.0))
-                .changed()
+            ui.add(
+                egui::TextEdit::singleline(text)
+                    .hint_text("Default")
+                    .desired_width(320.0),
+            )
+            .changed()
         })
         .inner
     }
@@ -1376,6 +1699,51 @@ impl SpikeApp {
         changed
     }
 
+    fn group_label(ui: &mut egui::Ui, text: &str) {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(text)
+                .size(9.5)
+                .strong()
+                .color(text_muted()),
+        );
+    }
+
+    fn text_row(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) -> bool {
+        ui.horizontal(|ui| {
+            Self::control_label(ui, label);
+            ui.add(
+                egui::TextEdit::singleline(text)
+                    .hint_text(hint)
+                    .desired_width(310.0),
+            )
+            .changed()
+        })
+        .inner
+    }
+
+    fn u16_row(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: &mut Option<u16>,
+        default: u16,
+        min: u16,
+        max: u16,
+    ) -> bool {
+        let mut v = value.unwrap_or(default) as u32;
+        let changed = ui
+            .horizontal(|ui| {
+                Self::control_label(ui, label);
+                ui.add(egui::DragValue::new(&mut v).range(min as u32..=max as u32))
+                    .changed()
+            })
+            .inner;
+        if changed {
+            *value = Some(v as u16);
+        }
+        changed
+    }
+
     #[allow(clippy::too_many_lines)]
     fn show_settings_editable(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
@@ -1390,12 +1758,34 @@ impl SpikeApp {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
+            self.settings_ytdlp_text = init.ytdlp_path.clone().unwrap_or_default();
+            self.settings_extension_text = init
+                .extension_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            self.settings_lan_dir_text = init
+                .lan_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            self.settings_lan_code_text = init.lan_code.clone().unwrap_or_default();
+            self.settings_bond_exclude_text = init
+                .bond_exclude
+                .clone()
+                .map(|v| v.join(", "))
+                .unwrap_or_default();
             self.settings_edit = Some(init);
             self.settings_dirty = false;
         }
 
         let mut edit = self.settings_edit.clone().unwrap();
         let mut dir_text = std::mem::take(&mut self.settings_dir_text);
+        let mut ytdlp_text = std::mem::take(&mut self.settings_ytdlp_text);
+        let mut extension_text = std::mem::take(&mut self.settings_extension_text);
+        let mut lan_dir_text = std::mem::take(&mut self.settings_lan_dir_text);
+        let mut lan_code_text = std::mem::take(&mut self.settings_lan_code_text);
+        let mut bond_exclude_text = std::mem::take(&mut self.settings_bond_exclude_text);
         let mut dirty = self.settings_dirty;
         let mut save = false;
         let mut revert = false;
@@ -1410,6 +1800,7 @@ impl SpikeApp {
             "Torrents",
             "Bundles",
             "Browser",
+            "LAN",
             "Updates",
             "Diagnostics",
         ];
@@ -1464,6 +1855,14 @@ impl SpikeApp {
                                     ) {
                                         dirty = true;
                                     }
+                                    if Self::text_row(
+                                        ui,
+                                        "yt-dlp path",
+                                        &mut ytdlp_text,
+                                        "yt-dlp or an absolute path",
+                                    ) {
+                                        dirty = true;
+                                    }
                                 }
                                 "File Types" => {
                                     Self::setting_row(
@@ -1475,6 +1874,7 @@ impl SpikeApp {
                                     Self::setting_row(ui, "Address exceptions", "none".into());
                                 }
                                 "Connection" => {
+                                    Self::group_label(ui, "ENGINE");
                                     if Self::usize_row(
                                         ui,
                                         "Downloads at once",
@@ -1505,6 +1905,7 @@ impl SpikeApp {
                                     ) {
                                         dirty = true;
                                     }
+                                    Self::group_label(ui, "BANDWIDTH");
                                     if Self::speed_row(
                                         ui,
                                         "Total speed limit",
@@ -1512,11 +1913,20 @@ impl SpikeApp {
                                     ) {
                                         dirty = true;
                                     }
+                                    Self::group_label(ui, "INTERFACES");
                                     if Self::bool_row(
                                         ui,
                                         "Bond interfaces",
                                         &mut edit.bond_interfaces,
                                         false,
+                                    ) {
+                                        dirty = true;
+                                    }
+                                    if Self::text_row(
+                                        ui,
+                                        "Exclude uplinks",
+                                        &mut bond_exclude_text,
+                                        "comma-separated adapter names",
                                     ) {
                                         dirty = true;
                                     }
@@ -1548,6 +1958,7 @@ impl SpikeApp {
                                     }
                                 }
                                 "Torrents" => {
+                                    Self::group_label(ui, "SEEDING");
                                     if Self::bool_row(
                                         ui,
                                         "Seed finished torrents",
@@ -1588,11 +1999,55 @@ impl SpikeApp {
                                     );
                                 }
                                 "Browser" => {
+                                    if Self::dir_row(ui, "Extension folder", &mut extension_text) {
+                                        dirty = true;
+                                    }
                                     Self::setting_row(ui, "Extension", "connected".into());
                                     Self::setting_row(ui, "Capture", "user-confirmable".into());
                                     Self::setting_row(ui, "Referer rules", "offer-first".into());
                                 }
+                                "LAN" => {
+                                    Self::group_label(ui, "DROP BOX");
+                                    if Self::bool_row(
+                                        ui,
+                                        "Accept files from devices",
+                                        &mut edit.lan_enabled,
+                                        false,
+                                    ) {
+                                        dirty = true;
+                                    }
+                                    if Self::u16_row(ui, "Port", &mut edit.lan_port, 8463, 1, 65535)
+                                    {
+                                        dirty = true;
+                                    }
+                                    if Self::dir_row(ui, "Inbox folder", &mut lan_dir_text) {
+                                        dirty = true;
+                                    }
+                                    Self::group_label(ui, "SECURITY");
+                                    if Self::bool_row(
+                                        ui,
+                                        "No pairing code",
+                                        &mut edit.lan_open,
+                                        false,
+                                    ) {
+                                        dirty = true;
+                                    }
+                                    if Self::text_row(
+                                        ui,
+                                        "Pairing code",
+                                        &mut lan_code_text,
+                                        "generated when enabled",
+                                    ) {
+                                        dirty = true;
+                                    }
+                                    Self::setting_row(
+                                        ui,
+                                        "Note",
+                                        "Changing the code disconnects paired devices".into(),
+                                    );
+                                }
                                 "Updates" => {
+                                    Self::group_label(ui, "RELEASE CHANNEL");
                                     if Self::bool_row(
                                         ui,
                                         "Check at startup",
@@ -1640,6 +2095,11 @@ impl SpikeApp {
             self.settings_edit = None;
             self.settings_dirty = false;
             self.settings_dir_text.clear();
+            self.settings_ytdlp_text.clear();
+            self.settings_extension_text.clear();
+            self.settings_lan_dir_text.clear();
+            self.settings_lan_code_text.clear();
+            self.settings_bond_exclude_text.clear();
             self.notice = "Settings reverted".into();
             self.settings_open = open;
             return;
@@ -1650,7 +2110,44 @@ impl SpikeApp {
         } else {
             Some(PathBuf::from(dir_text.trim()))
         };
+        edit.ytdlp_path = if ytdlp_text.trim().is_empty() {
+            None
+        } else {
+            Some(ytdlp_text.trim().to_string())
+        };
+        edit.extension_dir = if extension_text.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(extension_text.trim()))
+        };
+        edit.lan_dir = if lan_dir_text.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(lan_dir_text.trim()))
+        };
+        edit.lan_code = if lan_code_text.trim().is_empty() {
+            None
+        } else {
+            Some(lan_code_text.trim().to_string())
+        };
+        edit.bond_exclude = if bond_exclude_text.trim().is_empty() {
+            None
+        } else {
+            Some(
+                bond_exclude_text
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
+        };
         self.settings_dir_text = dir_text;
+        self.settings_ytdlp_text = ytdlp_text;
+        self.settings_extension_text = extension_text;
+        self.settings_lan_dir_text = lan_dir_text;
+        self.settings_lan_code_text = lan_code_text;
+        self.settings_bond_exclude_text = bond_exclude_text;
         self.settings_edit = Some(edit.clone());
         self.settings_dirty = dirty;
         if save {
@@ -1675,17 +2172,43 @@ impl SpikeApp {
 
 impl eframe::App for SpikeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if let Some(font) = ui.style_mut().text_styles.get_mut(&egui::TextStyle::Body) {
-            font.size = 14.0;
-        }
         let snap = { self.state.lock().unwrap().clone() };
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &snap));
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &snap));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, &snap));
+        egui::Panel::top("menu")
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(10, 3)),
+            )
+            .show(ui, |ui| self.menu_bar(ui, &snap));
+        egui::Panel::top("toolbar")
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(10, 5)),
+            )
+            .show(ui, |ui| self.toolbar(ui, &snap));
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
+            )
+            .show(ui, |ui| self.status_bar(ui, &snap));
         egui::Panel::left("categories")
-            .default_size(160.0)
+            .default_size(198.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(8, 4)),
+            )
             .show(ui, |ui| self.sidebar(ui, &snap));
-        egui::CentralPanel::default().show(ui, |ui| self.task_list(ui, &snap));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(ui_bg())
+                    .inner_margin(egui::Margin::symmetric(18, 14)),
+            )
+            .show(ui, |ui| self.task_list(ui, &snap));
         let ctx = ui.ctx().clone();
         self.show_add(&ctx);
         self.show_settings_editable(&ctx);
