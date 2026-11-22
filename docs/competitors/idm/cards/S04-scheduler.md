@@ -1,7 +1,8 @@
 # S04 - Scheduler
 
-Status: `spike shell` (queue list + schedule fields static; daemon queue and
-scheduling API open). Read `SHARED.md`, `S02-add-url.md`, `S03-settings.md`.
+Status: `spec only` (static shell removed from the live UI; daemon queue and
+scheduling API still open). Read `SHARED.md`, `S02-add-url.md`,
+`S03-settings.md`.
 
 ## Goal
 

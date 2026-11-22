@@ -517,7 +517,6 @@ struct SpikeApp {
     advanced_open: bool,
     url: String,
     dest: String,
-    category_text: String,
     headers_text: String,
     video: bool,
     torrent: bool,
@@ -533,9 +532,6 @@ struct SpikeApp {
     settings_lan_code_text: String,
     settings_bond_exclude_text: String,
     settings_dirty: bool,
-    scheduler_open: bool,
-    scheduler_tab: String,
-    selected_queue: String,
 }
 
 impl SpikeApp {
@@ -570,7 +566,6 @@ impl SpikeApp {
             advanced_open: screen == "add-advanced",
             url: String::new(),
             dest: String::new(),
-            category_text: String::new(),
             headers_text: String::new(),
             video: false,
             torrent: false,
@@ -580,6 +575,7 @@ impl SpikeApp {
             settings_tab: match screen.as_str() {
                 "settings-connection" => "Connection",
                 "settings-torrents" => "Torrents",
+                "settings-browser" => "Browser",
                 "settings-lan" => "LAN",
                 "settings-updates" => "Updates",
                 _ => "General",
@@ -593,9 +589,6 @@ impl SpikeApp {
             settings_lan_code_text: String::new(),
             settings_bond_exclude_text: String::new(),
             settings_dirty: false,
-            scheduler_open: screen == "scheduler",
-            scheduler_tab: "Schedule".into(),
-            selected_queue: "default".into(),
         }
     }
 
@@ -624,10 +617,8 @@ impl SpikeApp {
                     self.add_open = true;
                 }
                 if ui.button("Add torrent").clicked() {
-                    self.notice = "Add torrent is not wired in the spike yet".into();
-                }
-                if ui.button("Add bundle").clicked() {
-                    self.notice = "Add bundle is not wired in the spike yet".into();
+                    self.torrent = true;
+                    self.add_open = true;
                 }
                 ui.separator();
                 if ui.button("Pause all").clicked() {
@@ -669,40 +660,32 @@ impl SpikeApp {
                     let _ = ui.button("Open file");
                     let _ = ui.button("Open folder");
                 }
-                let _ = ui.button("Remove");
-            });
-            let _ = ui.menu_button("Downloads", |ui| {
-                if ui.button("Start queue").clicked() {
-                    self.notice = "Queue start is not wired in the spike yet".into();
+                if let Some(id) = self.selected.clone() {
+                    if ui.button("Remove").clicked() {
+                        self.rpc_action(Command::Remove {
+                            id,
+                            delete_files: false,
+                        });
+                    }
+                } else {
+                    let _ = ui.add_enabled(false, egui::Button::new("Remove"));
                 }
-                if ui.button("Stop queue").clicked() {
-                    self.notice = "Queue stop is not wired in the spike yet".into();
-                }
-                if ui.button("Scheduler").clicked() {
-                    self.scheduler_open = true;
-                }
-            });
-            let _ = ui.menu_button("View", |ui| {
-                let _ = ui.button("Columns");
-                let _ = ui.button("Theme");
             });
             let _ = ui.menu_button("Tools", |ui| {
                 if ui.button("Options").clicked() {
                     self.settings_open = true;
+                    self.settings_tab = "General".into();
                 }
-                if ui.button("Send & Receive").clicked() {
-                    self.notice = "LAN drop box is available from the daemon".into();
+                if ui.button("LAN settings").clicked() {
+                    self.settings_open = true;
+                    self.settings_tab = "LAN".into();
                 }
-            });
-            let _ = ui.menu_button("Help", |ui| {
-                let _ = ui.button("About ripdl");
-                let _ = ui.button("Run setup again");
             });
         });
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
-        let actions: [(&str, &str); 9] = [
+        let actions: [(&str, &str); 8] = [
             ("\u{e710}", "Add URL"),
             ("\u{e768}", "Resume"),
             ("\u{e71a}", "Stop"),
@@ -710,7 +693,6 @@ impl SpikeApp {
             ("\u{e74d}", "Delete"),
             ("\u{e73e}", "Delete Completed"),
             ("\u{e713}", "Options"),
-            ("\u{e787}", "Scheduler"),
             ("\u{e946}", "Details"),
         ];
         let has_selection = self.selected.is_some();
@@ -726,7 +708,7 @@ impl SpikeApp {
             ui.spacing_mut().item_spacing.x = metrics::SPACE_1;
             for (icon, label) in actions.iter() {
                 let enabled = match *label {
-                    "Add URL" | "Options" | "Scheduler" => true,
+                    "Add URL" | "Options" => true,
                     "Resume" | "Stop" | "Delete" | "Details" => has_selection,
                     "Stop All" => has_active,
                     "Delete Completed" => has_completed,
@@ -801,8 +783,10 @@ impl SpikeApp {
                             });
                         }
                     }
-                    "Options" => self.settings_open = true,
-                    "Scheduler" => self.scheduler_open = true,
+                    "Options" => {
+                        self.settings_open = true;
+                        self.settings_tab = "General".into();
+                    }
                     "Details" => {
                         if let Some(id) = self.selected.clone() {
                             self.details_id = Some(id);
@@ -862,14 +846,20 @@ impl SpikeApp {
                 .color(text_muted()),
         );
         ui.add_space(3.0);
-        if nav_row(ui, false, "\u{e71b}", "Send & Receive", None) {
-            self.notice = "LAN drop box is available from the daemon".into();
+        if nav_row(ui, false, "\u{e71b}", "LAN settings", None) {
+            self.settings_tab = "LAN".into();
+            self.settings_open = true;
         }
+        let (dot_color, daemon_label) = if snap.daemon.starts_with("connected") {
+            (status_color("completed"), "Connected")
+        } else {
+            (status_color("failed"), "Daemon offline")
+        };
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.label(
-                egui::RichText::new("●  Connected")
+                egui::RichText::new(format!("●  {daemon_label}"))
                     .size(10.5)
-                    .color(text_muted()),
+                    .color(dot_color),
             );
             ui.add_space(4.0);
         });
@@ -1184,7 +1174,6 @@ impl SpikeApp {
         let mut cancel = false;
         let url = &mut self.url;
         let dest = &mut self.dest;
-        let cat = &mut self.category_text;
         let headers = &mut self.headers_text;
         let video = &mut self.video;
         let torrent = &mut self.torrent;
@@ -1210,15 +1199,6 @@ impl SpikeApp {
                         egui::TextEdit::singleline(dest)
                             .hint_text("Default download folder")
                             .desired_width(430.0),
-                    );
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.strong("Category");
-                    let _ = ui.add(
-                        egui::TextEdit::singleline(cat)
-                            .hint_text("All")
-                            .desired_width(180.0),
                     );
                 });
                 ui.separator();
@@ -1324,70 +1304,6 @@ impl SpikeApp {
             );
             ui.label(value);
         });
-    }
-
-    fn show_scheduler(&mut self, ctx: &egui::Context) {
-        if !self.scheduler_open {
-            return;
-        }
-        let mut open = true;
-        let tab = &mut self.scheduler_tab;
-        let queue = &mut self.selected_queue;
-        let mut one_time = true;
-        egui::Window::new("Scheduler")
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .collapsible(false)
-            .default_size(egui::vec2(760.0, 460.0))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.heading("Queues");
-                        for q in ["default", "fast", "slow"] {
-                            if ui.selectable_label(*queue == q, q).clicked() {
-                                *queue = q.to_string();
-                            }
-                        }
-                    });
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(*tab == "Schedule", "Schedule")
-                                .clicked()
-                            {
-                                *tab = "Schedule".into();
-                            }
-                            if ui
-                                .selectable_label(
-                                    *tab == "Files in the queue",
-                                    "Files in the queue",
-                                )
-                                .clicked()
-                            {
-                                *tab = "Files in the queue".into();
-                            }
-                        });
-                        ui.separator();
-                        if tab == "Schedule" {
-                            ui.horizontal(|ui| {
-                                let _ = ui.button("Start Now");
-                                let _ = ui.button("Stop");
-                            });
-                            ui.label(format!("Queue: {queue}"));
-                            ui.checkbox(&mut one_time, "One-time downloading");
-                            Self::setting_row(ui, "Start download at:", "-".into());
-                            Self::setting_row(ui, "Stop download at:", "-".into());
-                            Self::setting_row(ui, "Retries per file:", "engine default".into());
-                            Self::setting_row(ui, "Files at once:", "daemon setting".into());
-                            Self::setting_row(ui, "On finish:", "hooks later".into());
-                        } else {
-                            ui.label("Files in this queue appear here.");
-                        }
-                    });
-                });
-            });
-        self.scheduler_open = open;
     }
 }
 
@@ -1638,6 +1554,11 @@ impl SpikeApp {
                     });
                 ui.add_space(8.0);
                 let id = data.id().to_string();
+                if let Some(a) = data.address() {
+                    if ui.button("Copy address").clicked() {
+                        ui.ctx().copy_text(a);
+                    }
+                }
                 if ui.button("Open file").clicked() {
                     self.rpc_action(Command::Open {
                         id: id.clone(),
@@ -1899,20 +1820,15 @@ impl SpikeApp {
         let mut dirty = self.settings_dirty;
         let mut save = false;
         let mut revert = false;
-        let mut notice = self.notice.clone();
+        let notice = self.notice.clone();
         let tab = &mut self.settings_tab;
         let tabs = [
             "General",
-            "File Types",
             "Connection",
-            "Save To",
-            "Downloads",
             "Torrents",
-            "Bundles",
             "Browser",
             "LAN",
             "Updates",
-            "Diagnostics",
         ];
         let mut open = true;
         egui::Window::new("Options")
@@ -1974,15 +1890,6 @@ impl SpikeApp {
                                         dirty = true;
                                     }
                                 }
-                                "File Types" => {
-                                    Self::setting_row(
-                                        ui,
-                                        "Capture types",
-                                        "documents, archives, media, video".into(),
-                                    );
-                                    Self::setting_row(ui, "Site exclusions", "none".into());
-                                    Self::setting_row(ui, "Address exceptions", "none".into());
-                                }
                                 "Connection" => {
                                     Self::group_label(ui, "ENGINE");
                                     if Self::usize_row(
@@ -2041,32 +1948,6 @@ impl SpikeApp {
                                         dirty = true;
                                     }
                                 }
-                                "Save To" => {
-                                    if Self::dir_row(ui, "Default folder", &mut dir_text) {
-                                        dirty = true;
-                                    }
-                                    Self::setting_row(
-                                        ui,
-                                        "Temp directory",
-                                        "alongside download".into(),
-                                    );
-                                    Self::setting_row(
-                                        ui,
-                                        "Remember last path",
-                                        "per category".into(),
-                                    );
-                                }
-                                "Downloads" => {
-                                    for (k, v) in [
-                                        ("Progress dialog", "inline"),
-                                        ("Complete dialog", "toast + row"),
-                                        ("Silent mode", "no modals"),
-                                        ("Start immediately", "explicit Add"),
-                                        ("Resume mtime check", "daemon policy"),
-                                    ] {
-                                        Self::setting_row(ui, k, v.into());
-                                    }
-                                }
                                 "Torrents" => {
                                     Self::group_label(ui, "SEEDING");
                                     if Self::bool_row(
@@ -2098,23 +1979,18 @@ impl SpikeApp {
                                     ) {
                                         dirty = true;
                                     }
-                                    Self::setting_row(ui, "Per-task cap", "set when adding".into());
-                                }
-                                "Bundles" => {
-                                    Self::setting_row(ui, "Auto-extract", "not implemented".into());
-                                    Self::setting_row(
-                                        ui,
-                                        "Part-set policy",
-                                        "wait for complete set".into(),
-                                    );
                                 }
                                 "Browser" => {
                                     if Self::dir_row(ui, "Extension folder", &mut extension_text) {
                                         dirty = true;
                                     }
-                                    Self::setting_row(ui, "Extension", "connected".into());
-                                    Self::setting_row(ui, "Capture", "user-confirmable".into());
-                                    Self::setting_row(ui, "Referer rules", "offer-first".into());
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Capture policy is owned by the browser extension.",
+                                        )
+                                        .size(10.5)
+                                        .color(text_muted()),
+                                    );
                                 }
                                 "LAN" => {
                                     Self::group_label(ui, "DROP BOX");
@@ -2173,14 +2049,6 @@ impl SpikeApp {
                                         false,
                                     ) {
                                         dirty = true;
-                                    }
-                                    Self::setting_row(ui, "Verification", "SHA256SUMS".into());
-                                }
-                                "Diagnostics" => {
-                                    Self::setting_row(ui, "Log level", "info".into());
-                                    Self::setting_row(ui, "Telemetry", "off (fixed)".into());
-                                    if ui.button("Copy diagnostics").clicked() {
-                                        notice = "Diagnostics export is not wired yet".into();
                                     }
                                 }
                                 _ => {}
@@ -2333,7 +2201,6 @@ impl eframe::App for SpikeApp {
         let ctx = ui.ctx().clone();
         self.show_add(&ctx);
         self.show_settings_editable(&ctx);
-        self.show_scheduler(&ctx);
         self.show_details(&ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
     }

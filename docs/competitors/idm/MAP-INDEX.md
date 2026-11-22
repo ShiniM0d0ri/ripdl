@@ -9,8 +9,8 @@ Upgrade/registration/trial popups are **excluded** from this map.
 |---|---|---|---|
 | S01 | Main window + task table | spike implemented (light Segoe/Fluent shell, icon toolbar with hover labels, shared 4/8/12/16 scale, table, actions, status, search; sort/resize/multi-select open) | SHARED |
 | S02 | Add URL | spike implemented (form + advanced + Add RPC; folder picker and duplicate review open) | S01 |
-| S03 | Settings / Options | spike partial (all 20 daemon-backed settings exposed incl. LAN; IDM-only options tracked in UI-OPTIONS.csv) | SHARED, S01, SETTINGS.csv |
-| S04 | Scheduler | spike shell (queue list + schedule fields static) | S02, S03 |
+| S03 | Settings / Options | spike verified (six live tabs; all 20 daemon-backed settings; mock tabs removed; planned options in UI-OPTIONS.csv) | SHARED, S01, SETTINGS.csv |
+| S04 | Scheduler | spec only - fake shell removed until daemon queue scheduling exists | S02, S03 |
 | S05 | Link grabber / bundles | spec ready, bundle engine exists | S02, S01 |
 | S06 | Queues | spec ready, single queue today | S01 |
 | S07 | Task details / progress | spike implemented (tabs, part/file progress, open file/folder) | S01 |

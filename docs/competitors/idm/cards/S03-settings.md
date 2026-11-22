@@ -1,8 +1,9 @@
 # S03 - Settings / Options
 
-Status: `spike partial` (all 20 daemon-backed settings exposed, including
-General, Connection, Torrents, Browser, LAN, Updates and offline defaults; Save
-via `SetConfig`; IDM-only options tracked in `UI-OPTIONS.csv`). Read `SHARED.md`
+Status: `spike verified` (six live tabs - General, Connection, Torrents,
+Browser, LAN, Updates; all 20 daemon-backed settings exposed; mock tabs
+removed; Save via `SetConfig`; planned options tracked in `UI-OPTIONS.csv`).
+Read `SHARED.md`
 and `SETTINGS.csv` for the individual 50 options; this card is only the screen
 shell.
 
