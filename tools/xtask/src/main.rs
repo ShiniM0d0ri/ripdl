@@ -36,7 +36,7 @@ fn main() -> Result<()> {
             let current = std::fs::read_to_string(path).with_context(|| {
                 format!("reading {target} - run `cargo run -p xtask -- protocol`")
             })?;
-            if current != generated {
+            if current.replace("\r\n", "\n") != generated.replace("\r\n", "\n") {
                 bail!("{target} is stale - run `cargo run -p xtask -- protocol`");
             }
         } else {

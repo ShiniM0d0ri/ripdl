@@ -186,6 +186,9 @@ pub fn notify_named(name: &str) -> io::Result<()> {
 fn claim_path(path: &std::path::Path) -> io::Result<Option<Guard>> {
     use std::os::unix::net::{UnixListener, UnixStream};
 
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     match UnixListener::bind(path) {
         Ok(listener) => Ok(Some(Guard { listener })),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => match UnixStream::connect(path) {

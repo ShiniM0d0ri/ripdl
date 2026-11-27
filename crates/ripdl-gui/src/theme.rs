@@ -159,9 +159,9 @@ pub fn apply_visuals(ctx: &egui::Context, mode: ThemeMode) {
 pub fn configure_style(ctx: &egui::Context, mode: ThemeMode) {
     let mut fonts = egui::FontDefinitions::default();
     let semibold_family = egui::FontFamily::Name("semibold".into());
-    let mut proportional_front = Vec::new();
-    let mut mono_front = Vec::new();
-    let mut semibold_front = Vec::new();
+    let mut proportional_front: Vec<String> = Vec::new();
+    let mut mono_front: Vec<String> = Vec::new();
+    let mut semibold_front: Vec<String> = Vec::new();
 
     #[cfg(target_os = "windows")]
     {

@@ -4,6 +4,7 @@
 # here rather than flipping autocrlf. .ps1 stays untouched (ASCII-only files,
 # CRLF conventional for PowerShell 5.1).
 ext/**/*.js text eol=lf
+ext/**/*.ts text eol=lf
 ext/**/*.mjs text eol=lf
 ext/**/*.json text eol=lf
 ext/**/*.html text eol=lf
