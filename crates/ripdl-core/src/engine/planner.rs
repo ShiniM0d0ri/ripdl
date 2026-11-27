@@ -26,9 +26,6 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
 
     let mut last: Option<Error> = None;
     for attempt in 0..3u32 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(500 << (attempt - 1))).await;
-        }
         let resp = match client.head(parsed.clone()).send().await {
             Ok(r) if r.status().is_success() => Ok(r),
             // Some servers reject HEAD; ask for the first byte instead.
@@ -44,6 +41,9 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
             Ok(r) => r,
             Err(e) => {
                 last = Some(e.into());
+                if attempt + 1 < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 << attempt)).await;
+                }
                 continue;
             }
         };
@@ -58,6 +58,18 @@ pub async fn probe(client: &Client, url: &str) -> Result<PlanInfo> {
             };
             if !super::retry::retryable_status(status.as_u16()) {
                 return Err(err);
+            }
+            if attempt + 1 < 3 {
+                // Honor `Retry-After` (seconds) within a bounded probe budget
+                // so a 429 doesn't immediately burn the remaining attempts.
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(|s| std::time::Duration::from_secs(s.min(5)));
+                let fallback = std::time::Duration::from_millis(500 << attempt);
+                tokio::time::sleep(retry_after.unwrap_or(fallback)).await;
             }
             last = Some(err);
             continue;

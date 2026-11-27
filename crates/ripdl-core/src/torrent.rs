@@ -208,12 +208,32 @@ async fn resolve_payload(payload: &str) -> Result<(AddTorrent<'static>, PayloadI
             },
         ));
     }
+    const MAX_TORRENT_BYTES: usize = 32 * 1024 * 1024;
     let bytes = if p.starts_with("http://") || p.starts_with("https://") {
+        use futures::StreamExt as _;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         let resp = client.get(p).send().await?.error_for_status()?;
-        resp.bytes().await?.to_vec()
+        if let Some(len) = resp.content_length() {
+            if len as usize > MAX_TORRENT_BYTES {
+                return Err(Error::State(format!(
+                    ".torrent file too large ({len} bytes, max {MAX_TORRENT_BYTES})"
+                )));
+            }
+        }
+        let mut out = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if out.len().saturating_add(chunk.len()) > MAX_TORRENT_BYTES {
+                return Err(Error::State(format!(
+                    ".torrent payload exceeds {MAX_TORRENT_BYTES} bytes"
+                )));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        out
     } else {
         let path = PathBuf::from(p);
         if !path.is_file() {

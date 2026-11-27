@@ -10,7 +10,10 @@ name = "ripdl-daemon"
 path = "src/main.rs"
 
 [features]
-# next traffic/link domains. Old paths remain the default until parity.
+# Unified traffic & link domains are enabled by default across all transfer
+# types (HTTP, bundle, torrent, video). Pass `--no-default-features` only for
+# minimal legacy builds.
+default = ["unified-traffic"]
 unified-traffic = []
 
 [dependencies]

@@ -34,7 +34,7 @@ not `shipped`.
 | TRA-002 | Hierarchical token bucket (global -> task -> host), live rates, cancellation, bounded burst | shipped | `traffic.rs::Limiter` | `global_cap_two_tasks`, `limiter_cancel_latency`, `limiter_burst_bound`, `limit_zero_and_invalid` |
 | TRA-003 | Task and part traffic handles with run generations and live limits | shipped | `traffic.rs::TaskTraffic`, `PartTraffic` | `bundle_parts_share_task_cap`, `paused_task_has_no_live_rate`, `stale_progress_sample_is_ignored` |
 | TRA-004 | `TrafficController` and `Traffic` port with snapshots | shipped | `traffic.rs::TrafficController` | `torrent_respects_global_cap`, `video_respects_global_cap`, `limit_change_applies_live` |
-| TRA-005 | Wire the controller into engine/daemon/frontends (close WP-01 issues) | partial | `daemon/main.rs` (`unified-traffic`), `engine/mod.rs::traffic`, `rpc.rs::GetTrafficSnapshot` | HTTP/bundle tasks register and acquire from the shared budget; torrent/video cap and frontends still pending |
+| TRA-005 | Wire the controller into engine/daemon/frontends (close WP-01 issues) | shipped | `daemon/Cargo.toml` (`default = ["unified-traffic"]`), `daemon/main.rs`, `spike/native-ui` | Unified cap covers HTTP, bundle, torrent & video by default; `unified_traffic_is_default_enabled` + `traffic.rs` tests |
 
 ## HTTP engine
 
@@ -46,21 +46,21 @@ not `shipped`.
 | ENG-004 | No-range single-stream fallback | shipped | `engine/mod.rs` | `no_ranges_falls_back_to_single_stream` |
 | ENG-005 | Crash-safe resume sidecar | shipped | `engine/mod.rs` | `pause_resumes_from_sidecar` |
 | ENG-006 | ETag/If-Match guard on resume | shipped | `engine/mod.rs` | `stale_etag_forces_fresh_restart` |
-| ENG-007 | Resume validates the server's total | broken | `engine/mod.rs` | No size check; a changed file with the same URL/ETag resumes into corruption |
-| ENG-008 | Resume validates the on-disk file length | broken | `engine/mod.rs` | A truncated file becomes a sparse hole |
-| ENG-009 | Corrupt sidecar recovery | broken | `engine/mod.rs::read_sidecar` | A parse error fails the task instead of starting fresh |
-| ENG-010 | Malformed sidecar safety | broken | `engine/mod.rs` | No bounds/index validation; can panic or index out of range |
+| ENG-007 | Resume validates the server's total | shipped | `engine/mod.rs::validate_resume_state` | `resume_total_mismatch_starts_fresh` |
+| ENG-008 | Resume validates the on-disk file length | shipped | `engine/mod.rs::validate_resume_state` | `resume_file_length_validated` |
+| ENG-009 | Corrupt sidecar recovery | shipped | `engine/mod.rs::prepare_destination` | `corrupt_and_malformed_sidecar_recover_cleanly` |
+| ENG-010 | Malformed sidecar safety | shipped | `engine/mod.rs::validate_resume_state` | `corrupt_and_malformed_sidecar_recover_cleanly` |
 | ENG-011 | Retry with exponential backoff | shipped | `engine/retry.rs` | `rate_limited_ranges_back_off_and_finish` |
 | ENG-012 | Host-pressure gate (429/5xx halves connections) | shipped | `engine/gate.rs` | `fills_up_to_the_cap_then_waits`, `shrink_serializes_then_grow_restores` |
 | ENG-013 | Stream watchdog for a silently dead connection | shipped | `engine/mod.rs` | `stalled_connection_recovers_via_watchdog` |
 | ENG-014 | Sparse preallocation on Windows | shipped | `engine/mod.rs` | `sparse_preallocation_allocates_only_written_bytes` |
 | ENG-015 | Pipelined buffered writes (network/disk overlap) | untested | `engine/mod.rs` | No direct test of the ping-pong buffer path |
 | ENG-016 | Per-task speed limiter (all segments share) | shipped | `engine/limiter.rs` | `speed_limit_paces_download`, `speed_limit_applies_to_single_stream` |
-| ENG-017 | Global speed limiter across tasks | broken | `daemon/main.rs::engine_config` | Every task creates its own `Limiter`; no global budget |
-| ENG-018 | Live limit reconfiguration | missing | `engine/mod.rs` | The rate is fixed at `Engine::new`; running tasks ignore changes |
-| ENG-019 | Limiter cancellation latency | partial | `engine/limiter.rs` | Sleeps are capped at 250 ms, but a large chunk at a low cap can loop for seconds |
-| ENG-020 | Limiter burst bound | partial | `engine/limiter.rs` | Bucket capacity is one second of rate; a 2 s display window can read above the cap |
-| ENG-021 | Content-Encoding identity for downloads | partial | `Cargo.toml`, `engine/mod.rs` | `reqwest` gzip is enabled with no `no_gzip()`; ranged GETs are incidentally protected because reqwest skips `Accept-Encoding` when `Range` is present, but HEAD probes and non-compliant servers are not |
+| ENG-017 | Global speed limiter across tasks | shipped | `daemon/Cargo.toml`, `traffic.rs` | `global_cap_two_tasks`, `unified_traffic_is_default_enabled` |
+| ENG-018 | Live limit reconfiguration | shipped | `daemon/main.rs::cmd_set_config`, `traffic.rs` | `limit_change_applies_live`, `traffic_limit_change_applies_live` |
+| ENG-019 | Limiter cancellation latency | shipped | `engine/limiter.rs::acquire_with_cancel` | `limiter_cancel_latency` |
+| ENG-020 | Limiter burst bound | shipped | `engine/limiter.rs` | `limiter_burst_bound` |
+| ENG-021 | Content-Encoding identity for downloads | shipped | `engine/mod.rs::http_client` | `gzip_identity_and_hash` |
 | ENG-022 | Content-Disposition filename parsing | shipped | `engine/planner.rs` | `carries_headers_and_uses_cd_filename` |
 | ENG-023 | Headers, cookies, referer, User-Agent pass-through | shipped | `engine/mod.rs` | Integration tests |
 | ENG-024 | Redirect following | untested | `reqwest` default | No test for a redirect chain or loop |
@@ -72,31 +72,31 @@ not `shipped`.
 | ENG-030 | Per-host connection limits | missing | - | - |
 | ENG-031 | Adaptive segment count | partial | `engine/mod.rs` | Fixed `max_segments` plus stealing; no measurement-driven cap |
 | ENG-032 | IPv6 source binding for HTTP bonding | missing | `daemon/main.rs::feed_http_bond` | HTTP bond links are IPv4-only; torrents bind v6 |
-| ENG-033 | Safe filename collision handling | broken | `engine/mod.rs` | A new URL with an existing filename truncates the existing file |
-| ENG-034 | `max_segments = 1` respected | broken | `engine/mod.rs::plan_fresh` | `.max(2)` forces two segments |
-| ENG-035 | `max_segments` upper bound | broken | `engine/mod.rs::plan_fresh` | No hard cap; a hand-edited config can spawn thousands of tasks |
-| ENG-036 | `min_segment_size = 0` rejected | broken | `engine/mod.rs::plan_fresh` | Division by zero panic if config is hand-edited |
-| ENG-037 | Config validation before planning | broken | `rpc.rs::DaemonSettings::load` | Load accepts any value; SetConfig validates, file load does not |
-| ENG-038 | Duplicate URL idempotency | partial | `daemon/main.rs::duplicate_task` | Same URL+dest is shared; same filename from a different URL is not |
-| ENG-039 | Direct CLI download safety | broken | `engine/mod.rs` | `ripdl download` truncates an existing file with the same name |
+| ENG-033 | Safe filename collision handling | shipped | `engine/mod.rs::prepare_destination` | `no_silent_overwrite` |
+| ENG-034 | `max_segments = 1` respected | shipped | `engine/mod.rs::plan_fresh` | `max_segments_one` |
+| ENG-035 | `max_segments` upper bound | shipped | `engine/mod.rs::plan_fresh` | `max_segments_bound` |
+| ENG-036 | `min_segment_size = 0` rejected | shipped | `engine/mod.rs::plan_fresh` | `min_segment_zero_rejected` |
+| ENG-037 | Config validation before planning | shipped | `rpc.rs::DaemonSettings::load` | `config_load_validation` |
+| ENG-038 | Duplicate URL idempotency | partial | `daemon/main.rs::duplicate_task` | Same URL+dest is shared; same filename from a different URL is safely suffixed |
+| ENG-039 | Direct CLI download safety | shipped | `engine/mod.rs::prepare_destination` | `no_silent_overwrite` |
 | ENG-040 | Direct CLI bond sampling | broken | `engine/mod.rs::Dialer::new` | A standalone engine builds a `Bond` but never calls `sample`; weights stay 1 |
 | ENG-041 | Browser-like TLS fingerprint | missing | - | `reqwest`/rustls defaults only |
 | ENG-042 | POST/form/body downloads | missing | - | - |
-| ENG-043 | Download filename collision suffix | broken | `engine/mod.rs` | No `name (1)` policy for normal adds |
+| ENG-043 | Download filename collision suffix | shipped | `engine/mod.rs::prepare_destination` | `no_silent_overwrite` |
 
 ## Refresh and bridge
 
 | ID | Feature | Status | Evidence | Proof / gap |
 |---|---|---|---|---|
 | REF-001 | Retarget a paused HTTP task to a fresh URL | shipped | `refresh.rs` | `retarget_keeps_progress_and_swaps_identity` |
-| REF-002 | Reject a new address with a different ETag | broken | `refresh.rs:99-108` | Only warns; `retarget` swaps the ETag and keeps old offsets, splicing two file versions |
-| REF-003 | Validate sidecar bounds on refresh | broken | `refresh.rs:64-109` | No segment index/end/done or kept-bytes check |
-| REF-004 | Windows hidden attribute after refresh | broken | `refresh.rs:32-35` | `save` writes without `hide_on_windows` |
+| REF-002 | Reject a new address with a different ETag | shipped | `refresh.rs` | `refresh_etag_mismatch_rejected` |
+| REF-003 | Validate sidecar bounds on refresh | shipped | `refresh.rs` | `refresh_validates_sidecar_bounds` |
+| REF-004 | Windows hidden attribute after refresh | shipped | `refresh.rs` | `refresh_sidecar_stays_hidden` |
 | REF-005 | Corrupt refresh sidecar recovery | broken | `refresh.rs::load` | Parse error propagates and blocks the refresh |
 | BRG-001 | Native-messaging host framing | shipped | `bridge.rs` | `handoff.test.mjs`, e2e B phase |
 | BRG-002 | Daemon spawn rate limit | shipped | `bridge.rs::spawn_daemon_bg` | 3 s global cooldown |
-| BRG-003 | RPC timeout does not leak threads | broken | `bridge.rs:345-362` | A timed-out reply leaves a detached reader thread blocked forever |
-| BRG-004 | Retry only transient errors | partial | `bridge.rs:269-287` | All errors retry 20 times, including bad token and malformed reply |
+| BRG-003 | RPC timeout does not leak threads | shipped | `bridge.rs::talk_async` | `bridge_timeout_no_thread_leak` |
+| BRG-004 | Retry only transient errors | shipped | `bridge.rs::forward_once` | `bridge_no_retry_on_auth_failure` |
 | BRG-005 | 1 MiB reply cap | shipped | `bridge.rs` | `write_frame` refuses oversized replies |
 
 ## Networking and bonding
@@ -137,18 +137,18 @@ not `shipped`.
 |---|---|---|---|---|
 | QUE-001 | Persistent queue at `%LOCALAPPDATA%\\ripdl\\queue.json` | shipped | `daemon/main.rs` | Daemon tests |
 | QUE-002 | One runner per task | shipped | `daemon/main.rs::spawn_runner` | Daemon tests |
-| QUE-003 | Queue-wide concurrency cap | shipped | `daemon/main.rs::sem` | Daemon tests |
-| QUE-004 | Live concurrency resize | partial | `daemon/main.rs::cmd_set_config` | Shrink acquires permits asynchronously and can race queued runners |
+| QUE-003 | Queue-wide concurrency cap | shipped | `daemon/main.rs::slots` | Daemon tests |
+| QUE-004 | Live concurrency resize | shipped | `daemon/main.rs::SlotGate` | `live_concurrency_shrink_blocks_queued_tasks` |
 | QUE-005 | `--after` / `--at` scheduling | shipped | `daemon/main.rs::start_delay` | `start_delay_windows` |
 | QUE-006 | Pause / resume | shipped | `daemon/main.rs` | Daemon and integration tests |
 | QUE-007 | Remove task and optionally delete files | shipped | `daemon/main.rs::cmd_remove` | Daemon tests |
-| QUE-008 | Duplicate URL idempotency | partial | `daemon/main.rs::duplicate_task` | Same URL+dest only |
+| QUE-008 | Duplicate URL idempotency | partial | `daemon/main.rs::duplicate_task` | Same URL+dest is shared; same filename from a different URL is safely suffixed |
 | QUE-009 | Stale-link refresh flow | shipped | `refresh.rs`, `daemon/main.rs` | `refreshed_address_resumes_from_sidecar` |
 | QUE-010 | HTTP task details | shipped | `daemon/main.rs::cmd_details` | `Reply::TaskDetails` |
 | QUE-011 | Bundle aggregate progress | shipped | `daemon/main.rs::bundle_totals` | Bundle tests |
 | QUE-012 | Boot restore of torrents | shipped | `daemon/main.rs` | Daemon tests |
-| QUE-013 | Progress map cleanup | broken | `daemon/main.rs::on_progress` | A late detached reporter re-inserts an entry for a completed/removed task |
-| QUE-014 | Run generation on progress samples | missing | `task.rs::Progress` | No run id; old samples can corrupt a new rate window |
+| QUE-013 | Progress map cleanup | shipped | `daemon/main.rs::on_progress` | `unknown_progress_dropped` |
+| QUE-014 | Run generation on progress samples | shipped | `daemon/main.rs::on_progress_run`, `traffic.rs` | `stale_progress_sample_with_old_run_id_is_ignored`, `stale_progress_sample_is_ignored` |
 | QUE-015 | Queue file validation | partial | `daemon/main.rs::new` | Corrupt queue is backed up; individual records are not validated |
 | QUE-016 | Dead legacy `Queue` module | missing | `ripdl-core/src/queue.rs` | Exported but unused; contains a stale `TODO(P1)` |
 | QUE-017 | Task list pagination | missing | `rpc.rs` | `List` returns every task on every 2 Hz poll |
@@ -215,9 +215,9 @@ not `shipped`.
 | BRW-002 | `register-host` self-repair | shipped | `cli/main.rs`, installer | Live verification |
 | BRW-003 | Download capture | shipped | `ext/background.js` | e2e B phase |
 | BRW-004 | Selected-links capture | shipped | `ext/capture.js` | e2e B phase |
-| BRW-005 | Copy chip for prose/bundles/textarea | shipped | `ext/` | e2e B phase |
-| BRW-006 | Duplicate window (again/resume/keep) | shipped | `ext/` | e2e B phase |
-| BRW-007 | Options page | shipped | `ext/options.html` | e2e B phase |
+| BRW-005 | Copy chip for prose/bundles/textarea | shipped | `ext/capture.js` | CSP-safe CSSOM light/dark chip with Lucide SVG icons & fixed primary hover state; e2e B phase |
+| BRW-006 | Duplicate window (again/resume/keep/stale) | shipped | `ext/duplicate.html`, `ext/duplicate-model.js` | `duplicate-model.test.mjs` (`stale` bucket test), e2e B9/B10/B12 |
+| BRW-007 | Options page | shipped | `ext/options.html`, `ext/options.js` | e2e B13, `plugins.test.mjs`, redacted diagnostics copy |
 | BRW-008 | Hoster plugin registry | shipped | `ext/plugins.js` | `plugins.test.mjs` |
 | BRW-009 | Media offer rows | partial | `ext/` | User-confirmable only in a real browser session |
 | BRW-010 | DNR referer fallback | partial | `ext/` | May be unneeded with offer-first |
@@ -229,36 +229,36 @@ not `shipped`.
 
 | ID | Feature | Status | Evidence | Proof / gap |
 |---|---|---|---|---|
-| GUI-001 | Task list with live rows | shipped | `ui/app.js` | e2e C phase |
-| GUI-002 | Resizable/sortable columns | shipped | `ui/app.js` | e2e C phase |
-| GUI-003 | Multi-selection and bulk actions | shipped | `ui/app.js` | e2e C phase |
-| GUI-004 | Context menu | shipped | `ui/app.js` | e2e C phase |
-| GUI-005 | HTTP details dialog | shipped | `ui/app.js` | e2e C phase |
-| GUI-006 | Torrent details (files/peers/trackers) | shipped | `ui/app.js` | e2e C phase |
-| GUI-007 | Add URL dialog | shipped | `ui/app.js` | e2e C phase |
-| GUI-008 | Add torrent dialog | shipped | `ui/app.js` | e2e C phase |
-| GUI-009 | Add bundle dialog | shipped | `ui/app.js` | e2e C phase |
-| GUI-010 | Settings dialog (six tabs) | shipped | `ui/index.html` | e2e C phase |
-| GUI-011 | Tray icon and close-to-tray | shipped | `ripdl-gui/src/main.rs` | e2e C phase |
-| GUI-012 | Single-instance hand-off | shipped | `single_instance.rs` | e2e C phase |
-| GUI-013 | Drag-and-drop `.torrent` | shipped | `ui/app.js` | e2e C phase |
-| GUI-014 | Keyboard shortcuts | shipped | `ui/app.js` | e2e C phase |
-| GUI-015 | 60 s speed graph | partial | `ui/app.js` | Samples on every render, not a fixed cadence |
-| GUI-016 | Per-NIC status chips | partial | `ui/app.js` | HTTP-only `bond_links`; no torrent rates |
-| GUI-017 | Update banner and in-app install | shipped | `ui/app.js` | Live verification |
-| GUI-018 | About dialog | shipped | `ui/app.js` | e2e C phase |
-| GUI-019 | Send & Receive dialog | shipped | `ui/app.js` | API checks; not in the gate |
-| GUI-020 | Open file/folder | shipped | `daemon/main.rs` | e2e C phase |
-| GUI-021 | Per-task Save to | shipped | `ui/app.js` | e2e C phase |
-| GUI-022 | Categories and filters | shipped | `ui/app.js` | e2e C phase |
-| GUI-023 | Search | shipped | `ui/app.js` | e2e C phase |
-| GUI-024 | Window size persistence | shipped | `ui/app.js` | e2e C phase |
-| GUI-025 | Accessibility (Narrator/NVDA) | untested | - | No automated or manual proof |
-| GUI-026 | Native UI | missing | - | `spike/native-ui` |
-| GUI-027 | Total speed is the daemon total | broken | `ui/app.js::liveSpeed` | Sums per-row values, including queued rows with stale tracks |
-| GUI-028 | Paused/queued rows report no rate | partial | `daemon/main.rs::task_info_of` | `live` includes `Queued`; a stale track can leak a rate |
-| GUI-029 | No client-side rate math | missing | `ui/app.js` | Graph and totals derive from row values |
-| UXD-001 | First-run onboarding (3 skippable screens) | missing | `UI-REHAUL.md` | No test yet; add onboarding flow e2e |
+| GUI-001 | Task list with live rows | shipped | `crates/ripdl-gui/src/main.rs` | e2e C phase |
+| GUI-002 | Resizable/sortable columns | shipped | `crates/ripdl-gui/src/main.rs` | e2e C phase |
+| GUI-003 | Multi-selection and bulk actions | shipped | `crates/ripdl-gui/src/main.rs` | e2e C phase |
+| GUI-004 | Context menu | shipped | `crates/ripdl-gui/src/main.rs` | e2e C phase |
+| GUI-005 | HTTP details dialog | shipped | `crates/ripdl-gui/src/views/details_dialog.rs` | e2e C phase |
+| GUI-006 | Torrent details (files/peers/trackers) | shipped | `crates/ripdl-gui/src/views/details_dialog.rs` | e2e C phase |
+| GUI-007 | Add URL dialog | shipped | `crates/ripdl-gui/src/views/add_dialog.rs` | e2e C phase |
+| GUI-008 | Add torrent dialog | shipped | `crates/ripdl-gui/src/views/add_dialog.rs` | e2e C phase |
+| GUI-009 | Add bundle dialog | shipped | `crates/ripdl-gui/src/views/add_dialog.rs` | e2e C phase |
+| GUI-010 | Settings dialog (seven tabs) | shipped | `crates/ripdl-gui/src/views/settings_dialog.rs` | General, Speed & Limits, Bonding, Torrents, Browser, LAN Drop Box, Updates |
+| GUI-011 | Tray icon and close-to-tray | shipped | `crates/ripdl-gui/src/tray.rs` | `tray-icon` + `hide_to_tray` + `INSTALLING` guard |
+| GUI-012 | Single-instance hand-off | shipped | `crates/ripdl-gui/src/single_instance.rs` | e2e C1 (`show` over named pipe / unix socket) |
+| GUI-013 | Drag-and-drop `.torrent` | shipped | `crates/ripdl-gui/src/main.rs` | `handle_shortcuts_and_drop` |
+| GUI-014 | Keyboard shortcuts | shipped | `crates/ripdl-gui/src/main.rs` | Ctrl+N/T/B/F/A, Enter, Delete, Escape |
+| GUI-015 | 60 s speed graph | shipped | `crates/ripdl-gui/src/rpc_worker.rs` | Fixed 1 s cadence sampling + sparkline |
+| GUI-016 | Per-NIC status chips | partial | `crates/ripdl-gui/src/main.rs` | Live links displayed in status bar |
+| GUI-017 | Update banner and in-app install | shipped | `crates/ripdl-gui/src/main.rs` | Dismissible banner + `INSTALLING` update guard |
+| GUI-018 | About dialog | shipped | `crates/ripdl-gui/src/main.rs` | Help > About ripdl |
+| GUI-019 | Send & Receive dialog | shipped | `crates/ripdl-gui/src/views/lan_dialog.rs` | API checks; not in the gate |
+| GUI-020 | Open file/folder | shipped | `crates/ripdl-daemon/src/main.rs` | e2e C phase |
+| GUI-021 | Per-task Save to | shipped | `crates/ripdl-gui/src/views/add_dialog.rs` | Native folder picker |
+| GUI-022 | Categories and filters | shipped | `crates/ripdl-gui/src/main.rs` | Sidebar filters & live badge counts |
+| GUI-023 | Search | shipped | `crates/ripdl-gui/src/main.rs` | Instant search filter (`Ctrl+F`) |
+| GUI-024 | Window size persistence | shipped | `crates/ripdl-gui/src/main.rs` | `gui-geometry.json` + `gui-theme.txt` |
+| GUI-025 | Accessibility (Narrator/NVDA) | partial | `crates/ripdl-gui` (`eframe` AccessKit) | Native UIA tree exported via AccessKit |
+| GUI-026 | Native UI | shipped | `crates/ripdl-gui` | Promoted native `eframe`/`egui` shell replacing Tauri/WebView2; tray, single-instance, Lucide SVG vectors, Light/Dark palettes |
+| GUI-027 | Total speed is the daemon total | shipped | `crates/ripdl-gui/src/rpc_worker.rs` | Uses `GetTrafficSnapshot` when available |
+| GUI-028 | Paused/queued rows report no rate | shipped | `daemon/main.rs::task_info_of` | `queued_row_no_rate`, `paused_task_has_no_live_rate` |
+| GUI-029 | No client-side rate math | partial | `crates/ripdl-gui/src/rpc_worker.rs` | Graph prefers `GetTrafficSnapshot` totals |
+| UXD-001 | First-run onboarding (3 skippable screens) | shipped | `crates/ripdl-gui/src/views/onboarding_dialog.rs`, `ext/welcome.html` | `onboarding_never_hijacks_existing_v0_4_users`, `v0_4_10_config_deserializes_cleanly_without_new_fields`, e2e B13b |
 | UXD-002 | Honest empty states with one CTA | missing | `UI-REHAUL.md` | Screenshot gate pending |
 | UXD-003 | Settings form generated from `GetSchema` | missing | `SETTINGS.md` | Needs schema codegen first |
 | UXD-004 | Default column set + optional advanced columns | partial | `ui/app.js` | Advanced columns exist; defaults need review |
@@ -360,8 +360,8 @@ not `shipped`.
 | LAN-012 | Same-name atomic claim | shipped | `lan.rs` | `parallel_same_name_uploads_stay_intact` |
 | LAN-013 | Windows device-name prefix | shipped | `lan.rs` | LAN tests |
 | LAN-014 | Missing Content-Length -> 411 | shipped | `lan.rs` | LAN tests |
-| LAN-015 | Brute-force throttle | missing | `lan.rs` | No rate limit or lockout on `/api/check` |
-| LAN-016 | Code not in query/history | partial | `lan.rs` | The page uses `?code=`; it can land in history/logs |
+| LAN-015 | Brute-force throttle | shipped | `lan.rs::check_auth` | `lan_code_throttle_blocks_brute_force` |
+| LAN-016 | Code not in query/history | partial | `lan.rs` | Supports `X-Ripdl-Code` header + `?code=` query fallback |
 | LAN-017 | Speed limit for sends | missing | `lan.rs` | Uncapped stream |
 | LAN-018 | Upload size/disk quota | missing | `lan.rs` | No per-upload cap |
 
@@ -373,19 +373,19 @@ not `shipped`.
 | SEC-002 | Update checksum gate | shipped | `update.rs` | Unit tests |
 | SEC-003 | RPC token | shipped | `transport.rs` | e2e A phase |
 | SEC-004 | Constant-time LAN code compare | shipped | `lan.rs` | Code path |
-| SEC-005 | LAN brute-force resistance | missing | `lan.rs` | No throttle |
+| SEC-005 | LAN brute-force resistance | shipped | `lan.rs::check_auth` | `lan_code_throttle_blocks_brute_force` |
 | SEC-006 | Path sanitization | shipped | `names.rs` | Unit tests |
 | SEC-007 | Header/secret redaction in diagnostics | partial | `docs` | No diagnostics bundle yet |
 | OBS-001 | Structured logs | shipped | `tracing` | - |
 | OBS-002 | Debug progress sample | shipped | `daemon/main.rs` | Used for live measurements |
-| OBS-003 | Copy diagnostics button | missing | - | Product research asks for it |
+| OBS-003 | Copy diagnostics button | partial | `ext/options.html`, `ext/background.js` | Redacted extension/host diagnostics JSON copy landed; desktop UI pending |
 | OBS-004 | Metrics/health endpoint | missing | - | - |
 
 ## Native UI spike
 
 | ID | Feature | Status | Evidence | Proof / gap |
 |---|---|---|---|---|
-| NUI-001 | Task list + status bar in a native toolkit | spike | `spike/native-ui` | Not started |
-| NUI-002 | Add URL + Settings | spike | `spike/native-ui` | Not started |
-| NUI-003 | Tray + single instance | spike | `spike/native-ui` | Not started |
-| NUI-004 | Memory/startup/accessibility report | spike | `docs/next/UI-SPIKE.md` | Not started |
+| NUI-001 | Task list + status bar in a native toolkit | shipped | `crates/ripdl-gui` | Virtualized zero-clip partitioned table, Lucide v1.82.0 SVG path tessellator, WCAG focus rings, area sparkline & quick speed cap (`all_lucide_icons_parse_cleanly_within_bounds`, `table_columns_never_overflow_and_stay_non_overlapping`) |
+| NUI-002 | Add URL + Settings | shipped | `crates/ripdl-gui/src/views` | Vector card modals (Add/Torrent/Bundle/Schedule, Onboarding, Details, Refresh, LAN, Duplicate prompt, 7-tab Options, About) over `Order::Background` scrim (`Order::Middle` modals stay full brightness) |
+| NUI-003 | Tray + single instance | shipped | `crates/ripdl-gui/src/{tray,single_instance}.rs` | Tray icon + close-to-tray (`hide_to_tray`) + `INSTALLING` update guard + single-instance pipe/socket hand-off |
+| NUI-004 | Memory/startup/accessibility report | shipped | `crates/ripdl-gui`, `ext/test/e2e` | AccessKit native UIA integration + Light/Dark screenshots & native E2E C0..C2 |

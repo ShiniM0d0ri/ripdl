@@ -105,7 +105,7 @@ pub fn is_host_pressure(e: &Error) -> bool {
     // exactly when it needs to fan out over the surviving links. The bond
     // gets the fail strike instead, and the retry re-picks a live link.
     if matches!(e, Error::StreamStalled(_)) {
-        return true;
+        return false;
     }
     matches!(
         e,
@@ -201,5 +201,17 @@ mod tests {
         // us to slow down, so it keeps the short leash.
         assert!(!is_host_pressure(&Error::Server("boom".into())));
         assert!(!is_host_pressure(&Error::InvalidUrl("not a url".into())));
+    }
+
+    #[test]
+    fn stalled_stream_policy_matches_comment() {
+        let r = RetryConfig::default();
+        let err = Error::StreamStalled(15);
+        assert!(is_retryable(&err));
+        assert!(
+            !is_host_pressure(&err),
+            "StreamStalled is a path stall, not host pressure"
+        );
+        assert_eq!(max_attempts(&r, is_host_pressure(&err)), r.max_retries);
     }
 }

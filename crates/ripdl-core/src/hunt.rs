@@ -153,7 +153,7 @@ pub fn build_args(cfg: &HuntConfig) -> Vec<String> {
         args.push(format!("{k}: {v}"));
     }
     if let Some(bps) = cfg.limit_bps {
-        let rate = if bps >= 1024 * 1024 {
+        let rate = if bps >= 1024 * 1024 && bps % (1024 * 1024) == 0 {
             format!("{}M", bps / (1024 * 1024))
         } else if bps >= 1024 {
             format!("{}K", bps / 1024)
@@ -185,6 +185,7 @@ fn spawn_child(program: &str, args: &[String]) -> Result<tokio::process::Child, 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
     #[cfg(windows)]
     {
         // Never flash a console for a background sidecar.
@@ -203,6 +204,7 @@ fn spawn_child(program: &str, args: &[String]) -> Result<tokio::process::Child, 
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
+            cmd.kill_on_drop(true);
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
             return cmd.spawn();
@@ -212,6 +214,34 @@ fn spawn_child(program: &str, args: &[String]) -> Result<tokio::process::Child, 
         std::io::ErrorKind::NotFound,
         format!("program not found: {program}"),
     ))
+}
+
+async fn read_line_lossy<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    buf.clear();
+    let n = reader.read_until(b'\n', buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(buf).into_owned()))
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
 }
 
 #[cfg(windows)]
@@ -284,12 +314,16 @@ pub async fn download(
     // unsupported urls, extraction failures, sign-in prompts).
     let stderr_task = tokio::spawn(async move {
         let mut tail = String::new();
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
+        let mut reader = BufReader::new(stderr);
+        let mut raw = Vec::new();
+        while let Ok(Some(l)) = read_line_lossy(&mut reader, &mut raw).await {
             tail.push_str(&l);
             tail.push('\n');
-            let cut = tail.len().saturating_sub(4000);
-            if cut > 0 {
+            if tail.len() > 4000 {
+                let mut cut = tail.len() - 4000;
+                while cut < tail.len() && !tail.is_char_boundary(cut) {
+                    cut += 1;
+                }
                 tail.drain(..cut);
             }
         }
@@ -302,24 +336,31 @@ pub async fn download(
     let reader_task = tokio::spawn(async move {
         let mut progress = progress;
         let mut output: Option<PathBuf> = None;
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let Ok(line) = lines.next_line().await else { break };
-            let Some(line) = line else { break };
-            if let Some(ev) = parse_progress(&line) {
-                progress.percent = Some(ev.percent.clamp(0.0, 100.0));
-                progress.total = ev.total;
-                on_progress(progress.clone());
-            }
-            if let Some(p) = parse_output_path(&line) {
-                output = Some(p);
+        let mut reader = BufReader::new(stdout);
+        let mut raw = Vec::new();
+        while let Ok(Some(segment)) = read_line_lossy(&mut reader, &mut raw).await {
+            // yt-dlp can still emit `\r`-delimited status updates inside one line.
+            for line in segment.split('\r').filter(|s| !s.is_empty()) {
+                if let Some(ev) = parse_progress(line) {
+                    progress.percent = Some(ev.percent.clamp(0.0, 100.0));
+                    progress.total = ev.total;
+                    on_progress(progress.clone());
+                }
+                if let Some(p) = parse_output_path(line) {
+                    output = Some(p);
+                }
             }
         }
         output
     });
 
+    let child_pid = child.id();
     let status = tokio::select! {
         _ = token.cancelled() => {
+            #[cfg(windows)]
+            if let Some(pid) = child_pid {
+                tokio::task::spawn_blocking(move || kill_process_tree(pid)).await.ok();
+            }
             let _ = child.kill().await;
             drop(child);
             stderr_task.abort();
@@ -449,5 +490,26 @@ mod tests {
         c.headers.insert("Referer".into(), String::new());
         let args = build_args(&c);
         assert!(!args.join(" ").contains("Referer"));
+    }
+
+    #[test]
+    fn limit_rate_uses_kib_precision_for_fractional_mib() {
+        let mut c = cfg("https://example.com/v");
+        c.limit_bps = Some(1536 * 1024); // 1.5 MiB/s must not floor-truncate to 1M
+        let args = build_args(&c);
+        let i = args.iter().position(|a| a == "--limit-rate").expect("limit-rate present");
+        assert_eq!(args[i + 1], "1536K");
+    }
+
+    #[tokio::test]
+    async fn read_line_lossy_handles_invalid_utf8_and_cr() {
+        let data: &[u8] = b"[download] 12.5%\r[download] \xff\xfe 45.0%\nnext line\r\n";
+        let mut reader = BufReader::new(data);
+        let mut buf = Vec::new();
+        let first = read_line_lossy(&mut reader, &mut buf).await.unwrap().unwrap();
+        assert!(first.contains("45.0%"), "{first}");
+        let second = read_line_lossy(&mut reader, &mut buf).await.unwrap().unwrap();
+        assert_eq!(second, "next line");
+        assert!(read_line_lossy(&mut reader, &mut buf).await.unwrap().is_none());
     }
 }

@@ -64,11 +64,17 @@ Guiding rules:
       until the wall clock honors it; cancels cleanly while waiting; start
       times persist across daemon restarts)
 
-## P2 - GUI (Tauri)
+## P2 - GUI (native eframe/egui)
 
 - [x] Task list: progress, speed, per-task pause/resume/cancel (`ripdl-gui`,
-      IDM-style: toolbar, category sidebar, grid with inline progress bars,
-      context menu, status bar; auto-spawns the daemon on first poll)
+      native `eframe`/`egui` shell replacing Tauri/WebView2: toolbar, category
+      sidebar, virtualized partitioned table with inline progress bars and
+      Lucide SVG vectors, context menu, Light/Dark themes, status bar;
+      auto-spawns the daemon on first poll)
+- [x] First-run onboarding: skippable 3-step Setup Wizard (Folder, Browser,
+      Network) in `ripdl-gui`, branded `ext/welcome.html` status page, popup
+      "Setup guide" link, and `ripdl register-host --open-welcome`; upgrades
+      from <=v0.4.10 bypass auto-launch when existing config/queue/tasks exist
 - [x] Add-URL dialog (`add_task` command + URL/category form, per-task
       "Save to" location with native folder browser, hunt toggle)
 - [x] Location + file management: per-row destination display, open
@@ -97,16 +103,8 @@ Guiding rules:
       (off by default, torrents only, takes its width from the name column) and
       "Copy address" in the row menu; saved widths shrink to fit a narrower
       window instead of scrolling
-- [x] Tray footprint: the WebView2 is suspended while the window is hidden
-      (`webview_mem.rs` - controller visible flag, `TrySuspend`, Low memory
-      target; `reveal()` resumes before showing), and the webview runs
-      software-composited (`--disable-gpu` + wry's default
-      `msWebOOUI,msPdfOOUI,msSmartScreenProtection` off). Approximate A/B
-      (2026-10-26, dev builds, 2 runs per side, GUI + WebView2 combined,
-      baseline = HEAD without these two changes): hidden 30-90 s working set
-      53-60 MB vs 341-369 MB; hidden private commit ~106 MB vs ~178 MB; hidden
-      CPU ~0 % vs ~2.5 %; visible private commit ~110 MB vs ~171 MB; after a
-      reveal ~155 MB vs ~330 MB. Measure late: the trim takes 30-90 s.
+- [x] Native UI promotion (v0.5.0): `ripdl-gui` runs directly on `eframe`/`egui`
+      + `tray-icon` + `embed-resource` with zero WebView2 dependency
 
 ## P3 - torrent support (via librqbit, Apache-2.0 — never a GPL client)
 

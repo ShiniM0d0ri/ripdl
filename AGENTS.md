@@ -31,17 +31,18 @@ telemetry, zero ads, forever — non-negotiable, code it into no feature.
   `add`, `ls`, `pause`, `resume`, `rm`, `lan`, `stop`).
 - `crates/ripdl-daemon` — queue owner: persistent queue at
   `%LOCALAPPDATA%\ripdl\queue.json`, one runner per task, EMA speed tracking.
+- `crates/ripdl-gui` — native desktop GUI (`eframe`/`egui` + `tray-icon` +
+  `embed-resource`), replacing the legacy Tauri/WebView2 shell as of `v0.5.0`.
 - `docs/ROADMAP.md` — phase plan; keep checkboxes current for every
   completed/added item.
-- `docs/rea-findings.md` — REA research notebook (P4 browser-capture work).
 - Brand assets: `docs/logo.svg` is the source of truth for the mark (deep-teal
   tile, white download arrow, three mint speed dashes);
   `packaging/icon/generate.ps1` redraws it with GDI+ into
   `crates/ripdl-gui/icons/icon.png` (512) + `icon.ico` (16-256: DIB frames,
   plus one PNG frame at 256) and `docs/logo-512.png`. Edit the SVG and the
-  script together, then re-run it. Gotcha: tauri-build caches the Windows
-  resource, so a plain `cargo build` keeps the *old* exe icon after
-  regenerating `icon.ico` — run `cargo clean -p ripdl-gui` first.
+  script together, then re-run it. Gotcha: Windows `.rc` resource compilation
+  can cache the old icon after regenerating `icon.ico` — run
+  `cargo clean -p ripdl-gui` first.
 
 ## Commands
 
@@ -99,15 +100,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ext\test\e2e\run-in-session.
     again, Resume, browser keeps its copy); the options page; a daemon stop and
     restart still lands a fallback byte for byte; SHA-256 of every fixture; box
     and prose links never fetched; Referer rules; no console errors.
-  - GUI, C0-C3 (5): first window up; a second launch hands off and exits; Settings
-    and Add URL open. Closing checks (2): the installed daemon, its queue and
+  - GUI, C0-C2 (4): first native GUI window + single-instance pipe up; second
+    launch hands off and exits while first stays alive; native window screenshot
+    captured cleanly. Closing checks (2): the installed daemon, its queue and
     Downloads are untouched.
 - Output: `target\e2e\runs\<RUN>\` (`report.json`, logs, `shots\`, `downloads\`).
 - Isolation: a private daemon (own pipe, TCP fallback, data folder), its own GUI
-  pipe and WebView2 profile, a dead proxy, and the update check off. The
-  installed daemon, its queue, and the user's Downloads must not change. The LAN
-  check briefly opens the private drop box on all interfaces (the one network
-  exception).
+  pipe (`RIPDL_GUI_PIPE`), a dead proxy, and the update check off. The installed
+  daemon, its queue, and the user's Downloads must not change. The LAN check
+  briefly opens the private drop box on all interfaces (the one network exception).
 
 ## Environment gotchas
 
@@ -120,16 +121,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ext\test\e2e\run-in-session.
   unix socket `<data_dir>/rpc.sock` on non-Windows. Client transport helpers
   live in `ripdl_core.transport`. Daemon policy file:
   `%LOCALAPPDATA%\ripdl\config.json` (all-optional fields).
-- **E2E GUI**: the agent shell is elevated (session 0), where WebView2 cannot
-  open windows (`0x80070578`), and elevation ignores
-  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`. Run GUI checks only through
-  `run-in-session.ps1`, which starts the harness in the desktop session via a
-  one-off scheduled task and waits for `done.flag`. The extension phase is
-  headless Edge and needs no desktop.
+- **E2E GUI**: the agent shell runs in session 0; run GUI checks through
+  `run-in-session.ps1`, which starts the harness in the interactive desktop
+  session via a one-off scheduled task and waits for `done.flag`. The extension
+  phase is headless Edge and needs no desktop.
 - Send & Receive is outside the gate: opening it runs LAN discovery, so the
   drop box is covered by API checks instead.
-- Do not run `research/gui-*.js` probes: they spawn `target\debug\ripdl-gui.exe`
-  without isolation and reach the installed daemon.
 - Keep PowerShell scripts ASCII-only (Windows PowerShell 5.1 reads BOM-less
   files as ANSI). Wait on a per-call event id and check `done.flag`; a fixed
   `Wait-Event` source id can return a stale event from an earlier run.

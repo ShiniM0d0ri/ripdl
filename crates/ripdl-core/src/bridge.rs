@@ -12,8 +12,7 @@
 //! an `error` reply, and the extension then lets the browser download
 //! normally. The host never blocks browsing because ripdl is missing.
 
-use std::io::{BufRead, Read, Write};
-use std::net::TcpStream;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -21,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::rpc::{Command, Reply};
@@ -264,14 +265,23 @@ fn send_reply<W: Write>(out: &Mutex<W>, resp: &NativeResponse) -> Result<()> {
     write_frame(&mut *writer, &json)
 }
 
+enum ForwardFailure {
+    /// Transport/startup fault worth retrying while daemon boots up.
+    Retryable(Error),
+    /// Auth refusal, protocol/id mismatch, malformed payload, or RPC timeout:
+    /// retrying won't help (and repeating a 30s timeout 20x wedges the host).
+    Fatal(Error),
+}
+
 /// Push one command to the daemon, spawning it if absent (once per call;
 /// every later request just races the freshly spawned listener).
 fn forward_once(config: &BridgeConfig, rpc_seq: &AtomicU64, cmd: Command) -> Result<Reply> {
     let mut spawned = false;
-    for attempt in 0..config.connect_attempts {
+    for attempt in 0..config.connect_attempts.max(1) {
         match talk(config, rpc_seq, &cmd) {
             Ok(reply) => return Ok(reply),
-            Err(err) => {
+            Err(ForwardFailure::Fatal(err)) => return Err(err),
+            Err(ForwardFailure::Retryable(err)) => {
                 if config.spawn_daemon && !spawned && attempt == 0 {
                     spawned = true;
                     let _ = spawn_daemon_bg();
@@ -287,20 +297,13 @@ fn forward_once(config: &BridgeConfig, rpc_seq: &AtomicU64, cmd: Command) -> Res
     Err(Error::State("daemon unreachable".to_string()))
 }
 
-/// One connected daemon stream for the bridge's blocking IO. The named pipe
-/// (Windows) / unix socket (elsewhere) is primary: no TCP handshake per
-/// message, no port to race. TCP loopback stays as the fallback for
-/// mixed-version dev setups.
-trait RpcStream: std::io::Read + std::io::Write + Send + 'static {}
-impl<T: std::io::Read + std::io::Write + Send + 'static> RpcStream for T {}
+trait AsyncRpcStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRpcStream for T {}
 
-fn connect_daemon_sync(use_pipe: bool, port: u16) -> std::io::Result<Box<dyn RpcStream>> {
+async fn connect_daemon_async(use_pipe: bool, port: u16) -> std::io::Result<Box<dyn AsyncRpcStream>> {
     #[cfg(windows)]
-    // std's OpenOptions reaches a named-pipe server directly.
     if use_pipe {
-        if let Ok(pipe) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
+        if let Ok(pipe) = tokio::net::windows::named_pipe::ClientOptions::new()
             .open(crate::transport::pipe_name())
         {
             return Ok(Box::new(pipe));
@@ -309,25 +312,59 @@ fn connect_daemon_sync(use_pipe: bool, port: u16) -> std::io::Result<Box<dyn Rpc
     #[cfg(not(windows))]
     if use_pipe {
         if let Ok(path) = crate::transport::unix_socket_path() {
-            if let Ok(sock) = std::os::unix::net::UnixStream::connect(path) {
+            if let Ok(sock) = tokio::net::UnixStream::connect(path).await {
                 return Ok(Box::new(sock));
             }
         }
     }
-    let stream = TcpStream::connect(("127.0.0.1", port))?;
-    // Request/reply are small packets; Nagle would delay the daemon's reply.
-    stream.set_nodelay(true)?;
+    let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let _ = stream.set_nodelay(true);
     Ok(Box::new(stream))
 }
 
-fn talk(config: &BridgeConfig, rpc_seq: &AtomicU64, cmd: &Command) -> Result<Reply> {
+fn talk(
+    config: &BridgeConfig,
+    rpc_seq: &AtomicU64,
+    cmd: &Command,
+) -> std::result::Result<Reply, ForwardFailure> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Avoid nesting runtimes when called synchronously from inside a
+        // current-thread #[tokio::test]; join cleanly so no thread ever leaks.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| ForwardFailure::Fatal(Error::Io(e)))?;
+                rt.block_on(talk_async(config, rpc_seq, cmd))
+            })
+            .join()
+            .unwrap_or_else(|_| Err(ForwardFailure::Fatal(Error::State("bridge worker panicked".into()))))
+        })
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ForwardFailure::Fatal(Error::Io(e)))?;
+        rt.block_on(talk_async(config, rpc_seq, cmd))
+    }
+}
+
+async fn talk_async(
+    config: &BridgeConfig,
+    rpc_seq: &AtomicU64,
+    cmd: &Command,
+) -> std::result::Result<Reply, ForwardFailure> {
     // Read the token per attempt: a daemon restarted under the browser writes
     // a fresh one, and the next attempt picks it up.
     let token = match &config.rpc_token {
         Some(token) => token.clone(),
-        None => crate::transport::read_rpc_token()?,
+        None => crate::transport::read_rpc_token()
+            .map_err(|e| ForwardFailure::Retryable(Error::Io(e)))?,
     };
-    let mut stream = connect_daemon_sync(config.use_pipe, config.port)?;
+    let mut stream = connect_daemon_async(config.use_pipe, config.port)
+        .await
+        .map_err(|e| ForwardFailure::Retryable(Error::Io(e)))?;
     // Build the request after the connection exists: a failed connect (spawn
     // warming up) must not clone the payload per retry attempt.
     let req = crate::rpc::Request {
@@ -338,45 +375,47 @@ fn talk(config: &BridgeConfig, rpc_seq: &AtomicU64, cmd: &Command) -> Result<Rep
     // The auth line comes first on every connection, then the request. One
     // write, so the two cannot be split across packets.
     let mut line = crate::transport::auth_line(&token);
-    line.push_str(&serde_json::to_string(&req)?);
+    let payload = serde_json::to_string(&req)
+        .map_err(|e| ForwardFailure::Fatal(Error::Json(e)))?;
+    line.push_str(&payload);
     line.push('\n');
-    stream.write_all(line.as_bytes())?;
 
-    // Read the reply on a worker thread and race it with the RPC deadline:
-    // pipe handles have no std read timeout, and a hung daemon must not wed
-    // the whole native-messaging host. One short-lived thread per message.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reply = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stream);
-        let mut resp_line = Vec::new();
-        let res = reader.read_until(b'\n', &mut resp_line).map(|_| resp_line);
-        let _ = tx.send(res);
-    });
-    let resp_line = match rx.recv_timeout(config.rpc_timeout) {
-        Ok(Ok(line)) => line,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => {
-            return Err(Error::State("daemon reply timed out".to_string()));
-        }
-    };
-    drop(reply); // detached worker exits on its own after the send
+    tokio::time::timeout(config.rpc_timeout, async {
+        stream.write_all(line.as_bytes()).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| ForwardFailure::Fatal(Error::State("daemon reply timed out".to_string())))?
+    .map_err(|e| ForwardFailure::Retryable(Error::Io(e)))?;
 
-    if resp_line.is_empty() {
-        return Err(Error::State("daemon closed the connection".to_string()));
+    // Bounded async read: on timeout the stream and future drop immediately,
+    // closing the pipe/socket with zero detached reader threads leaked.
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut resp_line = Vec::new();
+    let n = tokio::time::timeout(config.rpc_timeout, reader.read_until(b'\n', &mut resp_line))
+        .await
+        .map_err(|_| ForwardFailure::Fatal(Error::State("daemon reply timed out".to_string())))?
+        .map_err(|e| ForwardFailure::Retryable(Error::Io(e)))?;
+
+    if n == 0 || resp_line.is_empty() {
+        return Err(ForwardFailure::Retryable(Error::State(
+            "daemon closed the connection".to_string(),
+        )));
     }
-    let resp: crate::rpc::Response = serde_json::from_slice(&resp_line)?;
+    let resp: crate::rpc::Response = serde_json::from_slice(&resp_line)
+        .map_err(|e| ForwardFailure::Fatal(Error::Json(e)))?;
     if resp.id != req.id {
         // Id 0 is the daemon's connection-level refusal (a token it rejects).
         if resp.id == 0 {
-            return Err(Error::State(
+            return Err(ForwardFailure::Fatal(Error::State(
                 "daemon refused the connection (rpc token rejected or protocol mismatch)"
                     .to_string(),
-            ));
+            )));
         }
-        return Err(Error::State(format!(
+        return Err(ForwardFailure::Fatal(Error::State(format!(
             "daemon reply id mismatch: sent {}, got {}",
             req.id, resp.id
-        )));
+        ))));
     }
     Ok(resp.reply)
 }
@@ -463,7 +502,7 @@ fn directories_and_localappdata() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{BufRead, Cursor};
 
     #[test]
     fn frame_roundtrip() {
@@ -756,5 +795,95 @@ mod tests {
         let seq = AtomicU64::new(0);
         let result = forward_once(&config, &seq, Command::List);
         assert!(result.is_err(), "expected unreachable daemon error");
+    }
+
+    #[test]
+    fn bridge_no_retry_on_auth_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicU64::new(0));
+        let accepts_srv = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { return };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut r = std::io::BufReader::new(sock.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = r.read_line(&mut line);
+                let _ = r.read_line(&mut line);
+                let reply = crate::rpc::Response {
+                    id: 0,
+                    reply: Reply::Error {
+                        message: "bad token".into(),
+                    },
+                };
+                let mut out = serde_json::to_string(&reply).unwrap();
+                out.push('\n');
+                let _ = sock.write_all(out.as_bytes());
+            }
+        });
+
+        let config = BridgeConfig {
+            port,
+            spawn_daemon: false,
+            connect_attempts: 20,
+            connect_delay: Duration::from_millis(50),
+            use_pipe: false,
+            rpc_token: Some("wrong".to_string()),
+            ..BridgeConfig::default()
+        };
+        let seq = AtomicU64::new(0);
+        let err = forward_once(&config, &seq, Command::List).unwrap_err();
+        assert!(err.to_string().contains("refused"), "got {err}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "auth refusal must fail fast without 20x retry"
+        );
+    }
+
+    #[test]
+    fn bridge_timeout_no_thread_leak() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Keep accepted sockets open without replying so we prove timeout
+            // drops the client socket instead of leaking a blocked reader thread.
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { return };
+                let tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 256];
+                    loop {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => {
+                                let _ = tx.send(());
+                                return;
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let config = BridgeConfig {
+            port,
+            spawn_daemon: false,
+            connect_attempts: 1,
+            rpc_timeout: Duration::from_millis(80),
+            use_pipe: false,
+            rpc_token: Some("tok".to_string()),
+            ..BridgeConfig::default()
+        };
+        let seq = AtomicU64::new(0);
+        for _ in 0..3 {
+            let err = forward_once(&config, &seq, Command::List).unwrap_err();
+            assert!(err.to_string().contains("timed out"), "got {err}");
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("client timeout must close socket promptly without hanging reader");
+        }
     }
 }

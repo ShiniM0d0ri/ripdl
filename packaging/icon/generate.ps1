@@ -181,6 +181,14 @@ $png512.Save((Join-Path $iconDir 'icon.png'), [System.Drawing.Imaging.ImageForma
 $png512.Save((Join-Path $docsDir 'logo-512.png'), [System.Drawing.Imaging.ImageFormat]::Png)
 $png512.Dispose()
 
+$extIconDir = Join-Path $root 'ext/icons'
+New-Item -ItemType Directory -Force -Path $extIconDir | Out-Null
+foreach ($extSize in @(16, 32, 48, 128)) {
+    $bmp = New-MarkBitmap $extSize
+    $bmp.Save((Join-Path $extIconDir "icon-$extSize.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
+
 Write-Ico (Join-Path $iconDir 'icon.ico') @(16, 24, 32, 48, 64, 128, 256)
 
-Get-ChildItem $iconDir | ForEach-Object { "{0}  {1} bytes" -f $_.Name, $_.Length }
+Get-ChildItem $iconDir, $extIconDir | ForEach-Object { "{0}  {1} bytes" -f $_.Name, $_.Length }

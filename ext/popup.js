@@ -29,14 +29,19 @@ loadVersion();
 
 async function probeDaemon() {
     statusEl.textContent = "daemon: connecting";
-  statusEl.className = "down";
-  chrome.runtime.sendMessage({ type: "ripdl_light_probe" }); // wakes the SW
-  // The SW answers through the badge; also try the storage of last state.
-  setTimeout(async () => {
-    const { hostAlive } = await chrome.storage.local.get({ hostAlive: false });
-    statusEl.textContent = hostAlive ? "daemon: connected" : "daemon: not running";
-    statusEl.className = hostAlive ? "ok" : "down";
-  }, 400);
+    statusEl.className = "down";
+    try {
+        const resp = await chrome.runtime.sendMessage({ type: "ripdl_light_probe" });
+        const alive = typeof resp?.hostAlive === "boolean"
+            ? resp.hostAlive
+            : (await chrome.storage.local.get({ hostAlive: false })).hostAlive;
+        statusEl.textContent = alive ? "daemon: connected" : "daemon: not running";
+        statusEl.className = alive ? "ok" : "down";
+        if (alive) loadVersion();
+    } catch {
+        statusEl.textContent = "daemon: not running";
+        statusEl.className = "down";
+    }
 }
 
 async function loadSettings() {
@@ -82,18 +87,42 @@ const shortUrl = (u) => {
     }
 };
 
-function markQueued(btn, text) {
-    btn.textContent = text || "queued ✓";
-    btn.disabled = true;
-    setTimeout(() => { btn.textContent = text || "queued ✓"; }, 1200);
+const SVG_NS = "http://www.w3.org/2000/svg";
+function makeIcon(paths, size = 13) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", String(size));
+    svg.setAttribute("height", String(size));
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    for (const [tag, attrs] of paths) {
+        const node = document.createElementNS(SVG_NS, tag);
+        for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+        svg.append(node);
+    }
+    return svg;
+}
+
+function markQueued(btn, ok, text, fallbackText) {
+    const lbl = btn.querySelector(".btn-label") || btn;
+    lbl.textContent = text;
+    btn.disabled = ok;
+    if (!ok) {
+        setTimeout(() => { lbl.textContent = fallbackText; }, 2400);
+    }
 }
 
 async function sendTask(cmd) {
     try {
         const resp = await chrome.runtime.sendMessage({ type: "ripdl_send", cmd });
-        return resp?.ok === true;
+        return { ok: resp?.ok === true, error: resp?.error || null };
     } catch {
-        return false;
+        return { ok: false, error: "daemon unreachable" };
     }
 }
 
@@ -105,12 +134,16 @@ chrome.runtime.sendMessage({ type: "ripdl_hunt_query" }, (hunt) => {
     huntEl.classList.remove("hidden");
     if (videoish) {
         const pageBtn = document.getElementById("hunt-page");
+        const idleText = pageBtn.textContent || "Download page as video (yt-dlp)";
         pageBtn.addEventListener("click", async () => {
             pageBtn.disabled = true;
-            const ok = await sendTask({ type: "add", url: pageUrl, dest_dir: null, headers: {}, kind: "video" });
-            pageBtn.disabled = false;
-            markQueued(pageBtn, ok ? "queued for yt-dlp ✓" : "daemon unreachable ✗");
-            if (!ok) setTimeout(() => { pageBtn.textContent = "Download page as video (yt-dlp)"; }, 2400);
+            const res = await sendTask({ type: "add", url: pageUrl, dest_dir: null, headers: {}, kind: "video" });
+            markQueued(
+                pageBtn,
+                res.ok,
+                res.ok ? "queued for yt-dlp \u2713" : `${res.error || "daemon unreachable"} \u2717`,
+                idleText,
+            );
         });
     } else {
         document.getElementById("hunt-page").classList.add("hidden");
@@ -124,12 +157,27 @@ chrome.runtime.sendMessage({ type: "ripdl_hunt_query" }, (hunt) => {
         urlText.textContent = shortUrl(m.url);
         const btn = document.createElement("button");
         btn.className = "hunt-file-btn";
-        btn.textContent = "Download media file";
+        btn.type = "button";
+        const span = document.createElement("span");
+        span.className = "btn-label";
+        span.textContent = "Download media file";
+        btn.append(
+            makeIcon([
+                ["path", { d: "M12 15V3" }],
+                ["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }],
+                ["path", { d: "m7 10 5 5 5-5" }],
+            ]),
+            span,
+        );
         btn.addEventListener("click", async () => {
             btn.disabled = true;
-            const ok = await sendTask({ type: "add", url: m.url, dest_dir: null, headers: {} });
-            btn.disabled = false;
-            markQueued(btn, ok ? "queued ✓" : "daemon unreachable ✗");
+            const res = await sendTask({ type: "add", url: m.url, dest_dir: null, headers: {} });
+            markQueued(
+                btn,
+                res.ok,
+                res.ok ? "queued \u2713" : `${res.error || "daemon unreachable"} \u2717`,
+                "Download media file",
+            );
         });
         row.append(urlText, btn);
         huntMediaEl.appendChild(row);
@@ -142,9 +190,11 @@ chrome.runtime.sendMessage({ type: "ripdl_hunt_query" }, (hunt) => {
     }
 });
 
-// Ask the SW for fresh liveness; it mirrors it into storage.
-chrome.runtime.sendMessage({ type: "ripdl_light_probe" }).catch(() => {});
 probeDaemon();
 
-// Hoster plugins options page (chrome.runtime.openOptionsPage works from any extension page).
+// Hoster plugins options page & setup welcome page.
 document.getElementById("plugins-link").addEventListener("click", (e) => { e.preventDefault(); chrome.runtime.openOptionsPage(); });
+document.getElementById("welcome-link")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    chrome.tabs.create({ url: chrome.runtime.getURL("welcome.html") });
+});

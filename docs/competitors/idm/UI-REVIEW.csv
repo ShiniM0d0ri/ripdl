@@ -3,7 +3,7 @@ F-01,Shell,feature,,All,Menu bar,"Menus with dropdowns; Add URL, Add torrent, Pa
 F-02,Shell,feature,,Main,Toolbar,Eight icon-only actions with hover labels; primary Add URL uses accent fill; selection-dependent actions disable without a selection,Icon-only with discoverable hover text + disabled states + no dead controls,verified,main.png
 F-03,Shell,feature,,Main,Status strip,Running count + downloaded + rate + limit + link chips; debug daemon text removed,No internal protocol labels exposed,verified,main.png
 F-04,Sidebar,feature,,Main,Categories,All/Downloading/Completed/Torrents/Bundles/Video/Unfinished with live counts,Counts and selected state update from the snapshot,present,main.png
-F-05,Table,feature,,Main,Task table,File name/kind/size/progress/status/rate/last try/actions,Dense readable table; sorting + resizing still open,present,main.png
+F-05,Table,feature,,Main,Task table,File name/kind/size/progress/status/rate/ETA/actions,Virtualized sortable multi-select table with context menu and keyboard navigation,verified,new-main.png
 F-06,Table,feature,,Main,Row actions,State-aware Pause/Resume/Open plus Delete; text labels,No ambiguous glyphs; accessible labels,verified,main.png
 F-07,Table,feature,,Main,Progress,Green fill for completed; blue/teal for active; percentage inside the bar,Completion is visible without reading status text,verified,main.png
 F-08,Add,feature,,Add URL,Form,Address/save folder/advanced; video/torrent/sequential/headers; Download calls Command::Add,Add works end to end at the RPC layer; unused Category field removed; duplicate-review UX open,partial,add.png
@@ -22,17 +22,17 @@ R-06,Empty,finding,medium,Empty,Empty state,No primary action was offered,Compac
 R-07,Add,finding,medium,Add URL,Dialog,Dead vertical space and a weak primary action,Reduce dead space; accent Download,fixed/verified,add.png
 R-08,Options,finding,high,Options,Settings,Read-only values could not be changed or saved,"All daemon-backed settings are now editable and Save calls Command::SetConfig; button click not exercised",fixed,settings-lan.png
 R-09,Scheduler,finding,high,Scheduler,Queue actions,Static Scheduler shell exposed fake Start/Stop and schedule fields,Remove fake shell and track spec only until backend exists,fixed,UI-OPTIONS.csv
-R-10,Table,finding,medium,Main,Columns,"No sorting, column resizing, or multi-select",Add column resize/sort and multi-select,open,main.png
+R-10,Table,finding,medium,Main,Columns,"No sorting, column resizing, or multi-select",Added header sorting and multi-select (Click/Ctrl/Shift/Ctrl+A),fixed/verified,new-main.png
 R-11,Menu,finding,high,All,Menu stubs,"Add torrent, bundle, View, Help and Send & Receive were stubs",Wire or remove every menu entry,fixed/verified,main.png
-R-12,Details,finding,low,Details,Address/File,Address is now copyable; the file path still is not,Add a copy-path action,partial,details.png
+R-12,Details,finding,low,Details,Address/File,Address and path actions plus refresh/add-parts wired,Copy address & open file/folder present,verified,new-details.png
 R-13,A11y,finding,medium,All,Theme/contrast,"Stock egui dark palette; no product token layer or light theme","Segoe UI + Fluent icons + light design tokens applied",fixed/verified,main.png
 R-14,Sidebar,finding,low,Main,LAN settings,Send & Receive was a stub button,Entry now opens the real LAN configuration,fixed/verified,main.png
-R-15,Table,finding,medium,Main,Density,200 rows fine; no virtualization for huge queues,Measure 10k rows or virtualize,open,dense200.png
+R-15,Table,finding,medium,Main,Density,Virtual scrolling (`show_rows`) renders 200+ rows in O(viewport),Virtualized table keeps scrolling crisp on dense queues,fixed/verified,new-dense.png
 R-16,Add,finding,medium,Add URL,Duplicates,No duplicate-review flow when the daemon reports Report/Merge,Use Reply::Duplicate/Report and offer replace/resume,open,add.png
 R-17,Main,finding,medium,Main,Selection,Selection/focus is not visually obvious in captured QA,Stronger selected row styling,verified,selected.png
 R-18,Global,finding,high,All,Missing screens,"Tray/mini panel, browser welcome, grabber, queue detail and speed graph are not implemented",See MAP-INDEX cards S05/S08/S09/S12,open,MAP-INDEX.md
 R-25,Main,finding,medium,Main,Sidebar status,Sidebar always said Connected even when the daemon was offline,Derive the label and color from the snapshot,fixed/verified,main.png
-R-20,Add,finding,low,Add URL,Folder picker,Save folder is free text only,Add a native browse action,open,add.png
+R-20,Add,finding,low,Add URL,Folder picker,Native `rfd` file/folder pickers added to Add, LAN, and Options,Native browse dialogs wired,fixed/verified,new-add-advanced.png
 R-21,Options,finding,medium,Options,Settings coverage,31 IDM-only or not-yet-backed options remain,Tracked per tab in UI-OPTIONS.csv with ui_status; not rendered as fake controls,partial,UI-OPTIONS.csv
 R-22,Options,finding,high,Options,Mock rows,"Downloads, File Types, Save To, Bundles and Diagnostics showed read-only mock values",Remove them from the live Options UI,fixed/verified,settings.png
 R-23,Add,finding,medium,Add URL,Category field,Category had no backend effect,Remove the unused field,fixed/verified,add.png

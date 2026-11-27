@@ -1,1238 +1,2482 @@
-//! ripdl GUI: a thin Tauri shell over the daemon RPC.
-//!
-//! The window is pure static HTML/CSS/JS (IDM-style task manager) that talks
-//! to the local daemon through the commands below. The GUI owns no download
-//! logic; every feature already lives in the daemon/engine.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! Ripdl Desktop GUI (`eframe`/`egui`) — fast virtualized desktop shell over daemon RPC.
 
-use ripdl_core::bridge;
-use ripdl_core::categories::categorize;
-use ripdl_core::engine::percent_decode_lossy;
-use ripdl_core::rpc::{
-    BundlePart, Command, DaemonSettings, ExtensionStatus, Reply, Request, Response, TaskInfo,
-};
-use ripdl_core::task::{TaskKind, TaskState};
-use ripdl_core::transport;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
+mod ext_host;
+mod lucide_icons;
+mod model;
+mod rpc_worker;
 mod single_instance;
-mod webview_mem;
+mod theme;
+mod tray;
+mod vectors;
+mod views;
 
-/// Set once an in-app update has handed over to the installer. While it is
-/// set the GUI must not help: polling would auto-spawn the daemon the
-/// installer is trying to close (a windowless daemon makes Windows' Restart
-/// Manager stop an interactive install with "unable to close all
-/// applications"), and a close request must actually exit instead of
-/// minimizing to the tray.
-static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+use std::collections::HashSet;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
-/// One-shot RPC round trip against the daemon, with a single
-/// spawn-and-retry recovery: cold starts (fresh login after boot) make the
-/// user wait for the daemon otherwise.
-async fn rpc(cmd: Command) -> Result<Reply, String> {
-    if INSTALLING.load(std::sync::atomic::Ordering::Relaxed) {
-        // During an install the daemon is expected to be gone.
-        return rpc_once(cmd).await;
-    }
-    match rpc_once(cmd.clone()).await {
-        Ok(reply) => Ok(reply),
-        Err(_) => {
-            let _ = bridge::spawn_daemon_bg();
-            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-            rpc_once(cmd).await
+use eframe::egui::{self, Color32, CornerRadius, Rect, Stroke, StrokeKind};
+use ripdl_core::categories::Category;
+use ripdl_core::task::TaskState;
+use ripdl_core::torrent::looks_like_torrent_payload;
+
+use crate::model::{
+    count_filter, eta_text, humans_bin, matches_filter, sort_tasks, should_auto_open_onboarding,
+    AddDraft, AddMode, CachedDetails, DeleteConfirm, DetailsDraft, DuplicatePrompt,
+    FilePickTarget, LanDraft, OnboardingDraft, RefreshDraft, SettingsDraft, SettingsTab,
+    SidebarFilter, Snapshot, SortDir, SortKey, TaskRow, UiNotice,
+};
+use crate::rpc_worker::{is_installing, spawn_worker, UiCommand, UiEvent, WorkerHandle};
+use crate::theme::{
+    apply_visuals, configure_style, dialog_header, kind_visuals, metrics, paint_kind_pill,
+    paint_progress_bar, paint_sparkline, paint_status_pill, semibold, state_visuals, Palette,
+    ThemeMode,
+};
+use crate::tray::{TrayAction, TrayHandle};
+use crate::vectors::{
+    paint_brand_logo, paint_empty_illustration, paint_file_tile, paint_filter_empty_illustration,
+    paint_focus_ring, paint_icon, vector_button, vector_icon_button, IconId,
+};
+
+struct RipdlNativeApp {
+    worker: WorkerHandle,
+    tray_rx: mpsc::Receiver<TrayAction>,
+    _tray: Option<TrayHandle>,
+    theme_mode: ThemeMode,
+    filter: SidebarFilter,
+    sort_key: SortKey,
+    sort_dir: SortDir,
+    search: String,
+    focus_search: bool,
+    show_eta: bool,
+    show_peers: bool,
+    selected_ids: HashSet<String>,
+    anchor_id: Option<String>,
+    details: DetailsDraft,
+    cached_details: CachedDetails,
+    add: AddDraft,
+    refresh: RefreshDraft,
+    lan: LanDraft,
+    settings: SettingsDraft,
+    onboarding: OnboardingDraft,
+    onboarding_checked: bool,
+    delete_confirm: Option<DeleteConfirm>,
+    duplicate_prompt: Option<DuplicatePrompt>,
+    about_open: bool,
+    update_banner_dismissed: bool,
+    hide_to_tray: bool,
+    force_quit: bool,
+    notice: Option<UiNotice>,
+    last_details_poll: Instant,
+    last_lan_poll: Instant,
+    saved_window_size: Option<egui::Vec2>,
+}
+
+impl RipdlNativeApp {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        tray_rx: mpsc::Receiver<TrayAction>,
+        tray: Option<TrayHandle>,
+    ) -> Self {
+        let theme_mode = load_theme_mode();
+        configure_style(&cc.egui_ctx, theme_mode);
+        let worker = spawn_worker(cc.egui_ctx.clone());
+
+        Self {
+            worker,
+            tray_rx,
+            _tray: tray,
+            theme_mode,
+            filter: SidebarFilter::All,
+            sort_key: SortKey::Name,
+            sort_dir: SortDir::Asc,
+            search: String::new(),
+            focus_search: false,
+            show_eta: true,
+            show_peers: false,
+            selected_ids: HashSet::new(),
+            anchor_id: None,
+            details: DetailsDraft::default(),
+            cached_details: CachedDetails::default(),
+            add: AddDraft::default(),
+            refresh: RefreshDraft::default(),
+            lan: LanDraft::default(),
+            settings: SettingsDraft::default(),
+            onboarding: OnboardingDraft::default(),
+            onboarding_checked: false,
+            delete_confirm: None,
+            duplicate_prompt: None,
+            about_open: false,
+            update_banner_dismissed: false,
+            hide_to_tray: true,
+            force_quit: false,
+            notice: None,
+            last_details_poll: Instant::now(),
+            last_lan_poll: Instant::now(),
+            saved_window_size: None,
         }
     }
-}
 
-async fn rpc_once(cmd: Command) -> Result<Reply, String> {
-    let mut stream = transport::connect_daemon()
-        .await
-        .map_err(|e| format!("daemon not running ({e})"))?;
-    let req = Request { id: 1, cmd };
-    let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-    line.push('\n');
-    stream
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    let reply = tokio::io::BufReader::new(stream)
-        .lines()
-        .next_line()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("daemon closed without a reply")?;
-    let resp: Response =
-        serde_json::from_str(&reply).map_err(|e| format!("bad daemon reply: {e}"))?;
-    Ok(resp.reply)
-}
-
-fn download_root() -> std::path::PathBuf {
-    dirs::download_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
-/// File-name part of a URL (query/fragment stripped, percent-decoded).
-fn url_basename(url: &str) -> String {
-    let no_query = url.split(['?', '#']).next().unwrap_or(url);
-    let name = no_query.rsplit('/').next().unwrap_or("");
-    if name.is_empty() {
-        url.to_string()
-    } else {
-        percent_decode_lossy(name)
-    }
-}
-
-/// Subfolder for a new task. `Some("auto")`/`None` = core's
-/// auto-categorization; explicit picks honor the user ("other" = none).
-fn category_subdir_for(url: &str, category: Option<&str>) -> Option<&'static str> {
-    match category {
-        Some("auto") | None => categorize(&url_basename(url)).subdir(),
-        Some("video") => Some("Videos"),
-        Some("music") => Some("Music"),
-        Some("images") => Some("Images"),
-        Some("documents") => Some("Documents"),
-        Some("archives") => Some("Archives"),
-        Some("programs") => Some("Programs"),
-        _ => None,
-    }
-}
-
-#[tauri::command]
-async fn list_tasks() -> Result<Vec<TaskInfo>, String> {
-    let reply = rpc(Command::List).await?;
-    match reply {
-        Reply::Tasks { tasks } => Ok(tasks),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Queue a URL. `dest_dir` overrides the location entirely (the Add dialog
-/// passes an explicit user choice); otherwise category rules apply.
-#[tauri::command]
-async fn add_task(
-    url: String,
-    category: Option<String>,
-    dest_dir: Option<String>,
-    sequential: Option<bool>,
-    only_files: Option<Vec<usize>>,
-) -> Result<String, String> {
-    let dest = match dest_dir {
-        Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
-        _ => {
-            let mut d = download_root();
-            if let Some(sub) = category_subdir_for(&url, category.as_deref()) {
-                d.push(sub);
-            }
-            d
-        }
-    };
-    let _ = tokio::fs::create_dir_all(&dest).await;
-    let kind = if ripdl_core::torrent::looks_like_torrent_payload(&url) {
-        TaskKind::Torrent
-    } else {
-        TaskKind::Http
-    };
-    match rpc(Command::Add {
-        url,
-        dest_dir: Some(dest),
-        headers: Default::default(),
-        start_at: None,
-        kind,
-        sequential: sequential.unwrap_or(false),
-        only_files,
-        on_duplicate: Default::default(),
-    })
-    .await?
-    {
-        Reply::Added { id } => Ok(id),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Pre-add torrent preview for the Add dialog (qB-style file list before
-/// queuing). Magnets resolve over the swarm and can take a while.
-#[tauri::command]
-async fn torrent_preview(payload: String) -> Result<ripdl_core::torrent::TorrentPreviewSnapshot, String> {
-    match rpc(Command::TorrentPreview { payload }).await? {
-        Reply::TorrentPreview { preview } => Ok(preview),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Queue a video/stream page through the yt-dlp sidecar.
-#[tauri::command]
-async fn add_video_task(url: String, dest_dir: Option<String>) -> Result<String, String> {
-    let dest = match dest_dir {
-        Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
-        _ => download_root(),
-    };
-    let _ = tokio::fs::create_dir_all(&dest).await;
-    match rpc(Command::Add {
-        url,
-        dest_dir: Some(dest),
-        headers: Default::default(),
-        start_at: None,
-        kind: TaskKind::Video,
-        sequential: false,
-        only_files: None,
-        on_duplicate: Default::default(),
-    })
-    .await?
-    {
-        Reply::Added { id } => Ok(id),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Queue several direct links as **one** bundle task that owns a folder
-/// (`<dest>/<name>/<parts...>`). The dialog sends one URL per line; grouping
-/// and the folder name are the daemon's call unless the user typed a name.
-#[tauri::command]
-async fn add_bundle(
-    urls: Vec<String>,
-    name: Option<String>,
-    dest_dir: Option<String>,
-) -> Result<String, String> {
-    let dest = match dest_dir {
-        Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
-        _ => download_root(),
-    };
-    let _ = tokio::fs::create_dir_all(&dest).await;
-    let parts: Vec<BundlePart> = urls
-        .into_iter()
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())
-        .map(|url| BundlePart {
-            url,
-            filename: None,
-            headers: Default::default(),
-            state: TaskState::Queued,
-            downloaded: 0,
-            total: None,
-            seq: None,
-            error: None,
-            attempted: false,
-        })
-        .collect();
-    if parts.is_empty() {
-        return Err("no links given".into());
-    }
-    let name = name.filter(|n| !n.trim().is_empty());
-    match rpc(Command::AddBundle {
-        name,
-        dest_dir: Some(dest),
-        parts,
-        start_at: None,
-    })
-    .await?
-    {
-        Reply::Added { id } => Ok(id),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Append links to an existing bundle ("I forgot part 7"). New links must
-/// name parts of that bundle; URLs already in it are skipped. Returns how
-/// many parts actually joined.
-#[tauri::command]
-async fn add_bundle_parts(id: String, urls: Vec<String>) -> Result<usize, String> {
-    let parts: Vec<BundlePart> = urls
-        .into_iter()
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())
-        .map(|url| BundlePart {
-            url,
-            filename: None,
-            headers: Default::default(),
-            state: TaskState::Queued,
-            downloaded: 0,
-            total: None,
-            seq: None,
-            error: None,
-            attempted: false,
-        })
-        .collect();
-    if parts.is_empty() {
-        return Err("no links given".into());
-    }
-    match rpc(Command::AddBundleParts { id, parts }).await? {
-        Reply::BundlePartsAdded { added, .. } => Ok(added),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Group a selection without queueing anything: the Add-bundle dialog shows
-/// what the links would become, so "12 links" is never a leap of faith.
-#[tauri::command]
-async fn preview_bundle(urls: Vec<String>) -> Result<Vec<ripdl_core::bundle::Group>, String> {
-    let links: Vec<BundlePart> = urls
-        .into_iter()
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty())
-        .map(|url| BundlePart {
-            url,
-            filename: None,
-            headers: Default::default(),
-            state: TaskState::Queued,
-            downloaded: 0,
-            total: None,
-            seq: None,
-            error: None,
-            attempted: false,
-        })
-        .collect();
-    match rpc(Command::PreviewBundle { links }).await? {
-        Reply::BundlePreview { groups } => Ok(groups),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-async fn pause_task(id: String) -> Result<(), String> {
-    expect_ok(rpc(Command::Pause { id }).await?)
-}
-
-#[tauri::command]
-async fn resume_task(id: String) -> Result<(), String> {
-    expect_ok(rpc(Command::Resume { id }).await?)
-}
-
-/// Change a torrent task's per-file selection (`only_files` = None
-/// selects everything; works mid-flight and persists across restarts).
-#[tauri::command]
-async fn update_selection(id: String, only_files: Option<Vec<usize>>) -> Result<(), String> {
-    expect_ok(rpc(Command::UpdateTorrentSelection { id, only_files }).await?)
-}
-
-/// Remove the queue record; `delete_files` also erases the downloaded
-/// file(s) and their sidecars from disk.
-#[tauri::command]
-async fn remove_task(id: String, delete_files: Option<bool>) -> Result<(), String> {
-    expect_ok(
-        rpc(Command::Remove {
-            id,
-            delete_files: delete_files.unwrap_or(false),
-        })
-        .await?,
-    )
-}
-
-/// Quit the whole app (File > Exit). Tray "Exit" uses its own handler; this
-/// is the webview's entry point.
-#[tauri::command]
-fn exit_app(app: tauri::AppHandle) {
-    app.exit(0);
-}
-
-/// Update check through the daemon.
-#[tauri::command]
-async fn check_update() -> Result<ripdl_core::update::UpdateInfo, String> {
-    match rpc(Command::CheckUpdate).await? {
-        Reply::Update { info } => Ok(info),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// One-click upgrade: daemon downloads the verified setup and runs it.
-#[tauri::command]
-async fn install_update() -> Result<(), String> {
-    let out = expect_ok(rpc(Command::UpdateInstall).await?);
-    if out.is_ok() {
-        // The installer is running now: stop spawning daemons and let the
-        // next close request through (see INSTALLING).
-        INSTALLING.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    out
-}
-
-/// The running build's version (Help > About). Read from the crate rather
-/// than tauri.conf.json so it can never drift from the binaries.
-#[tauri::command]
-fn app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
-}
-
-fn managed_extension_dir() -> Result<std::path::PathBuf, String> {
-    Ok(transport::app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("extension"))
-}
-
-fn bundled_extension_dir() -> Result<std::path::PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let start = exe.parent().ok_or("GUI executable has no parent folder")?;
-    for dir in start.ancestors().take(5) {
-        let candidate = dir.join("ext");
-        if candidate.join("manifest.json").is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(format!("cannot find bundled ext folder beside {}", exe.display()))
-}
-
-fn sync_managed_extension() -> Result<ripdl_core::extplug::ManagedCopy, String> {
-    ripdl_core::extplug::sync_managed(&bundled_extension_dir()?, &managed_extension_dir()?)
-}
-
-#[derive(serde::Serialize)]
-struct BrowserExtensionInfo {
-    folder: String,
-    folder_version: Option<String>,
-    bundled_version: String,
-    loaded: ExtensionStatus,
-    browser: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-struct ChromiumBrowser {
-    name: &'static str,
-    extensions_url: &'static str,
-}
-
-#[cfg(windows)]
-fn default_chromium_browser() -> Option<ChromiumBrowser> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
-            "/v",
-            "ProgId",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let prog_id = text.split_whitespace().last()?.to_ascii_lowercase();
-    if prog_id.starts_with("chromehtml") {
-        Some(ChromiumBrowser { name: "Chrome", extensions_url: "chrome://extensions" })
-    } else if prog_id.starts_with("msedgehtm") {
-        Some(ChromiumBrowser { name: "Edge", extensions_url: "edge://extensions" })
-    } else if prog_id.starts_with("bravehtml") {
-        Some(ChromiumBrowser { name: "Brave", extensions_url: "brave://extensions" })
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn default_chromium_browser() -> Option<ChromiumBrowser> {
-    let output = std::process::Command::new("xdg-settings")
-        .args(["get", "default-web-browser"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let desktop_id = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    if desktop_id.contains("microsoft-edge") || desktop_id.contains("msedge") {
-        Some(ChromiumBrowser { name: "Edge", extensions_url: "edge://extensions" })
-    } else if desktop_id.contains("brave") {
-        Some(ChromiumBrowser { name: "Brave", extensions_url: "brave://extensions" })
-    } else if desktop_id.contains("chrome") || desktop_id.contains("chromium") {
-        Some(ChromiumBrowser { name: "Chrome", extensions_url: "chrome://extensions" })
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn default_chromium_browser() -> Option<ChromiumBrowser> {
-    None
-}
-
-#[tauri::command]
-async fn browser_extension_info(dir: String) -> Result<BrowserExtensionInfo, String> {
-    let managed = managed_extension_dir()?;
-    let bundled_version = ripdl_core::extplug::folder_version(&bundled_extension_dir()?)
-        .ok_or("bundled extension has no readable manifest version")?;
-    let loaded = match rpc(Command::GetConfig).await? {
-        Reply::Config { extension, .. } => extension,
-        other => return Err(format!("unexpected daemon reply: {other:?}")),
-    };
-    let folder = if dir.trim().is_empty() {
-        managed
-    } else {
-        std::path::PathBuf::from(dir.trim())
-    };
-    Ok(BrowserExtensionInfo {
-        folder_version: ripdl_core::extplug::folder_version(&folder),
-        folder: folder.to_string_lossy().into_owned(),
-        bundled_version,
-        loaded,
-        browser: default_chromium_browser().map(|b| b.name.to_string()),
-    })
-}
-
-#[tauri::command]
-async fn open_browser_extensions(dir: String, browser: Option<String>) -> Result<String, String> {
-    let _ = tauri::async_runtime::spawn_blocking(sync_managed_extension)
-        .await
-        .map_err(|e| e.to_string())??;
-    let browser = match browser.as_deref().unwrap_or("") {
-        "" => default_chromium_browser()
-            .ok_or("could not detect a supported default browser; select Chrome, Edge, or Brave")?,
-        "chrome" => ChromiumBrowser { name: "Chrome", extensions_url: "chrome://extensions" },
-        "edge" => ChromiumBrowser { name: "Edge", extensions_url: "edge://extensions" },
-        "brave" => ChromiumBrowser { name: "Brave", extensions_url: "brave://extensions" },
-        _ => return Err("unsupported browser selection".into()),
-    };
-    let folder = if dir.trim().is_empty() {
-        managed_extension_dir()?
-    } else {
-        std::path::PathBuf::from(dir.trim())
-    };
-    let version = ripdl_core::extplug::folder_version(&folder)
-        .ok_or_else(|| format!("{} has no readable extension manifest", folder.display()))?;
-    open_extensions_page(browser).map_err(|e| format!("could not open {} extensions: {e}", browser.name))?;
-    Ok(format!(
-        "Opened {}. Extension folder: {} (v{}).",
-        browser.name,
-        folder.display(),
-        version
-    ))
-}
-
-#[cfg(windows)]
-fn open_extensions_page(browser: ChromiumBrowser) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-
-    let relative = match browser.name {
-        "Chrome" => "Google/Chrome/Application/chrome.exe",
-        "Edge" => "Microsoft/Edge/Application/msedge.exe",
-        "Brave" => "BraveSoftware/Brave-Browser/Application/brave.exe",
-        _ => return Err(std::io::Error::other("unsupported browser")),
-    };
-    let executable_name = relative.rsplit('/').next().unwrap_or_default();
-    let mut candidates = Vec::new();
-    for hive in ["HKCU", "HKLM"] {
-        let key = format!(r"{hive}\Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}");
-        if let Ok(output) = std::process::Command::new("reg")
-            .args(["query", &key, "/ve"])
-            .creation_flags(0x0800_0000)
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                if let Some(value) = text.lines().find_map(|line| line.split_once("REG_SZ").map(|(_, value)| value.trim().trim_matches('"'))) {
-                    candidates.push(std::path::PathBuf::from(value));
-                }
-            }
-        }
-    }
-    for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
-        if let Some(root) = std::env::var_os(variable) {
-            candidates.push(std::path::PathBuf::from(root).join(relative));
-        }
-    }
-    let executable = candidates.into_iter().find(|path| path.is_file())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} executable not found; open {} manually", browser.name, browser.extensions_url)))?;
-    std::process::Command::new(executable)
-        .arg(browser.extensions_url)
-        .creation_flags(0x0800_0000)
-        .spawn()
-        .map(|_| ())
-}
-
-#[cfg(not(windows))]
-fn open_extensions_page(browser: ChromiumBrowser) -> std::io::Result<()> {
-    let programs: &[&str] = match browser.name {
-        "Chrome" => &["google-chrome", "chromium", "chromium-browser"],
-        "Edge" => &["microsoft-edge", "microsoft-edge-stable"],
-        "Brave" => &["brave-browser", "brave"],
-        _ => return Err(std::io::Error::other("unsupported browser")),
-    };
-    for program in programs {
-        match std::process::Command::new(program).arg(browser.extensions_url).spawn() {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} executable not found; open {} manually", browser.name, browser.extensions_url)))
-}
-
-/// Settings line: the extension folder's manifest version beside this app's.
-#[derive(serde::Serialize)]
-struct ExtFolder {
-    /// `None` when the folder has no readable `manifest.json`.
-    version: Option<String>,
-    app: String,
-    /// `same`, `older` (the folder predates this app) or `newer`; `None` without a version.
-    skew: Option<&'static str>,
-}
-
-#[tauri::command]
-fn extension_folder(dir: String) -> ExtFolder {
-    let dir = dir.trim();
-    let version = if dir.is_empty() {
-        None
-    } else {
-        ripdl_core::extplug::folder_version(std::path::Path::new(dir))
-    };
-    let app = app_version();
-    let skew = version
-        .as_deref()
-        .map(|v| match ripdl_core::update::compare_versions(v, &app) {
-            std::cmp::Ordering::Equal => "same",
-            std::cmp::Ordering::Less => "older",
-            std::cmp::Ordering::Greater => "newer",
+    fn set_notice(&mut self, text: String, is_error: bool) {
+        self.notice = Some(UiNotice {
+            text,
+            is_error,
+            until: Instant::now() + Duration::from_secs(5),
         });
-    ExtFolder { version, app, skew }
-}
-
-/// Open a URL in the user's browser (update banner, Help menu).
-#[tauri::command]
-fn open_url(url: String) -> Result<(), String> {
-    if !url.starts_with("https://") {
-        return Err(format!("not an https url: {url}"));
     }
-    open_with_default(&url).map_err(|e| e.to_string())
-}
 
-#[cfg(windows)]
-fn open_with_default(url: &str) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // cmd start is the reliable way to hand a URL to the default handler
-    // without an extra dependency; the empty arg eats quoting hazards.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-}
-
-#[cfg(not(windows))]
-fn open_with_default(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let prog = "open";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let prog = "xdg-open";
-    std::process::Command::new(prog).arg(url).spawn().map(|_| ())
-}
-
-/// Native directory picker for the Add dialog's "Save to" field.
-#[tauri::command]
-async fn pick_dir() -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        rfd::FileDialog::new()
-            .set_title("Choose download folder")
-            .pick_folder()
-            .map(|p| p.to_string_lossy().into_owned())
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// Native file picker for "Add Torrent" (.torrent files).
-#[tauri::command]
-async fn pick_file() -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        rfd::FileDialog::new()
-            .set_title("Choose torrent file")
-            .add_filter("Torrent files", &["torrent"])
-            .pick_file()
-            .map(|p| p.to_string_lossy().into_owned())
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// Native file picker for the Settings "Install hoster plugin" flow.
-#[tauri::command]
-async fn pick_js_file() -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        rfd::FileDialog::new()
-            .set_title("Choose hoster plugin script")
-            .add_filter("Script plugins", &["js"])
-            .pick_file()
-            .map(|p| p.to_string_lossy().into_owned())
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// Copy a user script into the selected extension's `hosts/local/` folder.
-/// The app-managed copy is the default; `extension_dir` selects a manual copy.
-#[tauri::command]
-async fn install_plugin(path: String) -> Result<String, String> {
-    let managed = managed_extension_dir()?;
-    let override_dir = match rpc(Command::GetConfig).await? {
-        Reply::Config { settings, .. } => settings.extension_dir,
-        other => return Err(format!("unexpected daemon reply: {other:?}")),
-    };
-    let extension_dir = override_dir.unwrap_or_else(|| managed.clone());
-    if extension_dir == managed {
-        tauri::async_runtime::spawn_blocking(sync_managed_extension)
-            .await
-            .map_err(|e| e.to_string())??;
+    fn any_modal_open(&self) -> bool {
+        self.duplicate_prompt.is_some()
+            || self.onboarding.open
+            || self.add.open
+            || self.settings.open
+            || self.lan.open
+            || self.refresh.open
+            || self.details.task_id.is_some()
+            || self.delete_confirm.is_some()
+            || self.about_open
     }
-    let content = std::fs::read(&path).map_err(|e| format!("{}: {e}", path))?;
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    ripdl_core::extplug::install(std::path::Path::new(&extension_dir), &name, &content)
-}
 
-/// Native file picker for a LAN send (any file).
-#[tauri::command]
-async fn pick_any_file() -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        rfd::FileDialog::new()
-            .set_title("Choose a file to send")
-            .pick_file()
-            .map(|p| p.to_string_lossy().into_owned())
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// LAN send/receive (thin wrappers over the daemon's drop box)
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-async fn lan_info() -> Result<ripdl_core::rpc::LanInfo, String> {
-    match rpc(Command::LanInfo).await? {
-        Reply::Lan { info } => Ok(info),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-async fn lan_peers() -> Result<Vec<ripdl_core::lan::LanPeer>, String> {
-    match rpc(Command::LanPeers).await? {
-        Reply::LanPeers { peers } => Ok(peers),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-async fn lan_send(url: String, code: String, path: String) -> Result<String, String> {
-    let cmd = Command::LanSend {
-        url,
-        code,
-        path: std::path::PathBuf::from(path),
-    };
-    match rpc(cmd).await? {
-        Reply::LanSend { id } => Ok(id),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-async fn lan_sends() -> Result<Vec<ripdl_core::rpc::LanSendInfo>, String> {
-    match rpc(Command::LanSends).await? {
-        Reply::LanSends { sends } => Ok(sends),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-#[tauri::command]
-async fn lan_forget(id: String) -> Result<(), String> {
-    expect_ok(rpc(Command::LanSendForget { id }).await?)
-}
-
-#[tauri::command]
-async fn lan_new_code() -> Result<ripdl_core::rpc::LanInfo, String> {
-    match rpc(Command::LanNewCode).await? {
-        Reply::Lan { info } => Ok(info),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Toggle receiving / trusted mode by patching the live settings, then
-/// return the state the daemon actually reached (a port clash shows up as
-/// `running: false` instead of a silent lie).
-#[tauri::command]
-async fn lan_configure(
-    enabled: Option<bool>,
-    open: Option<bool>,
-) -> Result<ripdl_core::rpc::LanInfo, String> {
-    let mut settings = match rpc(Command::GetConfig).await? {
-        Reply::Config { settings, .. } => settings,
-        other => return Err(format!("unexpected daemon reply: {other:?}")),
-    };
-    if let Some(v) = enabled {
-        settings.lan_enabled = Some(v);
-    }
-    if let Some(v) = open {
-        settings.lan_open = Some(v);
-    }
-    match rpc(Command::SetConfig { settings }).await? {
-        Reply::Config { .. } => {}
-        Reply::Error { message } => return Err(message),
-        other => return Err(format!("unexpected daemon reply: {other:?}")),
-    }
-    lan_info().await
-}
-
-/// Files/peers/trackers snapshot for one torrent task.
-#[tauri::command]
-async fn torrent_details(id: String) -> Result<ripdl_core::torrent::TorrentDetailsSnapshot, String> {
-    match rpc(Command::Details { id }).await? {
-        Reply::TorrentDetails { details } => Ok(details),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Engine view for an HTTP/video task: output file, resume identity and the
-/// byte-range segment map (what the details dialog renders).
-#[tauri::command]
-async fn task_details(id: String) -> Result<ripdl_core::rpc::TaskDetailsSnapshot, String> {
-    match rpc(Command::Details { id }).await? {
-        Reply::TaskDetails { details } => Ok(details),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-#[derive(serde::Serialize)]
-struct RefreshOutcome {
-    /// Durable bytes kept on disk.
-    kept: u64,
-    total: Option<u64>,
-    /// Dry-run only (`probe_only`): why the kept bytes might not line up.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warning: Option<String>,
-}
-
-/// Point a paused/failed download at a fresh URL (expired signed link) and
-/// resume it: the daemon keeps the bytes already downloaded. `part` targets
-/// one part of a bundle (by its part number) instead of the whole task.
-#[tauri::command]
-async fn refresh_url(
-    id: String,
-    url: String,
-    part: Option<u32>,
-    probe_only: Option<bool>,
-) -> Result<RefreshOutcome, String> {
-    match rpc(Command::RefreshUrl {
-        id,
-        url,
-        resume: true,
-        part,
-        probe_only: probe_only.unwrap_or(false),
-    })
-    .await?
-    {
-        Reply::Refreshed { kept, total, warning, .. } => Ok(RefreshOutcome { kept, total, warning }),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Open the task's folder (or reveal the completed file in it).
-#[tauri::command]
-async fn open_path(path: String, reveal: Option<String>) -> Result<(), String> {
-    let p = std::path::PathBuf::from(&path);
-    if !p.exists() {
-        return Err(format!("path does not exist: {path}"));
-    }
-    tokio::task::spawn_blocking(move || open_in_explorer(p, reveal))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[cfg(windows)]
-fn open_in_explorer(p: std::path::PathBuf, reveal: Option<String>) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    let mut cmd = std::process::Command::new("explorer.exe");
-    match reveal {
-        // /select,<file> reveals the exact file inside its folder.
-        Some(f) => {
-            let full = p.join(&f);
-            if full.exists() {
-                cmd.arg(format!("/select,{}", full.display()));
-            } else {
-                cmd.arg(&p);
-            }
-        }
-        None => {
-            cmd.arg(&p);
-        }
-    }
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
-}
-
-#[cfg(not(windows))]
-fn open_in_explorer(p: std::path::PathBuf, _reveal: Option<String>) -> Result<(), String> {
-    std::process::Command::new("xdg-open")
-        .arg(p)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn download_root_path() -> String {
-    download_root().to_string_lossy().into_owned()
-}
-
-/// Current daemon settings (config.json contents).
-#[tauri::command]
-async fn get_config() -> Result<DaemonSettings, String> {
-    match rpc(Command::GetConfig).await? {
-        Reply::Config { settings, .. } => Ok(settings),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Live HTTP-bond uplinks for the status-bar chips. Empty while bonding is
-/// off (the chips stay hidden; the Settings sentence is the "off" story).
-#[tauri::command]
-async fn bond_links() -> Result<Vec<ripdl_core::rpc::BondLink>, String> {
-    match rpc(Command::GetConfig).await? {
-        Reply::Config { bond_links, .. } => Ok(bond_links),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// One internet uplink bonding would spread connections across. Shown in
-/// Settings so a single-uplink machine can see the toggle is a no-op.
-#[derive(serde::Serialize)]
-struct UplinkView {
-    name: String,
-    addr: String,
-    default: bool,
-}
-
-/// Uplinks detected right now (same discovery the daemon uses for torrent
-/// bonding; HTTP tasks read it per download).
-#[tauri::command]
-fn bond_nics() -> Vec<UplinkView> {
-    ripdl_core::engine::bonded_nics()
-        .into_iter()
-        .map(|n| UplinkView {
-            name: n.name,
-            addr: n.addr.to_string(),
-            default: n.is_default_route,
-        })
-        .collect()
-}
-
-/// Live torrent-bonding state. The setting alone can lie: the shared session
-/// fixes `bind_ips` when it is created, so a toggle applies only after a
-/// daemon restart. `text` is the same sentence `ripdl config` prints.
-#[derive(serde::Serialize)]
-struct BondState {
-    text: String,
-    active: bool,
-}
-
-#[tauri::command]
-async fn bond_state() -> Result<BondState, String> {
-    match rpc(Command::GetConfig).await? {
-        Reply::Config {
-            settings,
-            torrent_session,
-            torrent_bind,
-            torrent_rates,
-            torrent_unreachable,
-            ..
-        } => {
-            let bind: Vec<std::net::IpAddr> = torrent_bind
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            let mut text = ripdl_core::engine::describe_torrent_bond(
-                settings.bond_interfaces(),
-                torrent_session,
-                &bind,
-            );
-            // Measured per-uplink throughput: the reason a slow tether gets
-            // skipped ("Wi-Fi 7.0 MB/s, Ethernet 2 idle").
-            if torrent_session && !torrent_rates.is_empty() {
-                let nics = ripdl_core::engine::bonded_nics();
-                // Fold v4+v6 of the same interface into one number.
-                let mut merged: Vec<(String, f64)> = Vec::new();
-                for (ip, rate) in &torrent_rates {
-                    let addr: Option<std::net::IpAddr> = ip.parse().ok();
-                    let name = addr
-                        .and_then(|a| {
-                            nics.iter()
-                                .find(|n| {
-                                    std::net::IpAddr::V4(n.addr) == a
-                                        || n.v6.map(std::net::IpAddr::V6) == Some(a)
-                                })
-                                .map(|n| n.name.clone())
-                        })
-                        .unwrap_or_else(|| ip.clone());
-                    match merged.iter_mut().find(|(n, _)| *n == name) {
-                        Some((_, r)) => *r += *rate,
-                        None => merged.push((name, *rate)),
+    fn drain_worker_events(&mut self) {
+        for ev in self.worker.drain_events() {
+            match ev {
+                UiEvent::Notice { text, is_error } => self.set_notice(text, is_error),
+                UiEvent::Details {
+                    task_id,
+                    http,
+                    torrent,
+                    error,
+                } => {
+                    self.cached_details = CachedDetails {
+                        task_id,
+                        loading: false,
+                        http,
+                        torrent,
+                        error,
+                    };
+                }
+                UiEvent::TorrentPreview { payload, result } => {
+                    if self.add.torrent_preview_for == payload {
+                        self.add.torrent_preview_busy = false;
+                        match result {
+                            Ok(prev) => {
+                                self.add.torrent_selected = (0..prev.files.len()).collect();
+                                self.add.torrent_preview = Some(prev);
+                                self.add.torrent_preview_error = None;
+                            }
+                            Err(e) => self.add.torrent_preview_error = Some(e),
+                        }
                     }
                 }
-                let parts: Vec<String> = merged
-                    .iter()
-                    .map(|(name, rate)| {
-                        if *rate < 1024.0 {
-                            format!("{name} idle")
-                        } else {
-                            format!("{name} {:.1} MB/s", rate / 1_048_576.0)
+                UiEvent::BundlePreview(res) => {
+                    self.add.bundle_preview_busy = false;
+                    match res {
+                        Ok(groups) => {
+                            if let Some(first) = groups.first() {
+                                if self.add.bundle_name.trim().is_empty() {
+                                    self.add.bundle_name = first.name.clone();
+                                }
+                            }
+                            self.add.bundle_preview = Some(groups);
+                            self.add.bundle_preview_error = None;
                         }
-                    })
-                    .collect();
-                text = format!("{text} \u{2014} {}", parts.join(" \u{00b7} "));
+                        Err(e) => self.add.bundle_preview_error = Some(e),
+                    }
+                }
+                UiEvent::RefreshProbe { url, result } => {
+                    if self.refresh.url.trim() == url {
+                        self.refresh.probing = false;
+                        match result {
+                            Ok((kept, total, warning)) => {
+                                self.refresh.verdict_ok = true;
+                                let tot = total.map(humans_bin).unwrap_or_else(|| "?".into());
+                                self.refresh.verdict_text = match warning {
+                                    Some(w) => format!("Keeps {} of {tot} — {w}", humans_bin(kept)),
+                                    None => format!("Verified — keeps {} of {tot} already on disk", humans_bin(kept)),
+                                };
+                            }
+                            Err(e) => {
+                                self.refresh.verdict_ok = false;
+                                self.refresh.verdict_text = e;
+                            }
+                        }
+                    }
+                }
+                UiEvent::RefreshCommitted { id, result } => {
+                    self.refresh.submitting = false;
+                    match result {
+                        Ok((kept, total)) => {
+                            self.refresh.open = false;
+                            let tot = total.map(humans_bin).unwrap_or_else(|| "?".into());
+                            self.set_notice(
+                                format!("Address refreshed (kept {} of {tot}).", humans_bin(kept)),
+                                false,
+                            );
+                            if self.details.task_id.as_deref() == Some(id.as_str()) {
+                                self.worker.send(UiCommand::FetchDetails { id });
+                            }
+                        }
+                        Err(e) => self.refresh.error = Some(e),
+                    }
+                }
+                UiEvent::AddPartsResult { id, result } => match result {
+                    Ok(added) => {
+                        self.details.add_parts_open = false;
+                        self.details.add_parts_text.clear();
+                        let msg = if added == 0 {
+                            "No new parts added (already present).".to_string()
+                        } else {
+                            format!("Added {added} missing part(s) — bundle restarting.")
+                        };
+                        self.set_notice(msg, false);
+                        self.worker.send(UiCommand::FetchDetails { id });
+                    }
+                    Err(e) => self.details.add_parts_error = Some(e),
+                },
+                UiEvent::AddDone(res) => {
+                    self.add.submitting = false;
+                    match res {
+                        Ok(new_id) => {
+                            self.add.open = false;
+                            self.duplicate_prompt = None;
+                            self.selected_ids.clear();
+                            self.selected_ids.insert(new_id.clone());
+                            self.anchor_id = Some(new_id);
+                            self.set_notice("Download added to queue.".into(), false);
+                        }
+                        Err(e) => self.add.error = Some(e),
+                    }
+                }
+                UiEvent::DuplicatePrompt { request, existing } => {
+                    self.add.submitting = false;
+                    self.add.open = false;
+                    self.duplicate_prompt = Some(DuplicatePrompt { request, existing });
+                }
+                UiEvent::FilePicked { target, path } => {
+                    let s = path.display().to_string();
+                    match target {
+                        FilePickTarget::AddTorrentOpen => {
+                            self.add.reset_for_open();
+                            self.add.mode = AddMode::Torrent;
+                            self.add.url_text = s.clone();
+                            self.add.torrent_preview_for = s.clone();
+                            self.add.torrent_preview_busy = true;
+                            self.worker.send(UiCommand::TorrentPreview { payload: s });
+                        }
+                        FilePickTarget::AddTorrentPayload => {
+                            self.add.mode = AddMode::Torrent;
+                            self.add.url_text = s.clone();
+                            self.add.torrent_preview_for = s.clone();
+                            self.add.torrent_preview_busy = true;
+                            self.worker.send(UiCommand::TorrentPreview { payload: s });
+                        }
+                        FilePickTarget::AddDestDir => self.add.dest_dir = s,
+                        FilePickTarget::SettingsDownloadDir => {
+                            self.settings.default_download_dir = s;
+                            self.settings.dirty = true;
+                        }
+                        FilePickTarget::SettingsYtDlp => {
+                            self.settings.ytdlp_path = s;
+                            self.settings.dirty = true;
+                        }
+                        FilePickTarget::SettingsExtensionDir => {
+                            self.settings.extension_dir = s;
+                            self.settings.dirty = true;
+                        }
+                        FilePickTarget::SettingsLanDir => {
+                            self.settings.lan_dir = s;
+                            self.settings.dirty = true;
+                        }
+                        FilePickTarget::OnboardingDownloadDir => {
+                            self.onboarding.download_dir = s;
+                        }
+                        FilePickTarget::SettingsPluginScript => {
+                            self.worker.send(UiCommand::InstallPlugin {
+                                path,
+                                override_dir: self.settings.extension_dir.clone(),
+                            });
+                        }
+                        FilePickTarget::LanSendFile => {
+                            let url = self.lan.send_to.trim().to_string();
+                            let code = self.lan.send_code.trim().to_string();
+                            if !url.is_empty() {
+                                self.worker.send(UiCommand::LanSend { url, code, path });
+                            }
+                        }
+                    }
+                }
+                UiEvent::ConfigSaved(res) => match res {
+                    Ok(()) => {
+                        self.settings.open = false;
+                        self.settings.loaded = false;
+                        self.set_notice("Options saved.".into(), false);
+                    }
+                    Err(e) => self.settings.error = Some(e),
+                },
+                UiEvent::HostRegisterResult(res) => match res {
+                    Ok(msg) => self.onboarding.host_status = Some((true, msg)),
+                    Err(msg) => self.onboarding.host_status = Some((false, msg)),
+                },
             }
-            if !torrent_unreachable.is_empty() {
-                text = format!(
-                    "{text} \u{2014} skipped {} (no working path)",
-                    torrent_unreachable.join(", ")
-                );
-            }
-            Ok(BondState {
-                active: torrent_session && !bind.is_empty(),
-                text,
-            })
         }
-        other => Err(format!("unexpected daemon reply: {other:?}")),
     }
-}
 
-/// Stop the daemon and let the bridge spawn a fresh one. Needed for settings
-/// fixed at torrent-session creation (NIC bonding); active transfers resume
-/// from their records/sidecars.
-#[tauri::command]
-async fn restart_daemon() -> Result<(), String> {
-    // A stop cancels runners, and the queue may record them as Paused (it
-    // races the process exit). Remember what was moving and replay resume on
-    // the fresh daemon so "active transfers resume" is deterministic.
-    let running: Vec<String> = match rpc_once(Command::List).await {
-        Ok(Reply::Tasks { tasks }) => tasks
+    fn filtered_rows<'a>(&self, snap: &'a Snapshot) -> Vec<&'a TaskRow> {
+        let mut rows: Vec<&TaskRow> = snap
+            .tasks
+            .iter()
+            .filter(|t| matches_filter(t, self.filter, &self.search))
+            .collect();
+        sort_tasks(&mut rows, self.sort_key, self.sort_dir);
+        rows
+    }
+
+    fn open_details_for(&mut self, id: String) {
+        self.details.task_id = Some(id.clone());
+        self.details.synced_selection_for.clear();
+        self.details.add_parts_open = false;
+        self.cached_details.loading = true;
+        self.last_details_poll = Instant::now();
+        self.worker.send(UiCommand::FetchDetails { id });
+    }
+
+    fn open_refresh_for(&mut self, row: &TaskRow) {
+        self.refresh = RefreshDraft {
+            open: true,
+            task_id: row.id.clone(),
+            task_name: row.name.clone(),
+            part_seq: None,
+            url: row.url.clone(),
+            last_probed_url: String::new(),
+            probing: false,
+            verdict_ok: false,
+            verdict_text: String::new(),
+            submitting: false,
+            error: None,
+            resume_after: true,
+        };
+    }
+
+    fn request_delete(&mut self, snap: &Snapshot, ids: Vec<String>, delete_files: bool) {
+        if ids.is_empty() {
+            return;
+        }
+        let label = if ids.len() == 1 {
+            snap.tasks
+                .iter()
+                .find(|t| t.id == ids[0])
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "selected item".into())
+        } else {
+            format!("{} selected items", ids.len())
+        };
+        self.delete_confirm = Some(DeleteConfirm {
+            ids,
+            label,
+            delete_files,
+        });
+    }
+
+    fn toggle_theme(&mut self, ctx: &egui::Context) {
+        self.theme_mode = match self.theme_mode {
+            ThemeMode::Light => ThemeMode::Dark,
+            ThemeMode::Dark => ThemeMode::Light,
+        };
+        apply_visuals(ctx, self.theme_mode);
+        save_theme_mode(self.theme_mode);
+    }
+
+    fn handle_shortcuts_and_drop(&mut self, ctx: &egui::Context, snap: &Snapshot) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(first_file) = dropped.first() {
+            let path = first_file.path();
+            let s = path.display().to_string();
+            self.add.reset_for_open();
+            if looks_like_torrent_payload(&s)
+                || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+            {
+                self.add.mode = AddMode::Torrent;
+                self.add.url_text = s.clone();
+                self.add.torrent_preview_for = s.clone();
+                self.add.torrent_preview_busy = true;
+                self.worker.send(UiCommand::TorrentPreview { payload: s });
+            } else {
+                self.add.url_text = s;
+            }
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.duplicate_prompt.is_some() {
+                self.duplicate_prompt = None;
+                return;
+            }
+            if self.delete_confirm.is_some() {
+                self.delete_confirm = None;
+                return;
+            }
+            if self.details.add_parts_open {
+                self.details.add_parts_open = false;
+                return;
+            }
+            if self.refresh.open {
+                self.refresh.open = false;
+                return;
+            }
+            if self.lan.open {
+                self.lan.open = false;
+                return;
+            }
+            if self.details.task_id.is_some() {
+                self.details.task_id = None;
+                return;
+            }
+            if self.settings.open {
+                self.settings.open = false;
+                return;
+            }
+            if self.onboarding.open {
+                self.onboarding.open = false;
+                return;
+            }
+            if self.add.open {
+                self.add.open = false;
+                return;
+            }
+            if self.about_open {
+                self.about_open = false;
+                return;
+            }
+            if !self.search.is_empty() {
+                self.search.clear();
+                return;
+            }
+        }
+
+        let cmd = ctx.input(|i| i.modifiers.command);
+        if cmd && ctx.input(|i| i.key_pressed(egui::Key::N)) {
+            self.add.reset_for_open();
+            return;
+        }
+        if cmd && ctx.input(|i| i.key_pressed(egui::Key::T)) {
+            self.worker.pick_path(
+                FilePickTarget::AddTorrentOpen,
+                false,
+                None,
+                Some(("Torrent", &["torrent"])),
+                ctx.clone(),
+            );
+            return;
+        }
+        if cmd && ctx.input(|i| i.key_pressed(egui::Key::B)) {
+            self.add.reset_for_open();
+            self.add.mode = AddMode::Bundle;
+            return;
+        }
+        if cmd && ctx.input(|i| i.key_pressed(egui::Key::F)) {
+            self.focus_search = true;
+            return;
+        }
+
+        if self.any_modal_open() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        let visible_ids: Vec<String> = self
+            .filtered_rows(snap)
             .into_iter()
-            .filter(|t| t.state == ripdl_core::task::TaskState::Running)
-            .map(|t| t.id)
-            .collect(),
-        _ => Vec::new(),
-    };
-    let _ = rpc_once(Command::Shutdown).await;
-    for _ in 0..60 {
-        if transport::connect_daemon().await.is_err() {
-            break;
+            .map(|r| r.id.clone())
+            .collect();
+        if visible_ids.is_empty() {
+            return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    rpc(Command::List).await?;
-    for id in running {
-        // Best effort per task: HTTP resumes from its sidecar, a torrent
-        // re-attaches to the session (and re-checks existing data first).
-        let _ = rpc(Command::Resume { id }).await;
-    }
-    Ok(())
-}
 
-/// Replace the daemon settings (validation happens daemon-side; the reply
-/// carries the normalized values). Also flips the tray preference live.
-#[tauri::command]
-async fn set_config(
-    settings: DaemonSettings,
-    state: tauri::State<'_, GuiPrefs>,
-) -> Result<DaemonSettings, String> {
-    let saved = match rpc(Command::SetConfig { settings }).await? {
-        Reply::Config { settings, .. } => settings,
-        other => Err(format!("unexpected daemon reply: {other:?}"))?,
-    };
-    state
-        .hide_to_tray
-        .store(saved.hide_to_tray.unwrap_or(true), std::sync::atomic::Ordering::Relaxed);
-    Ok(saved)
-}
-
-/// Live tray preference read by the close handler (avoid an async config
-/// roundtrip inside the window event). Managed; defaults true and is
-/// synced from the daemon settings at startup / on save.
-struct GuiPrefs {
-    hide_to_tray: std::sync::atomic::AtomicBool,
-}
-
-impl Default for GuiPrefs {
-    fn default() -> Self {
-        // Hide-to-tray on close until the user's config says otherwise.
-        Self { hide_to_tray: std::sync::atomic::AtomicBool::new(true) }
-    }
-}
-
-fn expect_ok(reply: Reply) -> Result<(), String> {
-    match reply {
-        Reply::Ok => Ok(()),
-        Reply::Error { message } => Err(message),
-        other => Err(format!("unexpected daemon reply: {other:?}")),
-    }
-}
-
-/// Bring the task window forward, waking the webview first: it is suspended
-/// whenever the window has been hidden to the tray.
-fn reveal(window: &tauri::WebviewWindow) {
-    webview_mem::resume(window);
-    let _ = window.show();
-    let _ = window.unminimize();
-    let _ = window.set_focus();
-}
-
-fn main() {
-    // One GUI per machine: a second launch asks the running window to come
-    // forward and exits before any window or tray icon is created.
-    let guard = match single_instance::claim() {
-        Ok(Some(guard)) => Some(guard),
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!("ripdl: single-instance guard unavailable ({e}); starting anyway");
-            None
+        if cmd && ctx.input(|i| i.key_pressed(egui::Key::A)) {
+            self.selected_ids = visible_ids.iter().cloned().collect();
+            self.anchor_id = visible_ids.first().cloned();
+            return;
         }
-    };
 
-    tauri::Builder::default()
-        .manage(GuiPrefs::default())
-        .invoke_handler(tauri::generate_handler![
-            list_tasks,
-            add_task,
-            torrent_preview,
-            add_video_task,
-            add_bundle,
-            add_bundle_parts,
-            preview_bundle,
-            pause_task,
-            resume_task,
-            update_selection,
-            remove_task,
-            pick_dir,
-            pick_file,
-            pick_js_file,
-            pick_any_file,
-            install_plugin,
-            lan_info,
-            lan_peers,
-            lan_send,
-            lan_sends,
-            lan_forget,
-            lan_new_code,
-            lan_configure,
-            torrent_details,
-            task_details,
-            refresh_url,
-            open_path,
-            download_root_path,
-            get_config,
-            bond_links,
-            set_config,
-            bond_nics,
-            bond_state,
-            restart_daemon,
-            check_update,
-            install_update,
-            app_version,
-            extension_folder,
-            browser_extension_info,
-            open_browser_extensions,
-            open_url,
-            exit_app
-        ])
-        .setup(move |app| {
-            use tauri::Manager;
+        let down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+        let up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+        if down || up {
+            let cur = self
+                .anchor_id
+                .as_ref()
+                .and_then(|id| visible_ids.iter().position(|x| x == id));
+            let next_idx = match (cur, down) {
+                (None, true) => 0,
+                (None, false) => visible_ids.len() - 1,
+                (Some(i), true) => (i + 1).min(visible_ids.len() - 1),
+                (Some(i), false) => i.saturating_sub(1),
+            };
+            let id = visible_ids[next_idx].clone();
+            self.selected_ids.clear();
+            self.selected_ids.insert(id.clone());
+            self.anchor_id = Some(id);
+            return;
+        }
 
-            if let Err(e) = sync_managed_extension() {
-                eprintln!("ripdl: cannot sync browser extension: {e}");
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Some(id) = self.primary_selected_id(snap) {
+                self.open_details_for(id);
             }
+            return;
+        }
 
-            // Serve "show" requests from later launches.
-            if let Some(guard) = guard {
-                let handle = app.handle().clone();
-                guard.spawn_listener(move || {
-                    if let Some(w) = handle.get_webview_window("main") {
-                        reveal(&w);
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            let ids: Vec<String> = self.selected_ids.iter().cloned().collect();
+            self.request_delete(snap, ids, false);
+        }
+    }
+
+    fn primary_selected_id(&self, snap: &Snapshot) -> Option<String> {
+        if let Some(a) = &self.anchor_id {
+            if self.selected_ids.contains(a) && snap.tasks.iter().any(|t| t.id == *a) {
+                return Some(a.clone());
+            }
+        }
+        snap.tasks
+            .iter()
+            .find(|t| self.selected_ids.contains(&t.id))
+            .map(|t| t.id.clone())
+    }
+
+    fn render_menu_bar(&mut self, ui: &mut egui::Ui, snap: &Snapshot, pal: &Palette) {
+        let sel_rows: Vec<&TaskRow> = snap
+            .tasks
+            .iter()
+            .filter(|t| self.selected_ids.contains(&t.id))
+            .collect();
+        let single = sel_rows.first().copied();
+
+        ui.horizontal(|ui| {
+            // Crisp SVG-identical brand logo mark (`docs/logo.svg`).
+            let (mark, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+            paint_brand_logo(ui.painter(), mark);
+            ui.label(semibold("ripdl", 14.0, pal.ink));
+            ui.add_space(8.0);
+
+            // Flat frameless top-level menus matching clean desktop chrome.
+            ui.scope(|ui| {
+                let w = &mut ui.visuals_mut().widgets;
+                w.inactive.bg_fill = Color32::TRANSPARENT;
+                w.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                w.inactive.bg_stroke = Stroke::NONE;
+
+                ui.menu_button("File", |ui| {
+                    if ui.button("New download… (Ctrl+N)").clicked() {
+                        self.add.reset_for_open();
+                        ui.close();
+                    }
+                    if ui.button("Open .torrent… (Ctrl+T)").clicked() {
+                        ui.close();
+                        self.worker.pick_path(
+                            FilePickTarget::AddTorrentOpen,
+                            false,
+                            None,
+                            Some(("Torrent", &["torrent"])),
+                            ui.ctx().clone(),
+                        );
+                    }
+                    if ui.button("Add multi-part bundle… (Ctrl+B)").clicked() {
+                        self.add.reset_for_open();
+                        self.add.mode = AddMode::Bundle;
+                        ui.close();
+                    }
+                    ui.separator();
+                    let has_file = single.is_some_and(|t| t.dest_file.is_some());
+                    if ui.add_enabled(has_file, egui::Button::new("Open file")).clicked() {
+                        if let Some(t) = single {
+                            self.worker.send(UiCommand::Open {
+                                id: t.id.clone(),
+                                folder: false,
+                            });
+                        }
+                        ui.close();
+                    }
+                    let has_dir = single.is_some_and(|t| t.dest_file.is_some() || t.dest_dir.is_some());
+                    if ui
+                        .add_enabled(has_dir, egui::Button::new("Open containing folder"))
+                        .clicked()
+                    {
+                        if let Some(t) = single {
+                            self.worker.send(UiCommand::Open {
+                                id: t.id.clone(),
+                                folder: true,
+                            });
+                        }
+                        ui.close();
+                    }
+                    let can_refresh = single.is_some_and(|t| t.can_refresh_url());
+                    if ui
+                        .add_enabled(can_refresh, egui::Button::new("Refresh address…"))
+                        .clicked()
+                    {
+                        if let Some(t) = single {
+                            self.open_refresh_for(t);
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Quit UI").clicked() {
+                        self.force_quit = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.close();
                     }
                 });
-            }
 
-            // Sync the tray preference from the daemon settings.
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Ok(Reply::Config { settings, .. }) = rpc(Command::GetConfig).await {
-                    if let Some(prefs) = handle.try_state::<GuiPrefs>() {
-                        prefs.hide_to_tray.store(
-                            settings.hide_to_tray.unwrap_or(true),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                ui.menu_button("Tasks", |ui| {
+                    let any_resumable = sel_rows.iter().any(|t| t.can_resume());
+                    let any_pausable = sel_rows.iter().any(|t| t.can_pause_or_stop());
+                    if ui
+                        .add_enabled(any_resumable, egui::Button::new("Resume selected"))
+                        .clicked()
+                    {
+                        let ids: Vec<String> = sel_rows
+                            .iter()
+                            .filter(|t| t.can_resume())
+                            .map(|t| t.id.clone())
+                            .collect();
+                        self.worker.send(UiCommand::Resume { ids });
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(any_pausable, egui::Button::new("Pause / Stop selected"))
+                        .clicked()
+                    {
+                        let ids: Vec<String> = sel_rows
+                            .iter()
+                            .filter(|t| t.can_pause_or_stop())
+                            .map(|t| t.id.clone())
+                            .collect();
+                        self.worker.send(UiCommand::Pause { ids });
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Resume all paused").clicked() {
+                        self.worker.send(UiCommand::ResumeAll);
+                        ui.close();
+                    }
+                    if ui.button("Stop all active").clicked() {
+                        self.worker.send(UiCommand::StopAll);
+                        ui.close();
+                    }
+                    if ui.button("Clear completed (keeps seeding torrents)").clicked() {
+                        self.worker.send(UiCommand::ClearCompleted);
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.show_eta, "Show ETA column");
+                    ui.checkbox(&mut self.show_peers, "Show Peers column");
+                    ui.separator();
+                    let is_dark = self.theme_mode == ThemeMode::Dark;
+                    if ui.selectable_label(!is_dark, "Light theme (Daylight)").clicked() {
+                        self.theme_mode = ThemeMode::Light;
+                        apply_visuals(ui.ctx(), self.theme_mode);
+                        save_theme_mode(self.theme_mode);
+                        ui.close();
+                    }
+                    if ui.selectable_label(is_dark, "Dark theme (Slate)").clicked() {
+                        self.theme_mode = ThemeMode::Dark;
+                        apply_visuals(ui.ctx(), self.theme_mode);
+                        save_theme_mode(self.theme_mode);
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("Tools", |ui| {
+                    if ui.button("Options…").clicked() {
+                        self.settings.open = true;
+                        self.settings.loaded = false;
+                        ui.close();
+                    }
+                    if ui.button("Send & Receive (LAN)…").clicked() {
+                        self.lan.open = true;
+                        self.worker.send(UiCommand::FetchLan);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Restart background daemon").clicked() {
+                        self.worker.send(UiCommand::RestartDaemon);
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Setup Wizard…").clicked() {
+                        self.onboarding.reset_from(snap.settings.as_ref());
+                        ui.close();
+                    }
+                    if ui.button("Extension Welcome Page").clicked() {
+                        self.worker.send(UiCommand::OpenExtensionWelcome {
+                            browser: self.settings.browser_choice,
+                        });
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Check for updates").clicked() {
+                        self.worker.send(UiCommand::CheckUpdate);
+                        ui.close();
+                    }
+                    if ui.button("About ripdl").clicked() {
+                        self.about_open = true;
+                        ui.close();
+                    }
+                });
+            });
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let (theme_ico, theme_tip) = match self.theme_mode {
+                    ThemeMode::Light => (IconId::Moon, "Switch to dark theme"),
+                    ThemeMode::Dark => (IconId::Sun, "Switch to light theme"),
+                };
+                if vector_icon_button(ui, pal, theme_ico, theme_tip, 24.0, false, false)
+                    .on_hover_text(theme_tip)
+                    .clicked()
+                {
+                    self.toggle_theme(ui.ctx());
+                }
+
+                let ver = if snap.daemon_version.is_empty() {
+                    format!("v{}", env!("CARGO_PKG_VERSION"))
+                } else {
+                    format!("v{}", snap.daemon_version)
+                };
+                ui.label(egui::RichText::new(ver).small().monospace().color(pal.ink_muted));
+
+                let (conn_fg, conn_bg, conn_dot) = if snap.connected {
+                    (pal.success, pal.success_soft, pal.success)
+                } else {
+                    (pal.warn, pal.warn_soft, pal.warn)
+                };
+                paint_status_pill(ui, &snap.daemon_label, conn_fg, conn_bg, conn_dot);
+
+                if let Some(upd) = &snap.update {
+                    if upd.update_available
+                        && vector_button(
+                            ui,
+                            pal,
+                            IconId::Download,
+                            &format!("Update v{}", upd.latest),
+                            22.0,
+                            false,
+                            true,
+                        )
+                        .clicked()
+                    {
+                        self.settings.open = true;
+                        self.settings.tab = SettingsTab::Updates;
                     }
                 }
             });
+        });
+    }
 
-            // Tray icon: left click shows the window; menu has Show / Exit.
-            let show_item =
-                tauri::menu::MenuItem::with_id(app, "tray-show", "Show ripdl", true, None::<&str>)?;
-            let quit_item =
-                tauri::menu::MenuItem::with_id(app, "tray-quit", "Exit", true, None::<&str>)?;
-            let tray_menu = tauri::menu::Menu::with_items(app, &[&show_item, &quit_item])?;
-            let mut tray = tauri::tray::TrayIconBuilder::with_id("ripdl-tray")
-                .menu(&tray_menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, ev| match ev.id().as_ref() {
-                    "tray-show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            reveal(&w);
-                        }
-                    }
-                    "tray-quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, ev| {
-                    // Left click = show the window (like IDM/FDM).
-                    if let tauri::tray::TrayIconEvent::Click {
-                        button: tauri::tray::MouseButton::Left,
-                        button_state: tauri::tray::MouseButtonState::Up,
-                        ..
-                    } = ev
-                    {
-                        if let Some(w) = tray.app_handle().get_webview_window("main") {
-                            reveal(&w);
-                        }
-                    }
-                });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
+    fn render_toolbar(&mut self, ui: &mut egui::Ui, snap: &Snapshot, pal: &Palette) {
+        let sel_rows: Vec<&TaskRow> = snap
+            .tasks
+            .iter()
+            .filter(|t| self.selected_ids.contains(&t.id))
+            .collect();
+        let any_resumable = sel_rows.iter().any(|t| t.can_resume());
+        let any_pausable = sel_rows.iter().any(|t| t.can_pause_or_stop());
+        let any_active = snap.tasks.iter().any(|t| t.can_pause_or_stop());
+        let any_clearable = snap
+            .tasks
+            .iter()
+            .any(|t| t.raw_state == TaskState::Completed && !t.seeding);
+        let single_stale = sel_rows.len() == 1
+            && sel_rows[0].can_refresh_url()
+            && sel_rows[0].raw_state == TaskState::Stale;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+
+            if vector_button(ui, pal, IconId::Add, "Add", metrics::TOOLBAR_H, true, true)
+                .on_hover_text("Add URL, magnet, or media link (Ctrl+N)")
+                .clicked()
+            {
+                self.add.reset_for_open();
             }
-            tray.build(app)?;
+            if vector_button(ui, pal, IconId::Torrent, "Torrent", metrics::TOOLBAR_H, false, false)
+                .on_hover_text("Add .torrent or magnet URI (Ctrl+T)")
+                .clicked()
+            {
+                self.add.reset_for_open();
+                self.add.mode = AddMode::Torrent;
+            }
+            if vector_button(ui, pal, IconId::Bundle, "Bundle", metrics::TOOLBAR_H, false, false)
+                .on_hover_text("Group multi-part links into one folder task (Ctrl+B)")
+                .clicked()
+            {
+                self.add.reset_for_open();
+                self.add.mode = AddMode::Bundle;
+            }
 
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            use tauri::Manager;
-            // Close minimizes to the tray by default (the daemon keeps
-            // running either way; Quit lives in the tray menu).
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let hide = window
-                    .app_handle()
-                    .try_state::<GuiPrefs>()
-                    .is_some_and(|p| p.hide_to_tray.load(std::sync::atomic::Ordering::Relaxed))
-                    // An installer is closing us: exiting is the point.
-                    && !INSTALLING.load(std::sync::atomic::Ordering::Relaxed);
-                if hide && window.label() == "main" {
-                    api.prevent_close();
-                    let _ = window.hide();
-                    // Hiding a WebView2 frees nothing on its own; suspend it
-                    // while it is off screen (see webview_mem.rs).
-                    if let Some(w) = window.app_handle().get_webview_window("main") {
-                        webview_mem::suspend(&w);
+            toolbar_sep(ui, pal);
+
+            if ui
+                .add_enabled_ui(any_resumable, |ui| {
+                    vector_button(ui, pal, IconId::Play, "Resume", metrics::TOOLBAR_H, false, false)
+                })
+                .inner
+                .clicked()
+            {
+                let ids: Vec<String> = sel_rows
+                    .iter()
+                    .filter(|t| t.can_resume())
+                    .map(|t| t.id.clone())
+                    .collect();
+                self.worker.send(UiCommand::Resume { ids });
+            }
+
+            if ui
+                .add_enabled_ui(any_pausable, |ui| {
+                    vector_button(ui, pal, IconId::Pause, "Pause", metrics::TOOLBAR_H, false, false)
+                })
+                .inner
+                .clicked()
+            {
+                let ids: Vec<String> = sel_rows
+                    .iter()
+                    .filter(|t| t.can_pause_or_stop())
+                    .map(|t| t.id.clone())
+                    .collect();
+                self.worker.send(UiCommand::Pause { ids });
+            }
+
+            if ui
+                .add_enabled_ui(any_active, |ui| {
+                    vector_button(ui, pal, IconId::Stop, "Stop All", metrics::TOOLBAR_H, false, false)
+                })
+                .inner
+                .on_hover_text("Pause all running downloads and stop seeding")
+                .clicked()
+            {
+                self.worker.send(UiCommand::StopAll);
+            }
+
+            if ui
+                .add_enabled_ui(!sel_rows.is_empty(), |ui| {
+                    vector_button(ui, pal, IconId::Trash, "Remove", metrics::TOOLBAR_H, false, false)
+                })
+                .inner
+                .clicked()
+            {
+                let ids: Vec<String> = sel_rows.iter().map(|t| t.id.clone()).collect();
+                self.request_delete(snap, ids, false);
+            }
+
+            if single_stale
+                && vector_button(ui, pal, IconId::Refresh, "Fix link", metrics::TOOLBAR_H, false, true).clicked()
+            {
+                self.open_refresh_for(sel_rows[0]);
+            }
+
+            if ui
+                .add_enabled_ui(any_clearable, |ui| {
+                    vector_button(ui, pal, IconId::ClearDone, "Clear", metrics::TOOLBAR_H, false, false)
+                })
+                .inner
+                .on_hover_text("Clear finished tasks from list (keeps active seeders)")
+                .clicked()
+            {
+                self.worker.send(UiCommand::ClearCompleted);
+            }
+
+            toolbar_sep(ui, pal);
+
+            if vector_button(ui, pal, IconId::Lan, "LAN", metrics::TOOLBAR_H, false, false)
+                .on_hover_text("Send & Receive files on local network")
+                .clicked()
+            {
+                self.lan.open = true;
+                self.worker.send(UiCommand::FetchLan);
+            }
+
+            if vector_button(ui, pal, IconId::Settings, "Options", metrics::TOOLBAR_H, false, false).clicked() {
+                self.settings.open = true;
+                self.settings.loaded = false;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::Frame::new()
+                    .fill(pal.surface_alt)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (sr, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+                            paint_icon(ui.painter(), sr, IconId::Search, pal.ink_muted);
+
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .frame(egui::Frame::NONE)
+                                    .hint_text("Search downloads… (Ctrl+F)")
+                                    .desired_width(164.0),
+                            );
+                            if self.focus_search {
+                                edit.request_focus();
+                                self.focus_search = false;
+                            }
+                            if !self.search.is_empty()
+                                && vector_icon_button(ui, pal, IconId::Close, "Clear search", 18.0, false, false)
+                                    .clicked()
+                            {
+                                self.search.clear();
+                            }
+                        });
+                    });
+            });
+        });
+    }
+
+    fn render_sidebar(&mut self, ui: &mut egui::Ui, snap: &Snapshot, pal: &Palette) {
+        ui.spacing_mut().item_spacing.y = 2.0;
+
+        let section_head = |ui: &mut egui::Ui, text: &str| {
+            ui.add_space(7.0);
+            ui.label(
+                egui::RichText::new(text)
+                    .size(10.0)
+                    .strong()
+                    .color(pal.ink_muted),
+            );
+            ui.add_space(2.0);
+        };
+
+        let mut nav_item = |ui: &mut egui::Ui, icon: IconId, f: SidebarFilter| {
+            let count = count_filter(&snap.tasks, f);
+            let active = self.filter == f;
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::Role::Button,
+                    true,
+                    active,
+                    f.label(),
+                )
+            });
+
+            if ui.is_rect_visible(rect) {
+                let bg = if active {
+                    pal.accent_soft
+                } else if resp.hovered() {
+                    pal.surface_hover
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let fg = if active { pal.accent_dark } else { pal.ink_secondary };
+                let ico_fg = if active { pal.accent } else { pal.ink_muted };
+
+                ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+                paint_focus_ring(ui.painter(), rect, 6, pal, resp.has_focus());
+                if active {
+                    let bar = Rect::from_min_max(
+                        rect.min + egui::vec2(0.0, 4.0),
+                        egui::pos2(rect.min.x + 3.0, rect.max.y - 4.0),
+                    );
+                    ui.painter().rect_filled(bar, CornerRadius::same(2), pal.accent);
+                }
+
+                let ico_rect = Rect::from_center_size(
+                    egui::pos2(rect.min.x + 17.0, rect.center().y),
+                    egui::vec2(14.0, 14.0),
+                );
+                paint_icon(ui.painter(), ico_rect, icon, ico_fg);
+
+                let font = egui::FontId::new(
+                    12.5,
+                    if active {
+                        egui::FontFamily::Name("semibold".into())
+                    } else {
+                        egui::FontFamily::Proportional
+                    },
+                );
+                ui.painter().text(
+                    egui::pos2(rect.min.x + 33.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    f.label(),
+                    font,
+                    fg,
+                );
+
+                // Crisp pill counter on right edge.
+                let count_str = count.to_string();
+                let count_galley = ui.painter().layout_no_wrap(
+                    count_str,
+                    egui::FontId::new(10.5, egui::FontFamily::Proportional),
+                    if active { pal.accent_dark } else { pal.ink_muted },
+                );
+                let pill_w = (count_galley.size().x + 11.0).max(22.0);
+                let pill_rect = Rect::from_center_size(
+                    egui::pos2(rect.max.x - 8.0 - pill_w * 0.5, rect.center().y),
+                    egui::vec2(pill_w, 17.0),
+                );
+                let pill_bg = if active {
+                    Color32::from_rgba_unmultiplied(pal.accent.r(), pal.accent.g(), pal.accent.b(), 36)
+                } else {
+                    pal.surface_hover
+                };
+                ui.painter().rect_filled(pill_rect, CornerRadius::same(9), pill_bg);
+                ui.painter().galley(
+                    pill_rect.center() - count_galley.size() * 0.5,
+                    count_galley,
+                    if active { pal.accent_dark } else { pal.ink_muted },
+                );
+            }
+            if resp.clicked() {
+                self.filter = f;
+            }
+        };
+
+        section_head(ui, "LIBRARY");
+        nav_item(ui, IconId::AllDownloads, SidebarFilter::All);
+        nav_item(ui, IconId::Active, SidebarFilter::Active);
+        nav_item(ui, IconId::Pause, SidebarFilter::PausedOrExpired);
+        nav_item(ui, IconId::Check, SidebarFilter::Completed);
+
+        section_head(ui, "SOURCES");
+        nav_item(ui, IconId::Torrent, SidebarFilter::Torrents);
+        nav_item(ui, IconId::Bundle, SidebarFilter::Bundles);
+        nav_item(ui, IconId::Video, SidebarFilter::Streams);
+
+        section_head(ui, "FILE TYPES");
+        nav_item(ui, IconId::Video, SidebarFilter::Category(Category::Video));
+        nav_item(ui, IconId::Audio, SidebarFilter::Category(Category::Audio));
+        nav_item(ui, IconId::Image, SidebarFilter::Category(Category::Image));
+        nav_item(ui, IconId::Document, SidebarFilter::Category(Category::Document));
+        nav_item(ui, IconId::Archive, SidebarFilter::Category(Category::Archive));
+        nav_item(ui, IconId::Program, SidebarFilter::Category(Category::Program));
+
+        // Push LAN drop box card cleanly to bottom of sidebar.
+        let rem = (ui.available_height() - 62.0).max(8.0);
+        ui.add_space(rem);
+        let listening = snap.lan.as_ref().is_some_and(|l| l.running);
+        let lan_sub = snap
+            .lan
+            .as_ref()
+            .filter(|l| l.running)
+            .map(|l| format!("Listening :{}", l.port))
+            .unwrap_or_else(|| "Drop box off".into());
+        let (card_rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Send & Receive on Local Network"));
+        if ui.is_rect_visible(card_rect) {
+            let bg = if self.lan.open || resp.hovered() {
+                pal.accent_soft
+            } else {
+                pal.surface_alt
+            };
+            ui.painter().rect_filled(card_rect, CornerRadius::same(8), bg);
+            ui.painter().rect_stroke(card_rect, CornerRadius::same(8), Stroke::new(1.0, pal.border), StrokeKind::Inside);
+            paint_focus_ring(ui.painter(), card_rect, 8, pal, resp.has_focus());
+            let ir = Rect::from_center_size(egui::pos2(card_rect.min.x + 17.0, card_rect.center().y), egui::vec2(15.0, 15.0));
+            paint_icon(ui.painter(), ir, IconId::Lan, if listening { pal.accent } else { pal.ink_muted });
+            ui.painter().text(
+                egui::pos2(card_rect.min.x + 32.0, card_rect.min.y + 14.0),
+                egui::Align2::LEFT_CENTER,
+                "Send & Receive",
+                egui::FontId::new(12.0, egui::FontFamily::Name("semibold".into())),
+                pal.ink,
+            );
+            let dot_c = if listening { pal.success } else { pal.ink_muted };
+            ui.painter().circle_filled(egui::pos2(card_rect.min.x + 35.0, card_rect.max.y - 12.0), 3.0, dot_c);
+            ui.painter().text(
+                egui::pos2(card_rect.min.x + 42.0, card_rect.max.y - 12.0),
+                egui::Align2::LEFT_CENTER,
+                lan_sub,
+                egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                pal.ink_muted,
+            );
+        }
+        if resp.clicked() {
+            self.lan.open = true;
+            self.worker.send(UiCommand::FetchLan);
+        }
+    }
+
+    fn render_table_area(&mut self, ui: &mut egui::Ui, snap: &Snapshot, pal: &Palette) {
+        if let Some(upd) = &snap.update {
+            if upd.update_available && !self.update_banner_dismissed {
+                let busy = snap
+                    .update_install_status
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Downloading"));
+                egui::Frame::new()
+                    .fill(pal.info_soft)
+                    .stroke(Stroke::new(1.0, pal.info))
+                    .corner_radius(CornerRadius::same(7))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (ir, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            paint_icon(ui.painter(), ir, IconId::Download, pal.info);
+                            let status_suffix = snap
+                                .update_install_status
+                                .as_deref()
+                                .map(|s| format!(" · {s}"))
+                                .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "ripdl v{} is available (running v{}){}",
+                                    upd.latest, upd.current, status_suffix
+                                ))
+                                .color(pal.info),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if vector_icon_button(ui, pal, IconId::Close, "Dismiss update banner", 20.0, false, false).clicked() {
+                                    self.update_banner_dismissed = true;
+                                }
+                                if vector_button(ui, pal, IconId::External, "Release notes", 22.0, false, false).clicked() {
+                                    views::open_external_url("https://github.com/ShiniM0d0ri/ripdl/releases");
+                                }
+                                if ui
+                                    .add_enabled_ui(!busy, |ui| {
+                                        vector_button(
+                                            ui,
+                                            pal,
+                                            IconId::Download,
+                                            &format!("Download & Install v{}", upd.latest),
+                                            22.0,
+                                            true,
+                                            true,
+                                        )
+                                    })
+                                    .inner
+                                    .clicked()
+                                {
+                                    self.worker.send(UiCommand::UpdateInstall);
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+        }
+
+        let mut dismiss_notice = false;
+        if let Some(notice) = self.notice.clone() {
+            if Instant::now() < notice.until {
+                let (fg, bg, ico) = if notice.is_error {
+                    (pal.danger, pal.danger_soft, IconId::Alert)
+                } else {
+                    (pal.accent_dark, pal.accent_soft, IconId::CheckCircle)
+                };
+                egui::Frame::new()
+                    .fill(bg)
+                    .stroke(Stroke::new(1.0, fg))
+                    .corner_radius(CornerRadius::same(7))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (ir, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            paint_icon(ui.painter(), ir, ico, fg);
+                            ui.label(egui::RichText::new(&notice.text).color(fg));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if vector_icon_button(ui, pal, IconId::Close, "Dismiss notice", 20.0, false, false).clicked() {
+                                    dismiss_notice = true;
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(6.0);
+            } else {
+                dismiss_notice = true;
+            }
+        }
+        if dismiss_notice {
+            self.notice = None;
+        }
+
+        let rows = self.filtered_rows(snap);
+        let owned_rows: Vec<TaskRow> = rows.into_iter().cloned().collect();
+
+        // Content header bar matching UI design reference.
+        let downloaded_total: u64 = owned_rows.iter().map(|r| r.downloaded).sum();
+        let active_cnt = owned_rows
+            .iter()
+            .filter(|r| r.raw_state == TaskState::Running)
+            .count();
+        let has_active_filter = self.filter != SidebarFilter::All || !self.search.trim().is_empty();
+        let eyebrow = match self.filter {
+            SidebarFilter::All
+            | SidebarFilter::Active
+            | SidebarFilter::PausedOrExpired
+            | SidebarFilter::Completed => "LIBRARY",
+            SidebarFilter::Torrents | SidebarFilter::Bundles | SidebarFilter::Streams => "SOURCES",
+            SidebarFilter::Category(_) => "FILE TYPES",
+        };
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.label(egui::RichText::new(eyebrow).size(10.0).strong().color(pal.ink_muted));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.label(semibold(self.filter.label(), 18.0, pal.ink));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {} · {} downloaded · {} active",
+                            owned_rows.len(),
+                            if owned_rows.len() == 1 { "task" } else { "tasks" },
+                            humans_bin(downloaded_total),
+                            active_cnt,
+                        ))
+                        .small()
+                        .color(pal.ink_muted),
+                    );
+                });
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("Columns", |ui| {
+                    ui.checkbox(&mut self.show_eta, "Show ETA column");
+                    ui.checkbox(&mut self.show_peers, "Show Peers column");
+                });
+                if has_active_filter
+                    && vector_button(ui, pal, IconId::Close, "Reset view", 24.0, false, true).clicked()
+                {
+                    self.filter = SidebarFilter::All;
+                    self.search.clear();
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if owned_rows.is_empty() {
+            egui::Frame::new()
+                .fill(pal.surface)
+                .stroke(Stroke::new(1.0, pal.border))
+                .corner_radius(CornerRadius::same(10))
+                .show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    ui.vertical_centered(|ui| {
+                        let top_pad = ((ui.available_height() - 220.0) * 0.42).max(28.0);
+                        ui.add_space(top_pad);
+                        if snap.tasks.is_empty() {
+                            paint_empty_illustration(ui, pal);
+                            ui.add_space(10.0);
+                            ui.label(semibold("No downloads queued", 16.5, pal.ink));
+                            ui.label(
+                                egui::RichText::new("Paste a URL or drop a .torrent file anywhere in this window.")
+                                    .color(pal.ink_muted),
+                            );
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let w_group = 250.0_f32;
+                                ui.add_space(((ui.available_width() - w_group) * 0.5).max(0.0));
+                                if vector_button(ui, pal, IconId::Add, "Add Download", 32.0, true, true).clicked() {
+                                    self.add.reset_for_open();
+                                }
+                                if vector_button(ui, pal, IconId::Torrent, "Open .torrent…", 32.0, false, true).clicked() {
+                                    self.worker.pick_path(
+                                        FilePickTarget::AddTorrentOpen,
+                                        false,
+                                        None,
+                                        Some(("Torrent", &["torrent"])),
+                                        ui.ctx().clone(),
+                                    );
+                                }
+                            });
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("Shortcuts: Ctrl+N Add URL  ·  Ctrl+T Torrent  ·  Ctrl+B Bundle")
+                                    .small()
+                                    .color(pal.ink_muted),
+                            );
+                        } else {
+                            paint_filter_empty_illustration(ui, pal);
+                            ui.add_space(8.0);
+                            ui.label(semibold(&format!("No downloads match \"{}\"", self.filter.label()), 15.0, pal.ink));
+                            ui.label(
+                                egui::RichText::new("Try clearing your search filter or switching category.")
+                                    .color(pal.ink_muted),
+                            );
+                            ui.add_space(10.0);
+                            if vector_button(ui, pal, IconId::Close, "Clear active filter", 28.0, false, true).clicked() {
+                                self.filter = SidebarFilter::All;
+                                self.search.clear();
+                            }
+                        }
+                        ui.add_space(40.0);
+                    });
+                });
+            return;
+        }
+
+        let card_avail_w = ui.available_width().max(720.0);
+        // Reserve inner margins + ScrollArea scrollbar so Actions column never clips.
+        let header_inner_w = (card_avail_w - 28.0).max(690.0);
+        let cols = table_columns(header_inner_w, self.show_eta, self.show_peers);
+
+        egui::Frame::new()
+            .fill(pal.surface)
+            .stroke(Stroke::new(1.0, pal.border))
+            .corner_radius(CornerRadius::same(10))
+            .show(ui, |ui| {
+                // Header strip pinned via exact computed X ranges (cannot squish or clip).
+                let (hdr_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), metrics::HEADER_H),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    hdr_rect,
+                    CornerRadius {
+                        nw: 10,
+                        ne: 10,
+                        sw: 0,
+                        se: 0,
+                    },
+                    pal.surface_alt,
+                );
+                ui.painter().line_segment(
+                    [egui::pos2(hdr_rect.min.x, hdr_rect.max.y), hdr_rect.max],
+                    Stroke::new(1.0, pal.border),
+                );
+                let hdr_origin_x = hdr_rect.min.x + 8.0;
+                self.paint_sort_header(ui, hdr_origin_x, hdr_rect, cols.name, "FILE NAME", SortKey::Name, pal);
+                self.paint_sort_header(ui, hdr_origin_x, hdr_rect, cols.kind, "KIND", SortKey::Kind, pal);
+                self.paint_sort_header(ui, hdr_origin_x, hdr_rect, cols.size, "SIZE", SortKey::Size, pal);
+                self.paint_sort_header(ui, hdr_origin_x, hdr_rect, cols.progress, "PROGRESS", SortKey::Progress, pal);
+                self.paint_sort_header(ui, hdr_origin_x, hdr_rect, cols.status, "STATUS", SortKey::Status, pal);
+                self.paint_sort_header(ui, hdr_origin_x, hdr_rect, cols.rate, "RATE", SortKey::Rate, pal);
+                if let Some(peers_span) = cols.peers {
+                    paint_static_header(ui, hdr_origin_x, hdr_rect, peers_span, "PEERS", pal);
+                }
+                if let Some(eta_span) = cols.eta {
+                    paint_static_header(ui, hdr_origin_x, hdr_rect, eta_span, "ETA", pal);
+                }
+                paint_static_header(ui, hdr_origin_x, hdr_rect, cols.actions, "ACTIONS", pal);
+
+                let mut clicked_row: Option<(usize, String)> = None;
+                let mut action_cmd: Option<UiCommand> = None;
+                let mut open_details_id: Option<String> = None;
+                let mut open_refresh_row: Option<TaskRow> = None;
+                let mut req_delete: Option<(Vec<String>, bool)> = None;
+                let mut copy_url_txt: Option<String> = None;
+
+                let total_rows = owned_rows.len();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, metrics::ROW_H, total_rows, |ui, range| {
+                        for idx in range {
+                            let row = &owned_rows[idx];
+                            let selected = self.selected_ids.contains(&row.id);
+
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), metrics::ROW_H),
+                                egui::Sense::click(),
+                            );
+                            let bg = if selected {
+                                pal.accent_soft
+                            } else if row_resp.hovered() {
+                                pal.surface_hover
+                            } else if idx % 2 == 1 {
+                                pal.surface_alt
+                            } else {
+                                pal.surface
+                            };
+                            ui.painter().rect_filled(row_rect, CornerRadius::ZERO, bg);
+                            ui.painter().line_segment(
+                                [egui::pos2(row_rect.min.x, row_rect.max.y), row_rect.max],
+                                Stroke::new(1.0, pal.border),
+                            );
+                            if selected {
+                                let bar = Rect::from_min_max(
+                                    row_rect.min,
+                                    egui::pos2(row_rect.min.x + 3.0, row_rect.max.y),
+                                );
+                                ui.painter().rect_filled(bar, CornerRadius::ZERO, pal.accent);
+                            }
+
+                            let ox = row_rect.min.x + 8.0;
+                            let col_rect = |span: (f32, f32)| -> Rect {
+                                Rect::from_min_max(
+                                    egui::pos2(ox + span.0, row_rect.min.y + 3.0),
+                                    egui::pos2(ox + span.0 + span.1, row_rect.max.y - 3.0),
+                                )
+                            };
+
+                            // 1. File tile + Name + concise source/error subline.
+                            let (k_ico, k_lbl, k_fg, _) = kind_visuals(&row.kind, pal);
+                            in_rect_left(ui, col_rect(cols.name), |ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                let (tile_rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                                paint_file_tile(ui.painter(), tile_rect, &row.kind, row.category, pal);
+
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.add(
+                                        egui::Label::new(semibold(&row.name, 13.0, pal.ink)).truncate(),
+                                    )
+                                    .on_hover_text(&row.name);
+                                    let sub = if let Some(err) = &row.error {
+                                        err.to_string()
+                                    } else if let Some(reason) = row
+                                        .stale_reason
+                                        .as_deref()
+                                        .filter(|_| row.raw_state == TaskState::Stale)
+                                    {
+                                        format!("{} · {reason}", row.source)
+                                    } else if !row.parts_missing.is_empty() {
+                                        format!("{} · missing parts: {:?}", row.source, row.parts_missing)
+                                    } else if let Some(start) = row.start_at.filter(|&s| s > crate::model::now_unix()) {
+                                        let mins = ((start - crate::model::now_unix()) + 59) / 60;
+                                        format!("{} · starts in ~{}m", row.source, mins)
+                                    } else if row.seeding && row.uploaded > 0 {
+                                        format!("{} · \u{2191} {} uploaded", row.source, humans_bin(row.uploaded))
+                                    } else if row.kind == "torrent" && row.peers > 0 {
+                                        format!("{} · {} peers", row.source, row.peers)
+                                    } else {
+                                        row.source.clone()
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(sub)
+                                                .small()
+                                                .color(if row.error.is_some() { pal.danger } else { pal.ink_muted }),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            });
+
+                            // 2. Kind outline pill with vector icon.
+                            in_rect_left(ui, col_rect(cols.kind), |ui| {
+                                paint_kind_pill(ui, k_ico, k_lbl, k_fg, pal);
+                            });
+
+                            // 3. Size.
+                            let size_str = match row.total {
+                                Some(t) => format!("{} / {}", humans_bin(row.downloaded), humans_bin(t)),
+                                None if row.downloaded > 0 => humans_bin(row.downloaded),
+                                None => "—".into(),
+                            };
+                            in_rect_left(ui, col_rect(cols.size), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(size_str)
+                                            .small()
+                                            .color(pal.ink_secondary),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+
+                            // 4. Progress bar + percentage.
+                            in_rect_left(ui, col_rect(cols.progress), |ui| {
+                                paint_progress_bar(ui, row.ratio(), &row.state, cols.progress.1, pal);
+                            });
+
+                            // 5. Status pill with colored dot.
+                            let (st_lbl, st_fg, st_bg, st_dot) = state_visuals(&row.state, pal);
+                            in_rect_left(ui, col_rect(cols.status), |ui| {
+                                paint_status_pill(ui, st_lbl, st_fg, st_bg, st_dot);
+                            });
+
+                            // 6. Rate.
+                            let rate_str = if row.seeding {
+                                row.upload_bps
+                                    .map(|r| format!("\u{2191} {}/s", humans_bin(r as u64)))
+                                    .unwrap_or_else(|| "\u{2191} —".into())
+                            } else if let Some(spd) = row.speed_bps {
+                                format!("{}/s", humans_bin(spd as u64))
+                            } else {
+                                "—".into()
+                            };
+                            in_rect_left(ui, col_rect(cols.rate), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(rate_str)
+                                            .small()
+                                            .monospace()
+                                            .color(if row.speed_bps.is_some() || row.seeding {
+                                                pal.ink_secondary
+                                            } else {
+                                                pal.ink_muted
+                                            }),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+
+                            // Optional Peers.
+                            if let Some(peers_span) = cols.peers {
+                                in_rect_left(ui, col_rect(peers_span), |ui| {
+                                    let txt = if row.kind == "torrent" {
+                                        row.peers.to_string()
+                                    } else {
+                                        "—".into()
+                                    };
+                                    ui.label(egui::RichText::new(txt).small().monospace().color(pal.ink_muted));
+                                });
+                            }
+
+                            // Optional ETA.
+                            if let Some(eta_span) = cols.eta {
+                                in_rect_left(ui, col_rect(eta_span), |ui| {
+                                    let raw = eta_text(row);
+                                    let disp = if raw == "-" { "—" } else { raw.as_str() };
+                                    ui.label(egui::RichText::new(disp).small().monospace().color(pal.ink_muted));
+                                });
+                            }
+
+                            // Last column: Unclipped crisp square vector action buttons.
+                            in_rect_left(ui, col_rect(cols.actions), |ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if row.raw_state == TaskState::Stale && row.can_refresh_url() {
+                                    if vector_button(ui, pal, IconId::Refresh, "Fix", 26.0, false, true)
+                                        .on_hover_text("Refresh expired link")
+                                        .clicked()
+                                    {
+                                        open_refresh_row = Some(row.clone());
+                                    }
+                                } else if row.can_pause_or_stop() {
+                                    let (ico, tip) = if row.seeding {
+                                        (IconId::Stop, "Stop seeding")
+                                    } else {
+                                        (IconId::Pause, "Pause download")
+                                    };
+                                    if vector_icon_button(ui, pal, ico, tip, 26.0, false, true)
+                                        .on_hover_text(tip)
+                                        .clicked()
+                                    {
+                                        action_cmd = Some(UiCommand::Pause { ids: vec![row.id.clone()] });
+                                    }
+                                } else if row.can_resume() {
+                                    if vector_icon_button(ui, pal, IconId::Play, "Resume download", 26.0, false, true)
+                                        .on_hover_text("Resume")
+                                        .clicked()
+                                    {
+                                        action_cmd = Some(UiCommand::Resume { ids: vec![row.id.clone()] });
+                                    }
+                                } else if row.dest_file.is_some() {
+                                    if vector_icon_button(ui, pal, IconId::OpenFile, "Open file", 26.0, false, true)
+                                        .on_hover_text("Open file")
+                                        .clicked()
+                                    {
+                                        action_cmd = Some(UiCommand::Open {
+                                            id: row.id.clone(),
+                                            folder: false,
+                                        });
+                                    }
+                                }
+
+                                if vector_icon_button(ui, pal, IconId::Details, "Inspect details", 26.0, false, true)
+                                    .on_hover_text("Inspect details")
+                                    .clicked()
+                                {
+                                    open_details_id = Some(row.id.clone());
+                                }
+                                if vector_icon_button(ui, pal, IconId::Trash, "Remove task", 26.0, true, true)
+                                    .on_hover_text("Remove")
+                                    .clicked()
+                                {
+                                    req_delete = Some((vec![row.id.clone()], false));
+                                }
+                            });
+
+                            if row_resp.double_clicked() {
+                                open_details_id = Some(row.id.clone());
+                            } else if row_resp.clicked() {
+                                clicked_row = Some((idx, row.id.clone()));
+                            }
+
+                            row_resp.context_menu(|ui| {
+                                if row.can_resume() && ui.button("Resume / Start").clicked() {
+                                    action_cmd = Some(UiCommand::Resume { ids: vec![row.id.clone()] });
+                                    ui.close();
+                                }
+                                if row.can_pause_or_stop() && ui.button("Pause / Stop").clicked() {
+                                    action_cmd = Some(UiCommand::Pause { ids: vec![row.id.clone()] });
+                                    ui.close();
+                                }
+                                if row.can_refresh_url() && ui.button("Refresh download address…").clicked() {
+                                    open_refresh_row = Some(row.clone());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Details…").clicked() {
+                                    open_details_id = Some(row.id.clone());
+                                    ui.close();
+                                }
+                                if row.dest_file.is_some() && ui.button("Open file").clicked() {
+                                    action_cmd = Some(UiCommand::Open {
+                                        id: row.id.clone(),
+                                        folder: false,
+                                    });
+                                    ui.close();
+                                }
+                                if (row.dest_file.is_some() || row.dest_dir.is_some())
+                                    && ui.button("Show in folder").clicked()
+                                {
+                                    action_cmd = Some(UiCommand::Open {
+                                        id: row.id.clone(),
+                                        folder: true,
+                                    });
+                                    ui.close();
+                                }
+                                if ui.button("Copy address").clicked() {
+                                    copy_url_txt = Some(row.url.clone());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Remove from list").clicked() {
+                                    req_delete = Some((vec![row.id.clone()], false));
+                                    ui.close();
+                                }
+                                if ui.button("Delete task & files from disk…").clicked() {
+                                    req_delete = Some((vec![row.id.clone()], true));
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
+
+                if let Some((idx, id)) = clicked_row {
+                    let ctrl = ui.input(|i| i.modifiers.command);
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    if shift {
+                        if let Some(anchor) = self.anchor_id.as_ref().and_then(|a| owned_rows.iter().position(|r| &r.id == a)) {
+                            let (lo, hi) = (anchor.min(idx), anchor.max(idx));
+                            self.selected_ids.clear();
+                            for r in &owned_rows[lo..=hi] {
+                                self.selected_ids.insert(r.id.clone());
+                            }
+                        } else {
+                            self.selected_ids.insert(id.clone());
+                            self.anchor_id = Some(id);
+                        }
+                    } else if ctrl {
+                        if !self.selected_ids.remove(&id) {
+                            self.selected_ids.insert(id.clone());
+                        }
+                        self.anchor_id = Some(id);
+                    } else {
+                        self.selected_ids.clear();
+                        self.selected_ids.insert(id.clone());
+                        self.anchor_id = Some(id);
                     }
                 }
+                if let Some(cmd) = action_cmd {
+                    self.worker.send(cmd);
+                }
+                if let Some(id) = open_details_id {
+                    self.open_details_for(id);
+                }
+                if let Some(r) = open_refresh_row {
+                    self.open_refresh_for(&r);
+                }
+                if let Some((ids, del_files)) = req_delete {
+                    self.request_delete(snap, ids, del_files);
+                }
+                if let Some(u) = copy_url_txt {
+                    ui.ctx().copy_text(u);
+                    self.set_notice("Address copied to clipboard.".into(), false);
+                }
+            });
+    }
+
+    fn paint_sort_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        origin_x: f32,
+        hdr_rect: Rect,
+        span: (f32, f32),
+        label: &str,
+        key: SortKey,
+        pal: &Palette,
+    ) {
+        let arrow = if self.sort_key == key {
+            match self.sort_dir {
+                SortDir::Asc => " \u{25b4}",
+                SortDir::Desc => " \u{25be}",
             }
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running ripdl gui");
+        } else {
+            ""
+        };
+        let rect = Rect::from_min_max(
+            egui::pos2(origin_x + span.0, hdr_rect.min.y + 2.0),
+            egui::pos2(origin_x + span.0 + span.1, hdr_rect.max.y - 2.0),
+        );
+        let mut clicked = false;
+        in_rect_left(ui, rect, |ui| {
+            let color = if self.sort_key == key {
+                pal.accent_dark
+            } else {
+                pal.ink_muted
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(format!("{label}{arrow}"))
+                            .size(10.5)
+                            .strong()
+                            .color(color),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                clicked = true;
+            }
+        });
+        if clicked {
+            if self.sort_key == key {
+                self.sort_dir = match self.sort_dir {
+                    SortDir::Asc => SortDir::Desc,
+                    SortDir::Desc => SortDir::Asc,
+                };
+            } else {
+                self.sort_key = key;
+                self.sort_dir = SortDir::Asc;
+            }
+        }
+    }
+
+    fn render_footer(&mut self, ui: &mut egui::Ui, snap: &Snapshot, pal: &Palette) {
+        let active_cnt = snap
+            .tasks
+            .iter()
+            .filter(|t| t.raw_state == TaskState::Running)
+            .count();
+        let seeding_cnt = snap.tasks.iter().filter(|t| t.seeding).count();
+
+        ui.horizontal(|ui| {
+            let sel_txt = if self.selected_ids.len() > 1 {
+                format!(" · {} selected", self.selected_ids.len())
+            } else {
+                String::new()
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} total · {active_cnt} running · {seeding_cnt} seeding{sel_txt}",
+                    snap.tasks.len()
+                ))
+                .small()
+                .color(pal.ink_secondary),
+            );
+
+            for link in &snap.links {
+                let chip_fg = if link.weight == 0 {
+                    pal.danger
+                } else if link.fails > 0 {
+                    pal.warn
+                } else {
+                    pal.accent_dark
+                };
+                ui.scope(|ui| {
+                    paint_status_pill(
+                        ui,
+                        &format!("{} {}/s", link.name, humans_bin(link.rate_bps)),
+                        chip_fg,
+                        pal.surface_hover,
+                        chip_fg,
+                    );
+                })
+                .response
+                .on_hover_text(format!(
+                    "{} ({}{}) · cap {}/s · {} conn · weight {}",
+                    link.name,
+                    link.ip,
+                    if link.default_route { ", default" } else { "" },
+                    humans_bin(link.capacity_bps),
+                    link.in_use,
+                    link.weight,
+                ));
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let cap_label = snap
+                    .global_limit
+                    .map(|bps| format!("Cap: {}/s", humans_bin(bps)))
+                    .unwrap_or_else(|| "Cap: Unlimited".into());
+                ui.menu_button(cap_label, |ui| {
+                    let presets: &[(&str, u64)] = &[
+                        ("Unlimited", 0),
+                        ("500 KiB/s", 500 * 1024),
+                        ("1 MiB/s", 1024 * 1024),
+                        ("2 MiB/s", 2 * 1024 * 1024),
+                        ("5 MiB/s", 5 * 1024 * 1024),
+                        ("10 MiB/s", 10 * 1024 * 1024),
+                    ];
+                    for &(lbl, val) in presets {
+                        if ui.button(lbl).clicked() {
+                            if let Some(mut s) = snap.settings.clone() {
+                                s.max_speed_bytes = Some(val);
+                                self.worker.send(UiCommand::SetConfig { settings: s });
+                            }
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Custom limit…").clicked() {
+                        self.settings.open = true;
+                        self.settings.loaded = false;
+                        self.settings.tab = SettingsTab::Connection;
+                        ui.close();
+                    }
+                });
+
+                paint_sparkline(ui, egui::vec2(124.0, 22.0), &snap.rate_history, pal);
+
+                let (gr, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+                paint_icon(ui.painter(), gr, IconId::Gauge, pal.accent);
+
+                let avg_bps = if snap.rate_history.is_empty() {
+                    0.0
+                } else {
+                    snap.rate_history.iter().sum::<f64>() / snap.rate_history.len() as f64
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Now {}/s · 60s avg {}/s",
+                        humans_bin(snap.total_bps as u64),
+                        humans_bin(avg_bps as u64)
+                    ))
+                    .small()
+                    .monospace()
+                    .color(pal.ink),
+                );
+            });
+        });
+    }
+
+    fn render_delete_confirm(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(mut confirm) = self.delete_confirm.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut cancel = false;
+        let mut do_delete = false;
+        egui::Window::new("Remove Download")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(views::modal_frame(ctx, pal))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(egui::vec2(430.0, 190.0))
+            .show(ctx, |ui| {
+                if dialog_header(ui, pal, IconId::Trash, "Remove Download", None) {
+                    cancel = true;
+                }
+                ui.label(format!("Remove {} from the download queue?", confirm.label));
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut confirm.delete_files,
+                    "Also permanently delete downloaded file(s) from disk",
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = egui::Button::new(
+                            egui::RichText::new(if confirm.delete_files {
+                                "Delete Files & Remove"
+                            } else {
+                                "Remove Task"
+                            })
+                            .color(Color32::WHITE)
+                            .strong(),
+                        )
+                        .fill(if confirm.delete_files { pal.danger } else { pal.accent });
+                        if ui.add(btn).clicked() {
+                            do_delete = true;
+                        }
+                    });
+                });
+            });
+        if !open || cancel {
+            self.delete_confirm = None;
+        } else if do_delete {
+            self.worker.send(UiCommand::Remove {
+                ids: confirm.ids,
+                delete_files: confirm.delete_files,
+            });
+            self.delete_confirm = None;
+        } else {
+            self.delete_confirm = Some(confirm);
+        }
+    }
+
+    fn render_about_dialog(&mut self, ctx: &egui::Context, pal: &Palette) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("About ripdl")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(views::modal_frame(ctx, pal))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(egui::vec2(430.0, 220.0))
+            .show(ctx, |ui| {
+                if dialog_header(ui, pal, IconId::Details, "About ripdl", None) {
+                    close = true;
+                }
+                ui.horizontal(|ui| {
+                    let (logo_rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+                    paint_brand_logo(ui.painter(), logo_rect);
+                    ui.vertical(|ui| {
+                        ui.label(semibold("ripdl", 16.0, pal.ink));
+                        ui.label(
+                            egui::RichText::new(format!("Version v{}", env!("CARGO_PKG_VERSION")))
+                                .small()
+                                .monospace()
+                                .color(pal.ink_secondary),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label("Free, open-source multi-segment download manager in Rust.");
+                ui.label(
+                    egui::RichText::new("Zero telemetry, zero ads, MIT / Apache-2.0 licensed.")
+                        .small()
+                        .color(pal.ink_muted),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if vector_button(ui, pal, IconId::External, "GitHub Repo", 26.0, false, true).clicked() {
+                        views::open_external_url("https://github.com/ShiniM0d0ri/ripdl");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if !open || close {
+            self.about_open = false;
+        }
+    }
+
+    fn render_duplicate_prompt(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(prompt) = self.duplicate_prompt.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        let existing = &prompt.existing;
+        let req = &prompt.request;
+
+        egui::Window::new("Already in Queue")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(views::modal_frame(ctx, pal))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_size(egui::vec2(500.0, 260.0))
+            .show(ctx, |ui| {
+                if dialog_header(
+                    ui,
+                    pal,
+                    IconId::Alert,
+                    "Already in Queue",
+                    Some("This URL matches an existing task in your download list"),
+                ) {
+                    close = true;
+                }
+
+                views::section_card(ui, pal, |ui| {
+                    ui.horizontal(|ui| {
+                        let (tr, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                        paint_file_tile(ui.painter(), tr, &existing.kind, existing.category, pal);
+                        ui.vertical(|ui| {
+                            ui.label(semibold(&existing.name, 13.5, pal.ink));
+                            let progress_txt = match existing.total {
+                                Some(tot) => format!("{} / {}", humans_bin(existing.downloaded), humans_bin(tot)),
+                                None if existing.downloaded > 0 => humans_bin(existing.downloaded),
+                                None => "size unknown".into(),
+                            };
+                            let folder = existing
+                                .dest_file
+                                .as_ref()
+                                .and_then(|p| p.parent())
+                                .or(existing.dest_dir.as_deref())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "—".into());
+                            ui.label(
+                                egui::RichText::new(format!("Progress: {progress_txt}  ·  {folder}"))
+                                    .small()
+                                    .color(pal.ink_muted),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (st_lbl, st_fg, st_bg, st_dot) = state_visuals(&existing.state, pal);
+                            paint_status_pill(ui, st_lbl, st_fg, st_bg, st_dot);
+                        });
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if existing.raw_state == TaskState::Stale && existing.can_refresh_url() {
+                        if vector_button(ui, pal, IconId::Refresh, "Refresh Address…", 28.0, true, true).clicked() {
+                            self.open_refresh_for(existing);
+                            close = true;
+                        }
+                    } else if existing.can_resume() {
+                        if vector_button(ui, pal, IconId::Play, "Resume Existing", 28.0, true, true).clicked() {
+                            self.worker.send(UiCommand::Resume {
+                                ids: vec![existing.id.clone()],
+                            });
+                            self.selected_ids.clear();
+                            self.selected_ids.insert(existing.id.clone());
+                            self.anchor_id = Some(existing.id.clone());
+                            close = true;
+                        }
+                    } else if existing.raw_state == TaskState::Completed && existing.dest_file.is_some() {
+                        if vector_button(ui, pal, IconId::OpenFile, "Open File", 28.0, true, true).clicked() {
+                            self.worker.send(UiCommand::Open {
+                                id: existing.id.clone(),
+                                folder: false,
+                            });
+                            close = true;
+                        }
+                    }
+
+                    if req.kind != ripdl_core::task::TaskKind::Torrent
+                        && vector_button(ui, pal, IconId::Add, "Download Numbered Copy", 28.0, false, true).clicked()
+                    {
+                        self.worker.send(UiCommand::Add {
+                            url: req.url.clone(),
+                            dest_dir: req.dest_dir.clone(),
+                            headers: req.headers.clone(),
+                            start_at: req.start_at,
+                            kind: req.kind,
+                            sequential: req.sequential,
+                            only_files: req.only_files.clone(),
+                            duplicate: ripdl_core::rpc::DuplicatePolicy::Copy,
+                        });
+                        close = true;
+                    }
+
+                    if ui.button("Select in Queue").clicked() {
+                        self.selected_ids.clear();
+                        self.selected_ids.insert(existing.id.clone());
+                        self.anchor_id = Some(existing.id.clone());
+                        close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if !open || close {
+            self.duplicate_prompt = None;
+        }
+    }
+}
+
+impl eframe::App for RipdlNativeApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_worker_events();
+        let snap = self.worker.state.lock().unwrap().clone();
+        let ctx = ui.ctx().clone();
+        let pal = Palette::for_mode(self.theme_mode);
+
+        if let Some(s) = snap.settings.as_ref() {
+            self.hide_to_tray = s.hide_to_tray.unwrap_or(true);
+            if !self.onboarding_checked && snap.connected {
+                self.onboarding_checked = true;
+                let has_profile_files = ripdl_core::transport::app_data_dir()
+                    .is_ok_and(|d| d.join("config.json").is_file() || d.join("queue.json").is_file());
+                if should_auto_open_onboarding(
+                    s,
+                    &snap.tasks,
+                    snap.extension.as_ref(),
+                    has_profile_files,
+                ) {
+                    self.onboarding.reset_from(Some(s));
+                }
+            }
+        }
+
+        while let Ok(action) = self.tray_rx.try_recv() {
+            match action {
+                TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::Quit => {
+                    self.force_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.force_quit
+            && !is_installing()
+            && self.hide_to_tray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        if self.details.task_id.is_some()
+            && self.last_details_poll.elapsed() >= Duration::from_secs(2)
+        {
+            if let Some(id) = self.details.task_id.clone() {
+                self.last_details_poll = Instant::now();
+                self.worker.send(UiCommand::FetchDetails { id });
+            }
+        }
+        if self.lan.open && self.last_lan_poll.elapsed() >= Duration::from_secs(2) {
+            self.last_lan_poll = Instant::now();
+            self.worker.send(UiCommand::FetchLan);
+        }
+
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            let sz = rect.size();
+            if sz.x >= 600.0 && sz.y >= 400.0 && self.saved_window_size != Some(sz) {
+                self.saved_window_size = Some(sz);
+                save_window_size(sz.x, sz.y);
+            }
+        }
+
+        self.handle_shortcuts_and_drop(&ctx, &snap);
+
+        egui::Panel::top("menu")
+            .frame(egui::Frame::default().fill(pal.surface).inner_margin(egui::Margin::symmetric(12, 5)))
+            .show(ui, |ui| self.render_menu_bar(ui, &snap, &pal));
+
+        egui::Panel::top("toolbar")
+            .frame(egui::Frame::default().fill(pal.surface).inner_margin(egui::Margin::symmetric(12, 6)))
+            .show(ui, |ui| self.render_toolbar(ui, &snap, &pal));
+
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::default().fill(pal.surface).inner_margin(egui::Margin::symmetric(12, 6)))
+            .show(ui, |ui| self.render_footer(ui, &snap, &pal));
+
+        egui::Panel::left("sidebar")
+            .default_size(metrics::SIDEBAR_W)
+            .resizable(false)
+            .frame(egui::Frame::default().fill(pal.surface).inner_margin(egui::Margin::symmetric(8, 6)))
+            .show(ui, |ui| self.render_sidebar(ui, &snap, &pal));
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(pal.canvas).inner_margin(egui::Margin::symmetric(14, 10)))
+            .show(ui, |ui| self.render_table_area(ui, &snap, &pal));
+
+        // Drag-and-drop overlay indicator.
+        if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            let screen = ctx.content_rect();
+            let layer = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("drop_hint")));
+            layer.rect_filled(screen, 0.0, pal.scrim);
+            let box_rect = Rect::from_center_size(screen.center(), egui::vec2(340.0, 140.0));
+            layer.rect_filled(box_rect, CornerRadius::same(12), pal.surface);
+            layer.rect_stroke(box_rect, CornerRadius::same(12), Stroke::new(2.0, pal.accent), StrokeKind::Inside);
+            let ir = Rect::from_center_size(box_rect.center() - egui::vec2(0.0, 22.0), egui::vec2(32.0, 32.0));
+            paint_icon(&layer, ir, IconId::Download, pal.accent);
+            layer.text(
+                box_rect.center() + egui::vec2(0.0, 20.0),
+                egui::Align2::CENTER_CENTER,
+                "Drop .torrent file or URL to queue",
+                egui::FontId::new(14.5, egui::FontFamily::Name("semibold".into())),
+                pal.ink,
+            );
+        }
+
+        // Dimmed backdrop scrim underneath modals without polluting AccessKit with unnamed nodes.
+        // Painted on Order::Background (non-area layers drain after all panels in Order::Background
+        // and strictly before modal egui::Windows in Order::Middle).
+        if self.any_modal_open() {
+            let screen = ctx.content_rect();
+            let layer = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, ui.scope_id().with("modal_scrim")));
+            layer.rect_filled(screen, 0.0, pal.scrim);
+        }
+
+        views::onboarding_dialog::show(&ctx, &mut self.onboarding, &snap, &self.worker, &pal);
+        views::add_dialog::show(&ctx, &mut self.add, &snap, &self.worker, &pal);
+        let mut queued_notice: Option<(String, bool)> = None;
+        {
+            let mut emit = |msg: String, is_err: bool| {
+                queued_notice = Some((msg, is_err));
+            };
+            views::details_dialog::show(
+                &ctx,
+                &mut self.details,
+                &mut self.cached_details,
+                &mut self.refresh,
+                &snap,
+                &self.worker,
+                &pal,
+                &mut emit,
+            );
+            views::refresh_dialog::show(&ctx, &mut self.refresh, &self.worker, &pal);
+            views::lan_dialog::show(&ctx, &mut self.lan, &snap, &self.worker, &pal, &mut emit);
+            views::settings_dialog::show(&ctx, &mut self.settings, &snap, &self.worker, &pal, &mut emit);
+        }
+        if let Some((msg, is_err)) = queued_notice {
+            self.set_notice(msg, is_err);
+        }
+        self.render_delete_confirm(&ctx, &pal);
+        self.render_duplicate_prompt(&ctx, &pal);
+        self.render_about_dialog(&ctx, &pal);
+
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TableColumns {
+    name: (f32, f32),
+    kind: (f32, f32),
+    size: (f32, f32),
+    progress: (f32, f32),
+    status: (f32, f32),
+    rate: (f32, f32),
+    peers: Option<(f32, f32)>,
+    eta: Option<(f32, f32)>,
+    actions: (f32, f32),
+}
+
+fn table_columns(total_w: f32, show_eta: bool, show_peers: bool) -> TableColumns {
+    let gap = 6.0_f32;
+    let kind_w = 74.0_f32;
+    let size_w = 102.0_f32;
+    let prog_w = 128.0_f32;
+    let stat_w = 102.0_f32;
+    let rate_w = 84.0_f32;
+    let peers_w = if show_peers { 46.0 } else { 0.0 };
+    let eta_w = if show_eta { 48.0 } else { 0.0 };
+    // Fits `[Refresh Fix] [Details] [Trash]` cleanly (`58 + 4 + 26 + 4 + 26 = 118`) without clipping.
+    let act_w = 120.0_f32;
+
+    let gaps = 6 + usize::from(show_peers) + usize::from(show_eta);
+    let mut fixed = kind_w + size_w + prog_w + stat_w + rate_w + act_w + gap * (gaps as f32);
+    if show_peers {
+        fixed += peers_w;
+    }
+    if show_eta {
+        fixed += eta_w;
+    }
+    let name_w = (total_w - fixed).max(140.0);
+
+    let mut x = 0.0_f32;
+    let mut take = |w: f32| -> (f32, f32) {
+        let span = (x, w);
+        x += w + gap;
+        span
+    };
+
+    let name = take(name_w);
+    let kind = take(kind_w);
+    let size = take(size_w);
+    let progress = take(prog_w);
+    let status = take(stat_w);
+    let rate = take(rate_w);
+    let peers = if show_peers { Some(take(peers_w)) } else { None };
+    let eta = if show_eta { Some(take(eta_w)) } else { None };
+    let actions = take(act_w);
+
+    TableColumns {
+        name,
+        kind,
+        size,
+        progress,
+        status,
+        rate,
+        peers,
+        eta,
+        actions,
+    }
+}
+
+fn paint_static_header(
+    ui: &mut egui::Ui,
+    origin_x: f32,
+    hdr_rect: Rect,
+    span: (f32, f32),
+    label: &str,
+    pal: &Palette,
+) {
+    let rect = Rect::from_min_max(
+        egui::pos2(origin_x + span.0, hdr_rect.min.y + 2.0),
+        egui::pos2(origin_x + span.0 + span.1, hdr_rect.max.y - 2.0),
+    );
+    in_rect_left(ui, rect, |ui| {
+        ui.label(egui::RichText::new(label).size(10.5).strong().color(pal.ink_muted));
+    });
+}
+
+fn in_rect_left(ui: &mut egui::Ui, rect: Rect, add: impl FnOnce(&mut egui::Ui)) {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    add(&mut child);
+}
+
+fn toolbar_sep(ui: &mut egui::Ui, pal: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 22.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.center().x, rect.min.y + 2.0),
+            egui::pos2(rect.center().x, rect.max.y - 2.0),
+        ],
+        Stroke::new(1.0, pal.border),
+    );
+}
+
+fn geometry_path() -> Option<std::path::PathBuf> {
+    ripdl_core::transport::app_data_dir()
+        .ok()
+        .map(|d| d.join("gui-geometry.json"))
+}
+
+fn load_window_size() -> egui::Vec2 {
+    if let Some(p) = geometry_path() {
+        if let Ok(bytes) = std::fs::read(p) {
+            if let Ok(v) = serde_json::from_slice::<[f32; 2]>(&bytes) {
+                if v[0] >= 720.0 && v[1] >= 480.0 && v[0] <= 4096.0 && v[1] <= 2160.0 {
+                    return egui::vec2(v[0], v[1]);
+                }
+            }
+        }
+    }
+    egui::vec2(1180.0, 720.0)
+}
+
+fn save_window_size(w: f32, h: f32) {
+    if let Some(p) = geometry_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(p, format!("[{:.0},{:.0}]", w, h));
+    }
+}
+
+fn theme_path() -> Option<std::path::PathBuf> {
+    ripdl_core::transport::app_data_dir()
+        .ok()
+        .map(|d| d.join("gui-theme.txt"))
+}
+
+fn load_theme_mode() -> ThemeMode {
+    if let Some(p) = theme_path() {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if s.trim().eq_ignore_ascii_case("dark") {
+                return ThemeMode::Dark;
+            }
+        }
+    }
+    ThemeMode::Light
+}
+
+fn save_theme_mode(mode: ThemeMode) {
+    if let Some(p) = theme_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let val = match mode {
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        };
+        let _ = std::fs::write(p, val);
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let instance_guard = match single_instance::claim() {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => return Ok(()),
+        Err(_) => None,
+    };
+
+    std::thread::spawn(|| {
+        let _ = ext_host::sync_managed_extension();
+    });
+
+    let size = load_window_size();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_visible(true)
+        .with_inner_size(size)
+        .with_min_inner_size(egui::vec2(860.0, 520.0));
+    if let Some((rgba, width, height)) = tray::load_icon_rgba() {
+        viewport = viewport.with_icon(Arc::new(egui::IconData {
+            rgba,
+            width,
+            height,
+        }));
+    }
+
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "ripdl",
+        options,
+        Box::new(move |cc| {
+            let (tray_tx, tray_rx) = mpsc::channel();
+            let tray = tray::init(tray_tx.clone(), cc.egui_ctx.clone());
+            if let Some(guard) = instance_guard {
+                let wake_ctx = cc.egui_ctx.clone();
+                let show_tx = tray_tx;
+                guard.spawn_listener(move || {
+                    let _ = show_tx.send(TrayAction::Show);
+                    wake_ctx.request_repaint();
+                });
+            }
+            Ok(Box::new(RipdlNativeApp::new(cc, tray_rx, tray)))
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_columns_never_overflow_and_stay_non_overlapping() {
+        for total_w in [900.0, 960.0, 1280.0] {
+            for (show_eta, show_peers) in [(true, false), (true, true), (false, false)] {
+                let c = table_columns(total_w, show_eta, show_peers);
+                let mut spans = vec![c.name, c.kind, c.size, c.progress, c.status, c.rate];
+                if let Some(p) = c.peers {
+                    spans.push(p);
+                }
+                if let Some(e) = c.eta {
+                    spans.push(e);
+                }
+                spans.push(c.actions);
+                for win in spans.windows(2) {
+                    assert!(
+                        win[0].0 + win[0].1 <= win[1].0,
+                        "columns overlapped at width {total_w}: {win:?}"
+                    );
+                }
+                let last = spans.last().unwrap();
+                assert!(
+                    last.0 + last.1 <= total_w + 0.01,
+                    "actions column clipped ({} > {total_w}) at eta={show_eta} peers={show_peers}",
+                    last.0 + last.1
+                );
+            }
+        }
+    }
 }

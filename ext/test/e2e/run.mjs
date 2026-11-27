@@ -58,7 +58,6 @@ const DIR = {
     src: path.join(RUN_DIR, "src"),
     shots: path.join(RUN_DIR, "shots"),
     profile: path.join(RUN_DIR, "edge-profile"),
-    guiProfile: path.join(RUN_DIR, "gui-profile"),
     ext: path.join(RUN_DIR, "ext"),
 };
 const PIPE = `\\\\.\\pipe\\ripdl-rpc-e2e-${RUN}`;
@@ -186,9 +185,9 @@ function killTree(pid) {
     execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => {});
 }
 
-function spawnTracked(exe, args, env, logName) {
+function spawnTracked(exe, args, env, logName, hideWindow = true) {
     const log = fs.openSync(path.join(RUN_DIR, logName), "a");
-    const child = spawn(exe, args, { env, stdio: ["ignore", log, log], windowsHide: true });
+    const child = spawn(exe, args, { env, stdio: ["ignore", log, log], windowsHide: hideWindow });
     procs.push(child);
     return child;
 }
@@ -1108,6 +1107,23 @@ async function extPhase() {
             await opt.close();
         });
 
+        await step("B13b welcome page renders & confirms bridge", async () => {
+            const wel = await openExtPage("welcome.html");
+            const pill = await until(
+                "welcome bridge state settles",
+                async () => {
+                    const txt = await evaluate(wel.conn, "(document.querySelector('#state-pill')||{}).textContent||''");
+                    return txt && !txt.includes("Checking") ? txt : null;
+                },
+                15000,
+                250,
+            ).catch(() => "");
+            const info = await evaluate(wel.conn, "(document.querySelector('#ver-label')||{}).textContent||''");
+            check("B13b welcome page shows bridge status", pill.includes("Connected"), `${pill} (${info})`);
+            await shotOf(wel.conn, "b13b-welcome.png");
+            await wel.close();
+        });
+
         await step("B14 daemon down: the browser keeps its own copy", async () => {
             await stopDaemon();
             check("B14 the private daemon is stopped", (await runRipdl(["ls"], 4000)).code !== 0);
@@ -1180,28 +1196,101 @@ async function extPhase() {
     }
 }
 
+function captureNativeWindow(pid, outPng) {
+    const cs = `
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public struct E2ERect { public int Left, Top, Right, Bottom; }
+public class E2EU32 {
+    public delegate bool EnumProc(IntPtr h, IntPtr lp);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr lp);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out E2ERect r);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    public static IntPtr FindMainWindow(uint targetPid) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((h, lp) => {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if (p != targetPid || !IsWindowVisible(h)) return true;
+            var sb = new StringBuilder(128);
+            GetWindowText(h, sb, sb.Capacity);
+            if (sb.ToString() == "ripdl") { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}`;
+    const ps = [
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -AssemblyName System.Drawing",
+        `if (-not ('E2EU32' -as [type])) {\nAdd-Type -TypeDefinition @'\n${cs}\n'@\n}`,
+        `$hwnd = [E2EU32]::FindMainWindow([uint32]${pid})`,
+        "$r = New-Object E2ERect",
+        "$vis = ($hwnd -ne [IntPtr]::Zero) -and [E2EU32]::IsWindowVisible($hwnd)",
+        "$rectOk = $vis -and [E2EU32]::GetWindowRect($hwnd, [ref]$r)",
+        "$w = [Math]::Max(1, $r.Right - $r.Left); $h = [Math]::Max(1, $r.Bottom - $r.Top)",
+        "if ($rectOk -and $w -ge 600 -and $h -ge 400) {",
+        "  $topmost = [IntPtr]::new(-1); $notopmost = [IntPtr]::new(-2)",
+        "  [void][E2EU32]::SetWindowPos($hwnd, $topmost, 0, 0, 0, 0, 0x0043)",
+        "  [void][E2EU32]::SetForegroundWindow($hwnd)",
+        "  Start-Sleep -Milliseconds 350",
+        "  [void][E2EU32]::GetWindowRect($hwnd, [ref]$r)",
+        "  $w = [Math]::Max(1, $r.Right - $r.Left); $h = [Math]::Max(1, $r.Bottom - $r.Top)",
+        "  $bmp = New-Object System.Drawing.Bitmap $w, $h",
+        "  $g = [System.Drawing.Graphics]::FromImage($bmp)",
+        "  $g.CopyFromScreen($r.Left, $r.Top, 0, 0, $bmp.Size)",
+        `  $bmp.Save('${outPng.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png)`,
+        "  $g.Dispose(); $bmp.Dispose()",
+        "  [void][E2EU32]::SetWindowPos($hwnd, $notopmost, 0, 0, 0, 0, 0x0003)",
+        "}",
+        "@{ hwnd = [int64]$hwnd; title = $(if ($vis) { 'ripdl' } else { '' }); vis = $vis; rectOk = $rectOk; w = $w; h = $h } | ConvertTo-Json -Compress",
+    ].join("\n");
+    const encoded = Buffer.from(ps, "utf16le").toString("base64");
+    const res = spawnSync("powershell", ["-NoProfile", "-EncodedCommand", encoded], { encoding: "utf8", windowsHide: true });
+    if (res.status !== 0) return null;
+    try {
+        return JSON.parse((res.stdout || "").trim());
+    } catch {
+        return null;
+    }
+}
+
 async function guiPhase() {
-    section("GUI (single instance and screenshots)");
+    section("GUI (native desktop window, single instance, and screenshot)");
     if (!fs.existsSync(GUI)) {
         check("C0 GUI binary is built", false, GUI);
         return;
     }
-    const dbg = await freePort();
-    const gui1 = spawnTracked(GUI, [], { ...ENV, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${dbg}` }, "gui1.log");
-    const page = await until(
-        "the GUI page target",
+    const shortPipe = GUI_PIPE.replace(/^\\\\\.\\pipe\\/, "");
+    const gui1 = spawnTracked(GUI, [], ENV, "gui1.log", false);
+    const shotPath = path.join(DIR.shots, "c1-gui-main.png");
+    const info = await until(
+        "native GUI window and single-instance pipe",
         async () => {
-            const list = await getJson(`http://127.0.0.1:${dbg}/json/list`).catch(() => []);
-            return list.find((t) => t.type === "page") ?? null;
+            if (!alive(gui1)) throw new Error("ripdl-gui.exe exited unexpectedly");
+            const pipeOk = fs.readdirSync("\\\\.\\pipe\\").includes(shortPipe);
+            if (!pipeOk) return null;
+            const st = captureNativeWindow(gui1.pid, shotPath);
+            return st && st.hwnd > 0 && st.vis && st.rectOk && st.w >= 600 && st.h >= 400 ? st : null;
         },
-        90000,
+        45000,
         500,
-    ).catch(() => null);
-    check("C0 first GUI window is up (WebView2 page target)", !!page, page ? page.url : "no page target");
-    if (!page) return;
-    await sleep(3000);
+    ).catch((err) => {
+        check("C0 first native GUI window and single-instance pipe are up", false, err.message);
+        return null;
+    });
+    if (!info) return;
+    check("C0 first native GUI window and single-instance pipe are up", true, `${info.title} (${info.w}x${info.h})`);
+    // Wait one full tick so the main window finishes initial render + daemon poll, then recapture cleanly.
+    await sleep(1500);
+    captureNativeWindow(gui1.pid, shotPath);
+    if (fs.existsSync(shotPath)) shots.push("c1-gui-main.png");
 
-    const gui2 = spawnTracked(GUI, [], ENV, "gui2.log");
+    const gui2 = spawnTracked(GUI, [], ENV, "gui2.log", false);
     const code2 = await new Promise((resolve) => {
         const t = setTimeout(() => resolve("still running"), 25000);
         gui2.once("exit", (code) => {
@@ -1212,148 +1301,8 @@ async function guiPhase() {
     check("C1 second GUI launch hands off to the first and exits", code2 === 0, `exit ${code2}`);
     check("C1 first GUI instance stays up", alive(gui1));
 
-    const ws = connect(page.webSocketDebuggerUrl);
-    await ws.ready;
-    await ws.send("Page.enable");
-    await ws.send("Runtime.enable");
-    await sleep(2500);
-    await shotOf(ws, "c1-gui-main.png");
-    const opened = await evaluate(
-        ws,
-        `(() => { const b = document.querySelector('button[title^="Settings"]'); if (b) { b.click(); return true; } return false; })()`,
-    );
-    check("C2 Settings button found and pressed", opened === true);
-    await sleep(1000);
-    await shotOf(ws, "c2-gui-settings.png");
-    await evaluate(ws, `(() => { document.querySelector('#set-close').click(); return true; })()`);
-    await sleep(500);
-
-    // C3: the Add URL dialog opens and is cancelled without a request.
-    // Send and receive stays closed: opening it runs a LAN discovery
-    // broadcast, which this gate does not do.
-    await evaluate(ws, `(() => { document.querySelector('#btn-add').click(); return true; })()`);
-    await sleep(800);
-    const addOpen = await evaluate(
-        ws,
-        `(() => { const d = document.querySelector('#dlg-backdrop'); return !!d && !d.classList.contains('hidden'); })()`,
-    );
-    check("C3 Add URL dialog opens", addOpen === true);
-    await shotOf(ws, "c3-gui-add-url.png");
-    await evaluate(ws, `(() => { document.querySelector('#dlg-cancel').click(); return true; })()`);
-    await sleep(400);
-
-    // C4: status-bar uplink chips ("name rate spark state"). Bonding is
-    // turned on for the private daemon late (not in isolateDaemon) so it
-    // never touches the earlier phases' loopback engine dialing or the
-    // torrent session setup. The HTTP bond publishes the machine's real
-    // uplinks on its 5 s tick; the chips sample every 2 s.
-    const bondOn = await runRipdl(["config", "bond_interfaces=true"], 10000);
-    check("C4 private daemon bonding turned on", bondOn.code === 0, bondOn.out.trim());
-    let chipsOk = false;
-    try {
-        await until(
-            "uplink chips to appear",
-            async () =>
-                evaluate(
-                    ws,
-                    `(() => { const b = document.querySelector('#st-uplinks'); return !!(b && !b.hidden && b.children.length); })()`,
-                ),
-            45000,
-            500,
-        );
-        chipsOk = true;
-    } catch (_) { /* render untouched; the check below reports it */ }
-    check("C4 bonding uplink chips appear in the status bar", chipsOk, "no #st-uplinks children");
-    const chips = await evaluate(
-        ws,
-        `(() => [...document.querySelectorAll('.uplink-chip')].map((c) => ({
-            text: c.textContent.trim(),
-            word: c.textContent.trim().split(/\\s+/).pop(),
-            title: c.title,
-        })))()`,
-    );
-    const words = [...new Set(chips.map((c) => c.word))];
-    check(
-        "C4 each chip carries a state word and a full tooltip",
-        chips.length > 0 &&
-            words.length > 0 &&
-            words.every((w) => ["active", "idle", "flaky", "dead"].includes(w)) &&
-            chips.every((c) => c.title.includes("now") && c.title.includes("preference weight")),
-        JSON.stringify(chips).slice(0, 500),
-    );
-    await shotOf(ws, "c4-gui-uplinks.png");
-
-    // A chip is a pointer into Settings > Network (where the toggle lives).
-    await evaluate(
-        ws,
-        `(() => { const c = document.querySelector('.uplink-chip'); if (c) c.click(); return !!c; })()`,
-    );
-    await sleep(900);
-    const netVisible = await evaluate(
-        ws,
-        `(() => { const p = document.querySelector('#set-panel-network'); return !!p && !p.classList.contains('hidden'); })()`,
-    );
-    check("C4 clicking a chip opens Settings > Network", netVisible === true);
-    await shotOf(ws, "c4-gui-settings-network.png");
-
-    // The NIC cards write bond_exclude: uncheck the first card and save.
-    // The CLI read-back proves the exclusion landed AND that the
-    // full-replace save rode the snapshot (default_download_dir still points
-    // at the run folder - a naive save would have reset it to defaults).
-    const toggled = await evaluate(
-        ws,
-        `(() => { const b = document.querySelector('.bond-nic input[type=checkbox]'); if (!b) return false; b.click(); return true; })()`,
-    );
-    check("C4 a NIC card checkbox exists", toggled === true);
-    if (toggled) {
-        await sleep(300);
-        await evaluate(ws, `(() => { document.querySelector('#set-ok').click(); return true; })()`);
-        await sleep(900);
-        const cfg = await runRipdl(["config"], 20000);
-        check(
-            "C4 card save wrote bond_exclude and kept the rest of the config",
-            cfg.code === 0 &&
-                /bond_exclude:/i.test(cfg.out) &&
-                cfg.out.includes(DIR.downloads),
-            cfg.out.split("\n").filter((l) => /bond_exclude|default_download_dir/.test(l)).join(" | ").slice(0, 200),
-        );
-    }
-    await evaluate(ws, `(() => { const c = document.querySelector('#set-close'); if (c && !document.querySelector('#set-backdrop').classList.contains('hidden')) c.click(); return true; })()`);
-    await sleep(400);
-
-    // C5: Help > About. The brand mark must be the real SVG tile (not a
-    // text glyph), the version badge filled from the running build, and
-    // the flat design language intact.
-    await evaluate(ws, `(() => { document.querySelector('#menubar span[data-menu=help]').click(); return true; })()`);
-    await sleep(300);
-    const aboutClicked = await evaluate(
-        ws,
-        `(() => { const mi = [...document.querySelectorAll('#menudrop .menu-item')].find((m) => m.textContent.includes('About')); if (!mi) return false; mi.click(); return true; })()`,
-    );
-    await sleep(500);
-    const about = await evaluate(
-        ws,
-        `(() => {
-            const abt = document.querySelector('#abt');
-            const open = !!abt && !document.querySelector('#abt-backdrop').classList.contains('hidden');
-            return {
-                open,
-                mark: !!abt.querySelector('.abt-mark'),
-                ver: abt.querySelector('.abt-ver').textContent,
-                chips: abt.querySelectorAll('.abt-chip').length,
-                links: abt.querySelectorAll('.abt-links button').length,
-            };
-        })()`,
-    );
-    check(
-        "C5 About opens with the brand mark and version badge",
-        aboutClicked === true && about.open === true && about.mark && about.ver.length > 0 && about.chips >= 3 && about.links >= 3,
-        JSON.stringify(about),
-    );
-    await shotOf(ws, "c5-gui-about.png");
-    await evaluate(ws, `(() => { document.querySelector('#abt-close').click(); return true; })()`);
-    await sleep(300);
-    ws.close();
+    const shotOk = fs.existsSync(shotPath) && fs.statSync(shotPath).size > 2048;
+    check("C2 native GUI screenshot captured cleanly", shotOk, shotOk ? `${fs.statSync(shotPath).size} bytes` : "missing screenshot");
     killTree(gui1.pid);
 }
 
@@ -1376,8 +1325,6 @@ async function main() {
         RIPDL_RPC_PIPE: PIPE,
         RIPDL_RPC_PORT: String(RPC_PORT),
         RIPDL_GUI_PIPE: GUI_PIPE,
-        // The GUI gets its own WebView2 profile, never the installed app's.
-        WEBVIEW2_USER_DATA_FOLDER: DIR.guiProfile,
     };
     console.log(`run ${RUN}: ${RUN_DIR}`);
     // A previous harness run killed mid-phase (timeout, exception) can leave

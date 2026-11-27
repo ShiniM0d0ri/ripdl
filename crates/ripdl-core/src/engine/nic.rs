@@ -31,6 +31,19 @@ const BLOCKED_NAMES: &[&str] = &[
     "zerotier",
     "openvpn",
     "hamachi",
+    "nordlynx",
+    "protonvpn",
+    "proton vpn",
+    "mullvad",
+    "cloudflare warp",
+    "warp",
+    "wintun",
+    "radmin",
+    "utun",
+    "tun0",
+    "tun1",
+    "tun2",
+    "tun3",
     "tap-",
     "tap adapter",
     "tunnel adapter",
@@ -140,14 +153,27 @@ pub fn bonded_nics() -> Vec<UplinkNic> {
 /// does not disable bonding for everybody.
 const PROBE_TARGETS_V4: &[(Ipv4Addr, u16)] = &[
     (Ipv4Addr::new(1, 1, 1, 1), 443),
+    (Ipv4Addr::new(9, 9, 9, 9), 443),
     (Ipv4Addr::new(8, 8, 8, 8), 53),
+    (Ipv4Addr::new(208, 67, 222, 222), 443),
 ];
 
 /// Same idea over IPv6: some tether/CGNAT paths drop IPv4 long before v6.
 const PROBE_TARGETS_V6: &[(std::net::Ipv6Addr, u16)] = &[
     (std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111), 443),
+    (std::net::Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe), 443),
     (std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888), 53),
 ];
+
+/// Parse optional `RIPDL_PROBE_TARGETS` (`ip:port,ip:port`) overrides.
+fn configured_probe_targets() -> Option<Vec<SocketAddr>> {
+    let raw = std::env::var("RIPDL_PROBE_TARGETS").ok()?;
+    let addrs: Vec<SocketAddr> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<SocketAddr>().ok())
+        .collect();
+    (!addrs.is_empty()).then_some(addrs)
+}
 
 /// How long one uplink gets to complete a TCP handshake.
 const UPLINK_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
@@ -199,21 +225,28 @@ async fn probe_family(src: IpAddr, targets: &[SocketAddr]) -> bool {
 /// peer connections to it turned 86% of dial attempts into 6 s timeouts and
 /// left 11 live peers where the same swarm then held 45.
 async fn uplink_carries_traffic(nic: &UplinkNic) -> bool {
-    let v4: Vec<SocketAddr> = PROBE_TARGETS_V4
-        .iter()
-        .map(|(ip, port)| SocketAddr::from((*ip, *port)))
-        .collect();
-    if probe_family(IpAddr::V4(nic.addr), &v4).await {
+    let custom = configured_probe_targets();
+    let v4: Vec<SocketAddr> = match &custom {
+        Some(addrs) => addrs.iter().copied().filter(|a| a.is_ipv4()).collect(),
+        None => PROBE_TARGETS_V4
+            .iter()
+            .map(|(ip, port)| SocketAddr::from((*ip, *port)))
+            .collect(),
+    };
+    if !v4.is_empty() && probe_family(IpAddr::V4(nic.addr), &v4).await {
         return true;
     }
     let Some(v6_src) = nic.v6 else {
         return false;
     };
-    let targets: Vec<SocketAddr> = PROBE_TARGETS_V6
-        .iter()
-        .map(|(ip, port)| SocketAddr::from((*ip, *port)))
-        .collect();
-    probe_family(IpAddr::V6(v6_src), &targets).await
+    let targets: Vec<SocketAddr> = match &custom {
+        Some(addrs) => addrs.iter().copied().filter(|a| a.is_ipv6()).collect(),
+        None => PROBE_TARGETS_V6
+            .iter()
+            .map(|(ip, port)| SocketAddr::from((*ip, *port)))
+            .collect(),
+    };
+    !targets.is_empty() && probe_family(IpAddr::V6(v6_src), &targets).await
 }
 
 /// Discovery plus a live reachability check, split so frontends can explain
@@ -373,5 +406,16 @@ mod tests {
             .await,
             "a closed port must not count as a working path"
         );
+    }
+
+    #[test]
+    fn new_vpn_adapters_are_excluded() {
+        assert!(virtual_adapter("NordLynx", Some("NordLynx Tunnel"), None));
+        assert!(virtual_adapter("ProtonVPN", None, Some("Proton VPN Tunnel")));
+        assert!(virtual_adapter("Mullvad", Some("Mullvad Tunnel"), None));
+        assert!(virtual_adapter("CloudflareWARP", Some("Cloudflare WARP"), None));
+        assert!(virtual_adapter("utun4", None, None));
+        assert!(virtual_adapter("tun0", Some("Wintun Userspace Tunnel"), None));
+        assert!(!virtual_adapter("Realtek PCIe 2.5GbE", Some("Ethernet"), None));
     }
 }

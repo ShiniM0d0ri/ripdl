@@ -138,6 +138,12 @@ enum Cmd {
         /// Group and print the result without queueing anything.
         #[arg(long = "preview")]
         preview: bool,
+        /// Start the bundle after a delay, e.g. `30s`, `1h30m`, `2d`.
+        #[arg(long = "after")]
+        after: Option<String>,
+        /// Start at local wall-clock time `HH:MM` (today, or tomorrow if past).
+        #[arg(long = "at")]
+        at: Option<String>,
     },
     /// List tasks known to the daemon.
     Ls,
@@ -173,6 +179,9 @@ enum Cmd {
         /// Bundle-only: refresh just this part (the number in its name).
         #[arg(long)]
         part: Option<u32>,
+        /// Validate the new URL and kept bytes without changing the task.
+        #[arg(long = "probe-only")]
+        probe_only: bool,
     },
     /// Append links to an existing bundle ("I forgot part 7"). New links
     /// must name parts of that bundle; URLs already in it are skipped. The
@@ -205,7 +214,7 @@ enum Cmd {
         /// bond_exclude (comma-separated adapter names, empty = clear),
         /// update_check, update_auto_install, seed_enabled (true|false),
         /// seed_ratio (0 = unlimited), seed_time_min (0 = never),
-        /// lan_enabled, lan_port, lan_dir, lan_open.
+        /// lan_enabled, lan_port, lan_dir, lan_open, lan_code, extension_dir.
         #[arg(value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
@@ -241,6 +250,9 @@ enum Cmd {
         /// installed ripdl.
         #[arg(long)]
         force: bool,
+        /// Open the browser extension welcome page after registering.
+        #[arg(long)]
+        open_welcome: bool,
     },
     /// Manage user script plugins for the browser extension: `ripdl plugin
     /// add <file.js>` copies the script into the extension's `hosts/local/`
@@ -385,12 +397,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Add { url, dest, header, referer, cookie, user_agent, after, at, video, torrent, sequential, only } => {
-            let start_at = match (&after, &at) {
-                (Some(_), Some(_)) => bail!("use --after or --at, not both"),
-                (Some(delay), None) => Some(now_unix() + parse_after(delay)? as i64),
-                (None, Some(when)) => Some(parse_at(when)?),
-                (None, None) => None,
-            };
+            let start_at = resolve_start_at(&after, &at)?;
             let headers = collect_headers(&header, referer, cookie, user_agent)?;
             let kind = if video {
                 ripdl_core::task::TaskKind::Video
@@ -420,7 +427,8 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Cmd::Bundle { urls, name, dest, header, referer, cookie, preview } => {
+        Cmd::Bundle { urls, name, dest, header, referer, cookie, preview, after, at } => {
+            let start_at = resolve_start_at(&after, &at)?;
             let headers = collect_headers(&header, referer, cookie, None)?;
             let parts: Vec<BundlePart> = urls
                 .iter()
@@ -443,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
                     name,
                     dest_dir: dest,
                     parts,
-                    start_at: None,
+                    start_at,
                 })
                 .await
             }
@@ -461,7 +469,9 @@ async fn main() -> anyhow::Result<()> {
             }
             LanCmd::Send { path, to, code } => send_watch(path, to, code).await,
         },
-        Cmd::RegisterHost { ext_id, host, force } => register_host(&ext_id, &host, force),
+        Cmd::RegisterHost { ext_id, host, force, open_welcome } => {
+            register_host(&ext_id, &host, force, open_welcome)
+        }
         Cmd::Ls => rpc(Command::List).await,
         Cmd::Traffic { json } => {
             let reply = rpc_reply(Command::GetTrafficSnapshot).await?;
@@ -484,17 +494,33 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
         Cmd::Details { id } => rpc(Command::Details { id }).await,
-        Cmd::Refresh { id, url, resume, part } => {
+        Cmd::Refresh { id, url, resume, part, probe_only } => {
             let reply = rpc_reply(Command::RefreshUrl {
                 id: id.clone(),
                 url,
-                resume,
+                resume: resume && !probe_only,
                 part,
-                probe_only: false,
+                probe_only,
             })
             .await?;
             match reply {
                 Reply::Refreshed { kept, total, part: seq, .. } => {
+                    if probe_only {
+                        if let Some(seq) = seq {
+                            println!(
+                                "part {seq} verified: would keep {} of {} already on disk (dry run)",
+                                humans(kept),
+                                total.map(humans).unwrap_or_else(|| "?".to_string())
+                            );
+                        } else {
+                            println!(
+                                "address verified: would keep {} of {} already on disk (dry run)",
+                                humans(kept),
+                                total.map(humans).unwrap_or_else(|| "?".to_string())
+                            );
+                        }
+                        return Ok(());
+                    }
                     if let Some(seq) = seq {
                         println!(
                             "part {seq} address refreshed: keeping {} of {} already on disk",
@@ -584,7 +610,10 @@ async fn main() -> anyhow::Result<()> {
                         settings.max_segments = Some(val.parse().context("max_segments needs a number (1..)")?)
                     }
                     "min_segment_size" => {
-                        settings.min_segment_size = Some(val.parse().context("min_segment_size needs a number (1..)")?)
+                        settings.min_segment_size = Some(
+                            parse_byte_size(val, 1, "min_segment_size")
+                                .context("min_segment_size needs bytes or e.g. 4MiB")?,
+                        )
                     }
                     "max_speed_bytes" | "max_speed" => {
                         let n = if val == "0" || val.eq_ignore_ascii_case("unlimited") {
@@ -651,6 +680,15 @@ async fn main() -> anyhow::Result<()> {
                     "lan_open" => {
                         settings.lan_open =
                             Some(val.parse().context("lan_open needs true|false")?)
+                    }
+                    "lan_code" => {
+                        if val.is_empty() {
+                            settings.lan_code = None;
+                        } else if !ripdl_core::rpc::is_valid_lan_code(val) {
+                            bail!("lan_code must be at least 6 ASCII alphanumeric characters");
+                        } else {
+                            settings.lan_code = Some(val.to_string());
+                        }
                     }
                     other => bail!("unknown setting {other:?} (see: ripdl config --help)"),
                 }
@@ -1568,7 +1606,7 @@ fn parse_header(s: &str) -> anyhow::Result<(String, String)> {
 
 /// Write the native-messaging manifest and point the browser's registry keys
 /// at it (HKCU, so no admin window ever appears).
-fn register_host(ext_ids: &[String], host: &str, force: bool) -> anyhow::Result<()> {
+fn register_host(ext_ids: &[String], host: &str, force: bool, open_welcome: bool) -> anyhow::Result<()> {
     if host.is_empty()
         || !host
             .chars()
@@ -1701,7 +1739,31 @@ fn register_host(ext_ids: &[String], host: &str, force: bool) -> anyhow::Result<
     } else {
         println!("next: load the extension unpacked (chrome://extensions -> Developer mode -> Load unpacked)");
     }
+    if open_welcome {
+        let url = format!("chrome-extension://{}/welcome.html", ripdl_core::bridge::PINNED_EXT_ID);
+        open_browser_url(&url);
+    }
     Ok(())
+}
+
+fn open_browser_url(url: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }
 
 /// `true` when the exe lives in a cargo build tree (`…\target\debug\x.exe`
@@ -1735,28 +1797,43 @@ fn validate_ext_id(id: &str, strict: bool) -> anyhow::Result<()> {
     bail!("extension id must be 32 letters a-p, got '{id}'")
 }
 
+fn resolve_start_at(after: &Option<String>, at: &Option<String>) -> anyhow::Result<Option<i64>> {
+    match (after, at) {
+        (Some(_), Some(_)) => bail!("use --after or --at, not both"),
+        (Some(delay), None) => Ok(Some(now_unix() + parse_after(delay)? as i64)),
+        (None, Some(when)) => Ok(Some(parse_at(when)?)),
+        (None, None) => Ok(None),
+    }
+}
+
 /// Parse a human speed cap like `500k`, `2.5m`, `1g`, or plain bytes/sec.
 /// Caps below 1 KiB/s are rejected as obviously accidental.
 fn parse_speed(s: &str) -> anyhow::Result<u64> {
+    parse_byte_size(s, 1024, "speed")
+}
+
+/// Shared binary-unit size parser (`500k`, `4MiB`, `2.5g`, or raw bytes).
+fn parse_byte_size(s: &str, min_bytes: u64, label: &str) -> anyhow::Result<u64> {
     let s = s.trim().to_ascii_lowercase();
     let cut = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
     let mult = match s[cut.len()..].trim() {
         "" => 1u64,
         // Accept the friendly spellings too: kb/kib/k, miB/mib/m, etc.
+        "b" => 1u64,
         "k" | "kb" | "kib" => 1024,
         "m" | "mb" | "mib" => 1024 * 1024,
         "g" | "gb" | "gib" => 1024 * 1024 * 1024,
-        other => bail!("unknown speed suffix '{other}' (use k, m, or g)"),
+        other => bail!("unknown {label} suffix '{other}' (use k, m, or g)"),
     };
-    let v: f64 = cut.trim().parse().context("invalid speed number")?;
-    if v < 0.0 {
-        bail!("speed cannot be negative");
+    let v: f64 = cut.trim().parse().with_context(|| format!("invalid {label} number"))?;
+    if !v.is_finite() || v < 0.0 {
+        bail!("{label} cannot be negative");
     }
-    let bps = (v * mult as f64) as u64;
-    if bps < 1024 {
-        bail!("minimum speed cap is 1k");
+    let bytes = (v * mult as f64) as u64;
+    if bytes < min_bytes {
+        bail!("minimum {label} is {min_bytes} bytes");
     }
-    Ok(bps)
+    Ok(bytes)
 }
 
 fn parse_only(spec: &str) -> anyhow::Result<Vec<usize>> {

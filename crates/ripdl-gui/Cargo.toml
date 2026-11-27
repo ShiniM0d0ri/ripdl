@@ -1,9 +1,10 @@
 [package]
 name = "ripdl-gui"
-description = "Desktop GUI for ripdl (Tauri shell over the daemon RPC)"
+description = "Desktop GUI for ripdl (native egui shell over the daemon RPC)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "ripdl-gui"
@@ -16,17 +17,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = "6"
 rfd = "0.15"
+eframe = "0.37"
+egui = "0.37"
+tray-icon = "0.25"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
-tauri-build = "2"
-
-[dependencies.tauri]
-version = "2"
-features = ["tray-icon"]
-
-# Suspend the WebView2 while the window sits in the tray (webview_mem.rs).
-# Both crates are already in the tree through wry; pin to the versions wry
-# resolves so the COM interface types stay identical.
-[target.'cfg(windows)'.dependencies]
-webview2-com = "0.39"
-windows-core = "0.62"
+embed-resource = "3.0"

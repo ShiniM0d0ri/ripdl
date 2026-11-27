@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -111,10 +111,61 @@ struct QueueFileRef<'a> {
 
 struct TaskRuntime {
     token: CancellationToken,
+    run_id: u64,
     #[cfg(feature = "unified-traffic")]
     traffic: Arc<TaskTraffic>,
-    #[cfg(feature = "unified-traffic")]
-    run_id: u64,
+}
+
+/// Live-resizable concurrency slot gate so lowering `max_concurrent` stops
+/// queued runners from entering before running tasks drain (without sem drift).
+struct SlotGate {
+    state: Mutex<(usize, usize)>,
+    notify: tokio::sync::Notify,
+}
+
+struct SlotPermit<'a>(&'a SlotGate);
+
+impl Drop for SlotPermit<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap();
+        s.0 = s.0.saturating_sub(1);
+        drop(s);
+        self.0.notify.notify_waiters();
+    }
+}
+
+impl SlotGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new((0, limit.max(1))),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn set_limit(&self, limit: usize) {
+        self.state.lock().unwrap().1 = limit.max(1);
+        self.notify.notify_waiters();
+    }
+
+    async fn acquire(&self, token: &CancellationToken) -> Option<SlotPermit<'_>> {
+        loop {
+            if token.is_cancelled() {
+                return None;
+            }
+            let notified = self.notify.notified();
+            {
+                let mut s = self.state.lock().unwrap();
+                if s.0 < s.1 {
+                    s.0 += 1;
+                    return Some(SlotPermit(self));
+                }
+            }
+            tokio::select! {
+                _ = token.cancelled() => return None,
+                _ = notified => {}
+            }
+        }
+    }
 }
 
 /// One active seeding watcher. The generation makes stale watchers harmless:
@@ -244,6 +295,8 @@ struct Daemon {
     config: Mutex<DaemonConfig>,
     records: Mutex<Vec<TaskRecord>>,
     progress: Mutex<HashMap<String, ProgressTrack>>,
+    /// Removed task IDs so late detached runners cannot re-populate `progress`.
+    tombstones: Mutex<HashSet<String>>,
     runtime: Mutex<HashMap<String, TaskRuntime>>,
     /// One token per completed torrent currently being served to the swarm.
     /// Separate from `runtime`: seeding must not hold a download semaphore
@@ -290,10 +343,12 @@ struct Daemon {
     traffic: Arc<TrafficController>,
     #[cfg(feature = "unified-traffic")]
     links: Arc<LinkSet>,
-    #[cfg(feature = "unified-traffic")]
     link_sample_at: Mutex<Option<Instant>>,
+    #[allow(dead_code)]
+    run_seq: std::sync::atomic::AtomicU64,
+    persist_lock: Mutex<()>,
     shutdown: tokio::sync::Notify,
-    sem: Arc<tokio::sync::Semaphore>,
+    slots: Arc<SlotGate>,
     /// Set during an install fetch (concurrent ones would share a .part).
     update_busy: std::sync::atomic::AtomicBool,
     /// LAN drop box listener. Dropped (tasks aborted) whenever receiving is
@@ -394,6 +449,7 @@ impl Daemon {
             config: Mutex::new(config),
             records: Mutex::new(records),
             progress: Mutex::new(HashMap::new()),
+            tombstones: Mutex::new(HashSet::new()),
             runtime: Mutex::new(HashMap::new()),
             seeders: Mutex::new(HashMap::new()),
             seed_gen: std::sync::atomic::AtomicU64::new(0),
@@ -413,9 +469,10 @@ impl Daemon {
             traffic: TrafficController::new(initial_speed),
             #[cfg(feature = "unified-traffic")]
             links: LinkSet::new(),
-            #[cfg(feature = "unified-traffic")]
             link_sample_at: Mutex::new(None),
-            sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            run_seq: std::sync::atomic::AtomicU64::new(0),
+            persist_lock: Mutex::new(()),
+            slots: Arc::new(SlotGate::new(max_concurrent)),
             update_busy: std::sync::atomic::AtomicBool::new(false),
             lan: tokio::sync::Mutex::new(None),
             lan_sends: Mutex::new(Vec::new()),
@@ -870,8 +927,10 @@ impl Daemon {
         });
     }
 
-    fn persist(&self, records: &[TaskRecord]) -> Result<()> {
-        atomic_write_json(&self.queue_path, &QueueFileRef { tasks: records })?;
+    fn persist(&self, _records: &[TaskRecord]) -> Result<()> {
+        let _guard = self.persist_lock.lock().unwrap();
+        let current = self.records.lock().unwrap().clone();
+        atomic_write_json(&self.queue_path, &QueueFileRef { tasks: &current })?;
         Ok(())
     }
 
@@ -1034,15 +1093,18 @@ impl Daemon {
     }
 
     async fn handle_conn(self: Arc<Self>, stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin) -> Result<()> {
+        const MAX_RPC_LINE_BYTES: usize = 16 * 1024 * 1024;
+        const MAX_AUTH_LINE_BYTES: usize = 4096;
+
         let (read, mut write) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read).lines();
+        let mut reader = BufReader::new(read);
 
         // Every connection opens with the daemon token (see
         // `transport::auth_line`). Anything else gets one refusal with id 0
         // and is closed before any command is read.
-        let authorized = match lines.next_line().await? {
-            Some(first) => ripdl_core::transport::auth_matches(first.trim(), &self.rpc_token),
-            None => false,
+        let authorized = match read_bounded_line(&mut reader, MAX_AUTH_LINE_BYTES).await {
+            Ok(Some(first)) => ripdl_core::transport::auth_matches(first.trim(), &self.rpc_token),
+            Ok(None) | Err(_) => false,
         };
         if !authorized {
             let refusal = Response {
@@ -1055,7 +1117,21 @@ impl Daemon {
             return Ok(());
         }
 
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            let line = match read_bounded_line(&mut reader, MAX_RPC_LINE_BYTES).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(message) => {
+                    let resp = Response {
+                        id: 0,
+                        reply: Reply::Error { message },
+                    };
+                    let mut out = serde_json::to_string(&resp).context("serialize response")?;
+                    out.push('\n');
+                    let _ = write.write_all(out.as_bytes()).await;
+                    break;
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -1585,11 +1661,15 @@ impl Daemon {
             id: req_id,
             reply: Reply::Error { message: m.to_string() },
         };
-        if settings.max_concurrent == Some(0) {
-            return err("max_concurrent must be at least 1");
+        if let Some(n) = settings.max_concurrent {
+            if !(1..=ripdl_core::rpc::MAX_CONCURRENT_LIMIT).contains(&n) {
+                return err("max_concurrent must be between 1 and 64");
+            }
         }
-        if settings.max_segments == Some(0) {
-            return err("max_segments must be at least 1");
+        if let Some(n) = settings.max_segments {
+            if !(1..=ripdl_core::rpc::MAX_SEGMENTS_LIMIT).contains(&n) {
+                return err("max_segments must be between 1 and 64");
+            }
         }
         if settings.min_segment_size == Some(0) {
             // A zero byte split denominator would kill the planner.
@@ -1598,6 +1678,19 @@ impl Daemon {
         if let Some(r) = settings.seed_ratio {
             if !r.is_finite() || r < 0.0 {
                 return err("seed_ratio must be 0 (no limit) or positive");
+            }
+        }
+        if settings.lan_port == Some(0) {
+            return err("lan_port must be 1-65535");
+        }
+        if let Some(code) = settings.lan_code.clone() {
+            let trimmed = code.trim();
+            if trimmed.is_empty() {
+                settings.lan_code = None;
+            } else if !ripdl_core::rpc::is_valid_lan_code(trimmed) {
+                return err("lan_code must be at least 6 ASCII alphanumeric characters");
+            } else {
+                settings.lan_code = Some(trimmed.to_string());
             }
         }
         // Frontends may send 0 for "unlimited"; normalize before persisting.
@@ -1609,7 +1702,6 @@ impl Daemon {
         if let Err(e) = settings.save(&self.config_path) {
             return err(&format!("saving config failed: {e}"));
         }
-        let old_max = self.conf().max_concurrent();
         let seed_before = self.conf().seed_enabled();
         let lan_before = (
             self.conf().lan_enabled(),
@@ -1629,22 +1721,7 @@ impl Daemon {
                 session.set_download_rate_limit(conf.max_speed());
             }
         }
-        match new_max.checked_sub(old_max) {
-            Some(grow) if grow > 0 => self.sem.add_permits(grow),
-            Some(_) => {}
-            None => {
-                // Shrink: own freed permits and forget them (blocks this
-                // reply at most until running tasks release; the permits
-                // exist only if running < old_max).
-                let sem = self.sem.clone();
-                let take = (old_max - new_max) as u32;
-                tokio::spawn(async move {
-                    if let Ok(perm) = sem.acquire_many(take).await {
-                        perm.forget();
-                    }
-                });
-            }
-        }
+        self.slots.set_limit(new_max);
         tracing::info!(%new_max, "settings updated");
         // Applying the seeding toggle live: off = stop every watcher and
         // pause the swarm sockets (details keep working); on = start serving
@@ -1698,10 +1775,12 @@ impl Daemon {
         if lan_before != lan_after {
             self.apply_lan().await;
         }
-        // Bonding applies to the live torrent session immediately: uplink
-        // lists are hot-swappable now, so saving the toggle must not wait for
-        // a daemon restart (HTTP tasks already read the setting per download).
-        self.refresh_uplinks().await;
+        // Bonding applies to the live torrent session immediately when enabled:
+        // skip discovery/probing when bonding is off so unrelated settings saves
+        // never emit probe handshakes.
+        if self.conf().bond_interfaces() {
+            self.refresh_uplinks().await;
+        }
         self.sync_torrent_binding().await;
         Response {
             id: req_id,
@@ -1925,18 +2004,41 @@ impl Daemon {
     /// a phone gets plugged in - or loses its data during a call and comes
     /// back). Probe every tick so a returning link is used within 5 s; two
     /// consecutive failures are needed to evict one, so a blip costs nothing.
+    ///
+    /// Reconcile of paused/completed torrents runs on its own 15 s loop so it
+    /// never delays the 5 s link/rate sampler under large torrent queues.
     async fn watch_bonding(self: Arc<Self>) {
-        let mut ticks = 0u64;
+        {
+            let this = Arc::clone(&self);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(15));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = this.shutdown.notified() => break,
+                        _ = tick.tick() => {
+                            this.reconcile_torrent_records().await;
+                        }
+                    }
+                }
+            });
+        }
+        let mut was_bonding = false;
         loop {
-            self.refresh_uplinks().await;
-            self.sync_torrent_binding().await;
-            self.apply_bind_weights().await;
-            self.feed_http_bond().await;
-            if ticks % 3 == 0 {
-                self.reconcile_torrent_records().await;
+            let bonding = self.conf().bond_interfaces();
+            if bonding {
+                self.refresh_uplinks().await;
+                self.sync_torrent_binding().await;
+                self.apply_bind_weights().await;
+            } else if was_bonding {
+                self.sync_torrent_binding().await;
             }
-            ticks += 1;
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            was_bonding = bonding;
+            self.feed_http_bond().await;
+            tokio::select! {
+                _ = self.shutdown.notified() => break,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
         }
     }
 
@@ -1949,17 +2051,24 @@ impl Daemon {
     /// Bonding off: keep the link set empty, so a pick never lands on a
     /// stale link after the toggle; engine `bond` config is Off anyway.
     async fn feed_http_bond(&self) {
-        let dt = Duration::from_secs(5).as_secs_f64();
         if !self.conf().bond_interfaces() {
             self.bond.set_links(&[]);
             *self.bond_links.lock().unwrap() = Vec::new();
+            *self.link_sample_at.lock().unwrap() = None;
             #[cfg(feature = "unified-traffic")]
-            {
-                self.links.set_enabled(false);
-                *self.link_sample_at.lock().unwrap() = None;
-            }
+            self.links.set_enabled(false);
             return;
         }
+        let now = Instant::now();
+        let measured = {
+            let mut prev = self.link_sample_at.lock().unwrap();
+            let measured = prev
+                .map(|t| now.duration_since(t))
+                .unwrap_or(Duration::from_secs(5));
+            *prev = Some(now);
+            measured
+        };
+        let dt = measured.as_secs_f64().max(0.05);
         let links: Vec<ripdl_core::bond::LinkInfo> = {
             let excludes = self.conf().bond_excludes();
             self.uplinks
@@ -1976,12 +2085,6 @@ impl Daemon {
         };
         #[cfg(feature = "unified-traffic")]
         {
-            let now = Instant::now();
-            let mut prev = self.link_sample_at.lock().unwrap();
-            let measured = prev
-                .map(|t| now.duration_since(t))
-                .unwrap_or(Duration::from_secs(5));
-            *prev = Some(now);
             self.links.set_enabled(true);
             let infos: Vec<ripdl_core::links::LinkInfo> = links
                 .iter()
@@ -2077,6 +2180,7 @@ impl Daemon {
                 rates.push((*ip, ema));
             }
         }
+        rates.retain(|(ip, _)| totals.iter().any(|(t_ip, _)| t_ip == ip));
         let mut weights = weights_from_rates(&rates);
         if self.bind_explore.lock().unwrap().elapsed() > Duration::from_secs(60) {
             *self.bind_explore.lock().unwrap() = Instant::now();
@@ -3512,6 +3616,7 @@ impl Daemon {
                 });
             }
         }
+        self.tombstones.lock().unwrap().insert(id.to_string());
         self.progress.lock().unwrap().remove(id);
         // Release the task's ManagedTorrent from the shared session. Without
         // this a stale handle (old output folder, possibly wiped files)
@@ -3586,7 +3691,10 @@ impl Daemon {
         // started, so with a few download slots the bar stayed empty until
         // completions made slots - and probes - trickle through. One probe
         // wave upfront paints the bar from the first real tick.
-        self.probe_part_totals(&rec.id).await;
+        self.probe_part_totals(&rec.id, &token).await;
+        if token.is_cancelled() {
+            return Ok(None);
+        }
 
         let mut workers = tokio::task::JoinSet::new();
         for index in 0..rec.parts.len() {
@@ -3625,7 +3733,10 @@ impl Daemon {
     /// only move `total` fields, never bytes. A failed probe leaves the part
     /// unknown - its runner probes again anyway, the aggregate just keeps
     /// the all-known rule a little longer.
-    async fn probe_part_totals(self: &Arc<Self>, id: &str) {
+    async fn probe_part_totals(self: &Arc<Self>, id: &str, token: &CancellationToken) {
+        if token.is_cancelled() {
+            return;
+        }
         let parts: Vec<(usize, String, std::collections::HashMap<String, String>)> = {
             let records = self.records.lock().unwrap();
             let Some(rec) = records.iter().find(|r| r.id == id) else {
@@ -3642,6 +3753,9 @@ impl Daemon {
                 .map(|(i, p)| (i, p.url.clone(), p.headers.clone()))
                 .collect()
         };
+        if parts.is_empty() {
+            return;
+        }
         // Computation only: the plan cannot change what the server answers.
         let mut probes = tokio::task::JoinSet::new();
         for (index, url, headers) in parts {
@@ -3657,9 +3771,17 @@ impl Daemon {
                 (index, info)
             });
         }
-        while let Some(joined) = probes.join_next().await {
-            if let Ok((index, Some(total))) = joined {
-                self.set_part_total(id, index, total);
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    probes.abort_all();
+                    return;
+                }
+                joined = probes.join_next() => match joined {
+                    Some(Ok((index, Some(total)))) => self.set_part_total(id, index, total),
+                    Some(_) => {}
+                    None => break,
+                }
             }
         }
     }
@@ -3740,22 +3862,11 @@ impl Daemon {
             filename
         };
 
-        // The slot comes from the same semaphore as every other transfer.
-        let permit = tokio::select! {
-            _ = token.cancelled() => {
-                self.set_part_state(id, index, TaskState::Paused, None, None);
-                return Ok(());
-            }
-            p = self.sem.clone().acquire_owned() => match p {
-                Ok(p) => p,
-                Err(_) => return Ok(()),
-            },
-        };
-        if token.is_cancelled() {
-            drop(permit);
+        // The slot comes from the same gate as every other transfer.
+        let Some(permit) = self.slots.acquire(&token).await else {
             self.set_part_state(id, index, TaskState::Paused, None, None);
             return Ok(());
-        }
+        };
 
         self.set_part_state(id, index, TaskState::Running, None, None);
         #[cfg(feature = "unified-traffic")]
@@ -3915,14 +4026,18 @@ impl Daemon {
             let id = handle.begin_run();
             (handle, id)
         };
+        #[cfg(not(feature = "unified-traffic"))]
+        let run_id = self
+            .run_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         self.runtime.lock().unwrap().insert(
             rec.id.clone(),
             TaskRuntime {
                 token: token.clone(),
+                run_id,
                 #[cfg(feature = "unified-traffic")]
                 traffic: Arc::clone(&traffic_handle),
-                #[cfg(feature = "unified-traffic")]
-                run_id,
             },
         );
 
@@ -3967,19 +4082,12 @@ impl Daemon {
             }
 
             // Wait for a concurrency slot; pause/remove while queued bails here.
-            let _permit = tokio::select! {
-                _ = token.cancelled() => {
-                    detach_runtime();
+            let Some(_permit) = this.slots.acquire(&token).await else {
+                detach_runtime();
+                if token.is_cancelled() {
                     this.set_state(&rec.id, TaskState::Paused, None);
-                    return;
                 }
-                p = this.sem.clone().acquire_owned() => match p {
-                    Ok(p) => p,
-                    Err(_) => {
-                        detach_runtime();
-                        return;
-                    }
-                },
+                return;
             };
 
             // Re-check after acquiring: paused or removed while queued?
@@ -3998,7 +4106,9 @@ impl Daemon {
 
             let on_progress_this = Arc::clone(&this);
             let on_progress_id = rec.id.clone();
-            let on_progress = move |p| on_progress_this.on_progress(&on_progress_id, p);
+            let on_progress = move |p| {
+                on_progress_this.on_progress_run(&on_progress_id, Some(run_id), p)
+            };
 
             // Route by tool: HTTP gets the multi-segment engine, video gets
             // the yt-dlp sidecar, torrents share one session. All feed the
@@ -4322,10 +4432,21 @@ impl Daemon {
     /// Terminal success with the produced file, remembered for the
     /// "open file" / "delete files" flows (and byte counters for the UI).
     fn set_completed(&self, id: &str, file: Option<PathBuf>) {
-        // The produced path is a parameter, so the (possibly huge) torrent
-        // tree walk runs BEFORE any lock is taken - a few-thousand-file
-        // root would otherwise block every list/pause/add for the walk.
-        let disk = file.as_deref().and_then(Self::disk_size);
+        // Torrent completion trusts session-tracked bytes instead of walking
+        // thousands of output files on disk (ISS-062). Single-file HTTP and
+        // video tasks measure the single produced file before taking locks.
+        let is_torrent = {
+            let records = self.records.lock().unwrap();
+            records
+                .iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.kind == TaskKind::Torrent)
+        };
+        let disk = if is_torrent {
+            None
+        } else {
+            file.as_deref().and_then(Self::disk_size)
+        };
         // progress fallback read first: keeps lock order trivial (no
         // records->progress nesting here at all).
         let fallback = self
@@ -4362,7 +4483,7 @@ impl Daemon {
                             }
                             // Torrent roots are directories: metadata.len()
                             // is 0 there, so fall back to the last progress
-                            // snapshot when the walk fails.
+                            // snapshot when the walk is skipped.
                             None => {
                                 if let Some((d, t, _)) = fallback {
                                     r.downloaded = d;
@@ -4383,6 +4504,21 @@ impl Daemon {
 
     /// Track per-task progress and derive a window-averaged speed.
     fn on_progress(&self, id: &str, p: Progress) {
+        self.on_progress_run(id, None, p);
+    }
+
+    fn on_progress_run(&self, id: &str, expected_run: Option<u64>, p: Progress) {
+        if let Some(run_id) = expected_run {
+            let active = self
+                .runtime
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|rt| rt.run_id == run_id);
+            if !active {
+                return;
+            }
+        }
         // HTTP samples carry the resolved output file from the first tick on:
         // record it so details/open/delete work on partial downloads (older
         // builds only knew the path at completion).
@@ -4391,13 +4527,18 @@ impl Daemon {
         }
         // Kind lookup happens before the progress lock (adopt_dest_file above
         // already took the records lock): nesting the two in the opposite
-        // order would invite a deadlock.
-        let is_torrent = self
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|r| r.id == id && r.kind == TaskKind::Torrent);
+        // order would invite a deadlock. Drop samples for removed/unknown tasks
+        // so a late detached reporter cannot revive `progress`.
+        let (known, is_torrent) = {
+            let records = self.records.lock().unwrap();
+            match records.iter().find(|r| r.id == id) {
+                Some(r) => (true, r.kind == TaskKind::Torrent),
+                None => (false, false),
+            }
+        };
+        if !known || self.tombstones.lock().unwrap().contains(id) {
+            return;
+        }
         let mut map = self.progress.lock().unwrap();
         let now = Instant::now();
         // or_insert_with clones Progress only on the first tick per task;
@@ -4709,10 +4850,9 @@ fn copy_output_name(
 /// The view of one record that every frontend shows (`Reply::Tasks`,
 /// `Reply::Duplicate`). The caller holds the `progress` lock.
 fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> TaskInfo {
-    // A parked task keeps its last sample for resume bookkeeping, but
-    // reporting it as a live rate prints bandwidth that is not moving (and
-    // inflates a frontend's total-speed strip).
-    let live = matches!(r.state, TaskState::Running | TaskState::Queued);
+    // A parked or queued task keeps its last sample for resume bookkeeping,
+    // but only an actively Running task reports a live download speed.
+    let live = r.state == TaskState::Running;
     // No sample yet on a live task: the engine is still probing the URL and
     // planning segments (HTTP/video only - a torrent has its own metadata
     // state).
@@ -4722,8 +4862,7 @@ fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> Ta
     let (parts_done, parts_total, parts_missing) = if r.kind == TaskKind::Bundle {
         let seqs: Vec<Option<u32>> = r.parts.iter().map(|p| p.seq).collect();
         let (_, total, missing) = ripdl_core::bundle::numbering(&seqs);
-        let done = r
-            .parts
+        let done = r.parts
             .iter()
             .filter(|p| p.state == TaskState::Completed)
             .count() as u32;
@@ -4739,7 +4878,11 @@ fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> Ta
                 if live { t.speed } else { None },
                 t.last.percent,
                 t.last.uploaded.max(r.uploaded),
-                r.upload_bps.or(t.last.upload_bps),
+                if r.seeding {
+                    r.upload_bps.or(t.last.upload_bps)
+                } else {
+                    None
+                },
                 t.last.verifying,
             ),
             None => (
@@ -4750,7 +4893,7 @@ fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> Ta
                 // too (it used to read "paused 100%").
                 None,
                 r.uploaded,
-                r.upload_bps,
+                if r.seeding { r.upload_bps } else { None },
                 false,
             ),
         };
@@ -6622,6 +6765,327 @@ mod tests {
             }
             other => panic!("expected StaleCandidates, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn queued_row_no_rate() {
+        let rec = TaskRecord {
+            id: "q1".into(),
+            url: "https://example.com/q1.bin".into(),
+            dest_dir: None,
+            state: TaskState::Queued,
+            error: None,
+            stale_reason: None,
+            headers: HashMap::new(),
+            start_at: None,
+            kind: TaskKind::Http,
+            dest_file: None,
+            output_name: None,
+            downloaded: 512,
+            total: Some(1024),
+            info_hash: None,
+            torrent_name: None,
+            sequential: false,
+            only_files: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
+        };
+        let mut progress = HashMap::new();
+        progress.insert(
+            "q1".to_string(),
+            ProgressTrack {
+                last: Progress {
+                    id: "q1".into(),
+                    downloaded: 512,
+                    total: Some(1024),
+                    dest_file: None,
+                    percent: None,
+                    uploaded: 0,
+                    upload_bps: None,
+                    seeding: false,
+                    speed_bps: Some(99_000.0),
+                    verifying: false,
+                },
+                speed: Some(99_000.0),
+                window: VecDeque::new(),
+                at: Instant::now(),
+            },
+        );
+        let info = task_info_of(&rec, &progress);
+        assert_eq!(info.speed_bps, None, "queued rows must not report live speed");
+    }
+
+    #[test]
+    fn paused_task_has_no_live_rate() {
+        let rec = TaskRecord {
+            id: "p1".into(),
+            url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+            dest_dir: None,
+            state: TaskState::Paused,
+            error: None,
+            stale_reason: None,
+            headers: HashMap::new(),
+            start_at: None,
+            kind: TaskKind::Torrent,
+            dest_file: None,
+            output_name: None,
+            downloaded: 512,
+            total: Some(1024),
+            info_hash: None,
+            torrent_name: None,
+            sequential: false,
+            only_files: None,
+            uploaded: 256,
+            upload_bps: Some(50_000.0),
+            seeding: false,
+            seed_paused: true,
+            peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
+        };
+        let mut progress = HashMap::new();
+        progress.insert(
+            "p1".to_string(),
+            ProgressTrack {
+                last: Progress {
+                    id: "p1".into(),
+                    downloaded: 512,
+                    total: Some(1024),
+                    dest_file: None,
+                    percent: None,
+                    uploaded: 256,
+                    upload_bps: Some(42_000.0),
+                    seeding: false,
+                    speed_bps: Some(99_000.0),
+                    verifying: false,
+                },
+                speed: Some(99_000.0),
+                window: VecDeque::new(),
+                at: Instant::now(),
+            },
+        );
+        let info = task_info_of(&rec, &progress);
+        assert_eq!(info.speed_bps, None);
+        assert_eq!(
+            info.upload_bps, None,
+            "non-seeding tasks must not leak stale upload rate"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_probes_when_bonding_off() {
+        let (daemon, _dir) = proposal_daemon("no-probe");
+        assert!(!daemon.conf().bond_interfaces());
+        let watcher = tokio::spawn(Arc::clone(&daemon).watch_bonding());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        daemon.shutdown.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(2), watcher).await;
+        assert!(daemon.uplinks.lock().unwrap().is_empty());
+        assert!(daemon.uplinks_dead.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_progress_dropped() {
+        let (daemon, _dir) = proposal_daemon("unknown-prog");
+        daemon.on_progress(
+            "never-added",
+            Progress {
+                id: "never-added".into(),
+                downloaded: 100,
+                total: Some(200),
+                dest_file: None,
+                percent: None,
+                uploaded: 0,
+                upload_bps: None,
+                seeding: false,
+                speed_bps: None,
+                verifying: false,
+            },
+        );
+        assert!(daemon.progress.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(daemon.queue_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn rpc_max_message_size() {
+        let (daemon, _dir) = proposal_daemon("rpc-limit");
+        let token = daemon.rpc_token.clone();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let serve = tokio::spawn(Arc::clone(&daemon).handle_conn(server));
+        let (read, mut write) = tokio::io::split(client);
+        let mut reader = BufReader::new(read);
+        let auth = ripdl_core::transport::auth_line(&token);
+        write.write_all(auth.as_bytes()).await.unwrap();
+        let big = "x".repeat(16 * 1024 * 1024 + 128);
+        write.write_all(big.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let resp: Response = serde_json::from_str(&line).expect("parse limit error response");
+        assert!(matches!(resp.reply, Reply::Error { .. }));
+        drop(write);
+        let _ = serve.await;
+    }
+
+    #[tokio::test]
+    async fn watch_bonding_shutdown() {
+        let (daemon, _dir) = proposal_daemon("watch-stop");
+        assert!(!daemon.conf().bond_interfaces());
+        let watcher = tokio::spawn(Arc::clone(&daemon).watch_bonding());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        daemon.shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("watch_bonding exits promptly on shutdown")
+            .expect("task join");
+        assert!(
+            daemon.uplinks.lock().unwrap().is_empty()
+                && daemon.uplinks_dead.lock().unwrap().is_empty(),
+            "bonding off must not populate probed uplinks"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_traffic_is_default_enabled() {
+        assert!(
+            include_str!("../Cargo.toml").contains("default = [\"unified-traffic\"]"),
+            "unified-traffic must remain enabled in Cargo.toml default features"
+        );
+        #[cfg(feature = "unified-traffic")]
+        {
+            let (daemon, _dir) = proposal_daemon("unified-default");
+            let resp = daemon.cmd_get_traffic_snapshot(1);
+            assert!(
+                matches!(resp.reply, Reply::TrafficSnapshot { .. }),
+                "unified-traffic must be enabled by default, got {:?}",
+                resp.reply
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_concurrency_shrink_blocks_queued_tasks() {
+        let gate = Arc::new(SlotGate::new(3));
+        let token = CancellationToken::new();
+        let p1 = gate.acquire(&token).await.unwrap();
+        let p2 = gate.acquire(&token).await.unwrap();
+        gate.set_limit(1);
+
+        let g_wait = Arc::clone(&gate);
+        let t_wait = token.clone();
+        let waiter = tokio::spawn(async move { g_wait.acquire(&t_wait).await.is_some() });
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!waiter.is_finished(), "waiter must stay blocked while active (2) >= limit (1)");
+
+        drop(p1);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!waiter.is_finished(), "waiter must stay blocked while active (1) == limit (1)");
+
+        drop(p2);
+        let acquired = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter acquires once active < limit")
+            .unwrap();
+        assert!(acquired);
+    }
+
+    #[test]
+    fn stale_progress_sample_with_old_run_id_is_ignored() {
+        let (daemon, _dir) = proposal_daemon("stale-prog");
+        let rec = TaskRecord {
+            id: "t1".into(),
+            url: "https://example.com/file.bin".into(),
+            dest_dir: None,
+            state: TaskState::Running,
+            error: None,
+            stale_reason: None,
+            headers: Default::default(),
+            start_at: None,
+            kind: TaskKind::Http,
+            dest_file: None,
+            output_name: None,
+            downloaded: 0,
+            total: Some(1000),
+            info_hash: None,
+            torrent_name: None,
+            sequential: false,
+            only_files: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seed_paused: false,
+            peers: 0,
+            bundle_name: None,
+            parts: Vec::new(),
+        };
+        daemon.records.lock().unwrap().push(rec);
+        daemon.runtime.lock().unwrap().insert(
+            "t1".into(),
+            TaskRuntime {
+                token: CancellationToken::new(),
+                run_id: 2,
+                #[cfg(feature = "unified-traffic")]
+                traffic: daemon.traffic.register_task("t1", TrafficKind::Http, None, None),
+            },
+        );
+        daemon.on_progress_run(
+            "t1",
+            Some(1),
+            Progress {
+                id: "t1".into(),
+                downloaded: 999,
+                total: Some(1000),
+                ..Progress::default()
+            },
+        );
+        assert!(
+            daemon.progress.lock().unwrap().get("t1").is_none(),
+            "stale run_id sample must be ignored"
+        );
+    }
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> std::result::Result<Option<String>, String> {
+    let mut buf = Vec::new();
+    loop {
+        let avail = reader.fill_buf().await.map_err(|e| e.to_string())?;
+        if avail.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            let s = String::from_utf8(buf).map_err(|e| format!("invalid utf-8 request: {e}"))?;
+            return Ok(Some(s));
+        }
+        if let Some(nl) = avail.iter().position(|&b| b == b'\n') {
+            if buf.len() + nl > max_len {
+                reader.consume(nl + 1);
+                return Err(format!("request exceeds {max_len} byte limit"));
+            }
+            buf.extend_from_slice(&avail[..nl]);
+            reader.consume(nl + 1);
+            if buf.ends_with(b"\r") {
+                buf.pop();
+            }
+            let s = String::from_utf8(buf).map_err(|e| format!("invalid utf-8 request: {e}"))?;
+            return Ok(Some(s));
+        }
+        if buf.len() + avail.len() > max_len {
+            let len = avail.len();
+            reader.consume(len);
+            return Err(format!("request exceeds {max_len} byte limit"));
+        }
+        buf.extend_from_slice(avail);
+        let len = avail.len();
+        reader.consume(len);
     }
 }
 

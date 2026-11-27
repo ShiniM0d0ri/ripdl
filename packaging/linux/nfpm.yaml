@@ -30,7 +30,7 @@ contents:
     dst: /usr/share/licenses/ripdl/LICENSE-MIT
   - src: "${RIPDL_SRC}/LICENSE-APACHE"
     dst: /usr/share/licenses/ripdl/LICENSE-APACHE
-# The GUI links webkit2gtk-4.1 (tauri) and uses appindicator for the tray;
+# The GUI uses native eframe (OpenGL / Wayland / X11) and appindicator for the tray;
 # the engine and daemon only need libc. yt-dlp powers hunt-mode video
 # downloads when present.
 overrides:
@@ -38,14 +38,18 @@ overrides:
     depends:
       - libc6
       - libgtk-3-0
-      - libwebkit2gtk-4.1-0
       - libayatana-appindicator3-1
+      - libgl1
+      - libxkbcommon0
+      - libxdo3
     recommends:
       - yt-dlp
   rpm:
     depends:
       - gtk3
-      - webkit2gtk4.1
       - libayatana-appindicator-gtk3
+      - mesa-libGL
+      - libxkbcommon
+      - xdotool
     recommends:
       - yt-dlp

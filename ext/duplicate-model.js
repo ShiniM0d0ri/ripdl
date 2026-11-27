@@ -11,6 +11,8 @@ export function bucketOf(task) {
             return "done";
         case "paused":
             return "paused";
+        case "stale":
+            return "stale";
         case "failed":
             return "failed";
         case "cancelled":
@@ -45,8 +47,8 @@ export function actionsFor(task, url = "") {
         if (hasFile) add("reveal", "Show in folder");
         if (direct && hasFile) add("copy", "Download again");
         if (direct) add("browser", "Let browser download");
-    } else if (bucket === "paused" || bucket === "failed") {
-        // The daemon resumes only paused or failed tasks.
+    } else if (bucket === "paused" || bucket === "failed" || bucket === "stale") {
+        // The daemon resumes paused, failed, or stale tasks (or lets browser try a copy).
         add("resume", bucket === "failed" ? "Retry" : "Resume");
         if (hasFile) add("reveal", "Show in folder");
         if (direct) add("browser", "Let browser download");
@@ -70,6 +72,10 @@ export function stateLine(task) {
         }
         case "paused":
             return `Paused${progressText(task)}`;
+        case "stale": {
+            const why = task.stale_reason ? ` \u00b7 ${task.stale_reason}` : "";
+            return `Expired link${why}${progressText(task)}`;
+        }
         case "failed":
             return task.error ? `Failed \u00b7 ${task.error}` : "Failed";
         case "cancelled":
