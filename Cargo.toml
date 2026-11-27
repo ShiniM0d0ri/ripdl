@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon", "crates/ripdl-gui", "vendor/librqbit"]
+members = ["crates/ripdl-core", "crates/ripdl-cli", "crates/ripdl-daemon", "crates/ripdl-gui", "vendor/librqbit", "tools/xtask"]
 
 [workspace.package]
-version = "0.4.10"
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "ripdl - free, ad-free, multi-segment download manager"
@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 sha2 = "0.10"
+ts-rs = "12"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 anyhow = "1"

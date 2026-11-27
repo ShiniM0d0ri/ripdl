@@ -6,6 +6,18 @@ use crate::task::TaskState;
 
 /// Default daemon RPC port (TCP, localhost only).
 pub const DEFAULT_PORT: u16 = 5593;
+/// Hard ceiling on queued concurrency so a hand-edited config cannot exhaust
+/// OS threads/sockets.
+pub const MAX_CONCURRENT_LIMIT: usize = 64;
+/// Hard ceiling on per-task segments so a hand-edited config cannot open
+/// unbounded range connections or file handles.
+pub const MAX_SEGMENTS_LIMIT: usize = 64;
+
+/// Validation helper for LAN drop-box pairing codes: at least 6 ASCII
+/// alphanumeric characters (matching [`crate::lan::generate_code`]).
+pub fn is_valid_lan_code(code: &str) -> bool {
+    code.len() >= 6 && code.chars().all(|c| c.is_ascii_alphanumeric())
+}
 
 /// Daemon-wide settings (`<data_dir>/config.json`). Every field is optional
 /// so any partial file works: absent fields fall back to built-in defaults.
@@ -83,6 +95,10 @@ pub struct DaemonSettings {
     /// extension under the per-user data directory is the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_dir: Option<PathBuf>,
+    /// GUI preference: whether the first-run setup wizard has been completed
+    /// or skipped (`None` on upgrades from <=0.4.10 — existing configs stay silent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_done: Option<bool>,
 }
 
 impl DaemonSettings {
@@ -97,12 +113,74 @@ impl DaemonSettings {
                 if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
                     bytes.drain(..3);
                 }
-                serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                let mut cfg: Self = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                     eprintln!("warn: ignoring invalid config {}: {e}", path.display());
                     Self::default()
-                })
+                });
+                cfg.sanitize_loaded(path);
+                cfg
             }
             Err(_) => Self::default(),
+        }
+    }
+
+    /// Normalize out-of-range or corrupted fields in a hand-edited config file
+    /// rather than panicking in the planner or letting invalid values through.
+    pub fn sanitize_loaded(&mut self, path: &std::path::Path) {
+        if let Some(n) = self.max_concurrent {
+            if !(1..=MAX_CONCURRENT_LIMIT).contains(&n) {
+                eprintln!(
+                    "warn: clamping out-of-range max_concurrent ({n}) in {}",
+                    path.display()
+                );
+                self.max_concurrent = Some(n.clamp(1, MAX_CONCURRENT_LIMIT));
+            }
+        }
+        if let Some(n) = self.max_segments {
+            if !(1..=MAX_SEGMENTS_LIMIT).contains(&n) {
+                eprintln!(
+                    "warn: clamping out-of-range max_segments ({n}) in {}",
+                    path.display()
+                );
+                self.max_segments = Some(n.clamp(1, MAX_SEGMENTS_LIMIT));
+            }
+        }
+        if self.min_segment_size == Some(0) {
+            eprintln!(
+                "warn: ignoring min_segment_size=0 in {} (using default)",
+                path.display()
+            );
+            self.min_segment_size = None;
+        }
+        if let Some(r) = self.seed_ratio {
+            if !r.is_finite() || r < 0.0 {
+                eprintln!(
+                    "warn: ignoring invalid seed_ratio ({r}) in {} (using default)",
+                    path.display()
+                );
+                self.seed_ratio = None;
+            }
+        }
+        if self.lan_port == Some(0) {
+            eprintln!(
+                "warn: ignoring lan_port=0 in {} (using default)",
+                path.display()
+            );
+            self.lan_port = None;
+        }
+        if let Some(code) = self.lan_code.clone() {
+            let trimmed = code.trim();
+            if trimmed.is_empty() {
+                self.lan_code = None;
+            } else if !is_valid_lan_code(trimmed) {
+                eprintln!(
+                    "warn: ignoring invalid lan_code in {} (must be >= 6 alphanumeric chars)",
+                    path.display()
+                );
+                self.lan_code = None;
+            } else if trimmed.len() != code.len() {
+                self.lan_code = Some(trimmed.to_string());
+            }
         }
     }
 
@@ -111,18 +189,22 @@ impl DaemonSettings {
         crate::atomic_write_json(path, self)
     }
 
-    /// Queue-wide concurrent-download cap (built-in default 3).
+    /// Queue-wide concurrent-download cap (built-in default 3, bounded 1..=64).
     pub fn max_concurrent(&self) -> usize {
-        self.max_concurrent.unwrap_or(3).max(1)
+        self.max_concurrent
+            .unwrap_or(3)
+            .clamp(1, MAX_CONCURRENT_LIMIT)
     }
 
     pub fn max_segments(&self) -> usize {
         self.max_segments
             .unwrap_or(crate::engine::EngineConfig::default().max_segments)
+            .clamp(1, MAX_SEGMENTS_LIMIT)
     }
 
     pub fn min_segment_size(&self) -> u64 {
         self.min_segment_size
+            .filter(|&v| v > 0)
             .unwrap_or(crate::engine::EngineConfig::default().min_segment_size)
     }
 
@@ -174,7 +256,10 @@ impl DaemonSettings {
 
     /// Stop at this share ratio; `0` disables the ratio limit (default 1.0).
     pub fn seed_ratio(&self) -> f64 {
-        self.seed_ratio.unwrap_or(1.0).max(0.0)
+        match self.seed_ratio {
+            Some(r) if r.is_finite() && r >= 0.0 => r,
+            _ => 1.0,
+        }
     }
 
     /// Stop after this many minutes; `0` = no time limit (default 0).
@@ -257,6 +342,12 @@ impl DaemonSettings {
         }
         if patch.lan_code.is_some() {
             self.lan_code = patch.lan_code;
+        }
+        if patch.extension_dir.is_some() {
+            self.extension_dir = patch.extension_dir;
+        }
+        if patch.onboarding_done.is_some() {
+            self.onboarding_done = patch.onboarding_done;
         }
     }
 }
@@ -454,6 +545,8 @@ pub enum Command {
     },
     /// Rotate this device's pairing code (paired devices must re-enter it).
     LanNewCode,
+    /// next: one snapshot of traffic limits/rates and per-link state.
+    GetTrafficSnapshot,
     Shutdown,
 }
 
@@ -514,6 +607,11 @@ pub enum Reply {
     },
     Tasks {
         tasks: Vec<TaskInfo>,
+    },
+    /// next: the single source of truth for limits, task rates and links.
+    TrafficSnapshot {
+        controller: crate::traffic::ControllerSnapshot,
+        links: Vec<crate::links::LinkSnapshot>,
     },
     TorrentDetails {
         details: crate::torrent::TorrentDetailsSnapshot,
@@ -591,6 +689,11 @@ pub enum Reply {
         /// act on. Empty when bonding is off or no older daemon feeds it.
         #[serde(default)]
         bond_links: Vec<BondLink>,
+        /// One link truth from the shared `LinkSet` (HTTP + torrent). Old
+        /// frontends ignore this additive field; new ones render it instead
+        /// of the split `bond_links` / `torrent_rates` arrays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traffic_links: Option<Vec<crate::links::LinkSnapshot>>,
         /// Capability flag: this daemon understands `AddBundle`/`PreviewBundle`
         /// (multi-part tasks). Frontends check it instead of probing with an
         /// unknown command - an older daemon simply omits the field, which
@@ -982,6 +1085,7 @@ mod tests {
                 bundles,
                 version,
                 extension,
+                ..
             } => {
                 assert_eq!(settings.max_segments, Some(4));
                 assert_eq!(version, "0.4.1");
@@ -1019,6 +1123,7 @@ mod tests {
                 in_use: 4,
                 fails: 0,
             }],
+            traffic_links: None,
             bundles: true,
             version: "0.4.1".to_string(),
             extension: ExtensionStatus {
@@ -1059,5 +1164,115 @@ mod tests {
             }
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_round_trip_all_fields() {
+        let mut base = DaemonSettings::default();
+        let patch = DaemonSettings {
+            max_concurrent: Some(7),
+            max_segments: Some(12),
+            min_segment_size: Some(2 * 1024 * 1024),
+            max_speed_bytes: Some(500_000),
+            default_download_dir: Some(PathBuf::from("D:/Downloads")),
+            ytdlp_path: Some("C:/tools/yt-dlp.exe".to_string()),
+            hide_to_tray: Some(false),
+            bond_interfaces: Some(true),
+            bond_exclude: Some(vec!["Cellular".to_string()]),
+            update_check: Some(false),
+            update_auto_install: Some(true),
+            seed_enabled: Some(false),
+            seed_ratio: Some(2.5),
+            seed_time_min: Some(45),
+            lan_enabled: Some(true),
+            lan_port: Some(8465),
+            lan_dir: Some(PathBuf::from("D:/Inbox")),
+            lan_open: Some(true),
+            lan_code: Some("ABCD23".to_string()),
+            extension_dir: Some(PathBuf::from("D:/Ext")),
+            onboarding_done: Some(true),
+        };
+        base.apply(patch.clone());
+        assert_eq!(base, patch, "DaemonSettings::apply must copy every field");
+        let dir = std::env::temp_dir().join(format!("ripdl-cfg-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        base.save(&path).unwrap();
+        let reloaded = DaemonSettings::load(&path);
+        assert_eq!(reloaded, base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_concurrent_bound() {
+        let dir = std::env::temp_dir().join(format!("ripdl-cfg-bounds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"max_concurrent":999}"#).unwrap();
+        let loaded = DaemonSettings::load(&path);
+        assert_eq!(loaded.max_concurrent(), MAX_CONCURRENT_LIMIT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_load_validation() {
+        let dir = std::env::temp_dir().join(format!("ripdl-cfg-val-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"max_concurrent":0,"max_segments":500,"min_segment_size":0,"seed_ratio":-1.5,"lan_port":0}"#,
+        )
+        .unwrap();
+        let loaded = DaemonSettings::load(&path);
+        assert_eq!(loaded.max_concurrent(), 1);
+        assert_eq!(loaded.max_segments(), MAX_SEGMENTS_LIMIT);
+        assert_eq!(loaded.min_segment_size(), 1024 * 1024);
+        assert_eq!(loaded.seed_ratio(), 1.0);
+        assert_eq!(loaded.lan_port(), crate::lan::DEFAULT_PORT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lan_code_validation() {
+        let dir = std::env::temp_dir().join(format!("ripdl-cfg-lan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"lan_code":"bad"}"#).unwrap();
+        assert_eq!(DaemonSettings::load(&path).lan_code, None);
+        std::fs::write(&path, r#"{"lan_code":"ABCDEF"}"#).unwrap();
+        assert_eq!(DaemonSettings::load(&path).lan_code.as_deref(), Some("ABCDEF"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v0_4_10_config_deserializes_cleanly_without_new_fields() {
+        let dir = std::env::temp_dir().join(format!("ripdl-cfg-v0410-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let legacy = r#"{
+            "max_concurrent": 3,
+            "max_segments": 5,
+            "default_download_dir": "C:\\Users\\Demo\\Downloads",
+            "hide_to_tray": true,
+            "bond_interfaces": true,
+            "bond_exclude": ["wi-fi"],
+            "update_check": true,
+            "seed_enabled": true,
+            "seed_ratio": 0.5
+        }"#;
+        std::fs::write(&path, legacy).unwrap();
+        let loaded = DaemonSettings::load(&path);
+        assert_eq!(loaded.max_concurrent(), 3);
+        assert_eq!(loaded.max_segments(), 5);
+        assert!(loaded.bond_interfaces());
+        assert_eq!(loaded.bond_excludes(), vec!["wi-fi".to_string()]);
+        assert_eq!(loaded.onboarding_done, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

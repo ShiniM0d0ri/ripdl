@@ -20,6 +20,7 @@ const magnet = (state, extra = {}) => ({
 test("every daemon state falls in one bucket, unknown states count as active", () => {
     assert.equal(bucketOf({ state: "completed" }), "done");
     assert.equal(bucketOf({ state: "paused" }), "paused");
+    assert.equal(bucketOf({ state: "stale" }), "stale");
     assert.equal(bucketOf({ state: "failed" }), "failed");
     assert.equal(bucketOf({ state: "cancelled" }), "cancelled");
     assert.equal(bucketOf({ state: "running" }), "active");
@@ -95,6 +96,7 @@ test("stateLine words each bucket", () => {
     assert.equal(stateLine(direct("completed")), "Completed \u00b7 100 B");
     assert.equal(stateLine(direct("completed", { total: 0, downloaded: 0 })), "Completed");
     assert.equal(stateLine(direct("paused", { downloaded: 400, total: 1000 })), "Paused \u00b7 40% \u00b7 400 B of 1000 B");
+    assert.equal(stateLine(direct("stale", { downloaded: 400, total: 1000, stale_reason: "HTTP 403" })), "Expired link \u00b7 HTTP 403 \u00b7 40% \u00b7 400 B of 1000 B");
     assert.equal(stateLine(direct("failed", { error: "disk full" })), "Failed \u00b7 disk full");
     assert.equal(stateLine(direct("failed", { error: null })), "Failed");
     assert.equal(stateLine(direct("cancelled")), "Cancelled");

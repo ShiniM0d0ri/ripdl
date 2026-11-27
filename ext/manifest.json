@@ -1,9 +1,15 @@
 {
   "manifest_version": 3,
   "name": "ripdl",
-  "version": "0.4.10",
+  "version": "0.5.0",
   "description": "Send downloads to ripdl - the free, ad-free download manager.",
   "minimum_chrome_version": "88",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   // Pinned RSA public key: unpacked-extension IDs are otherwise derived from
   // the load path, so loading the zip from a different folder changes the ID
   // and the native host silently rejects it. With a key embedded, the ID is
@@ -36,6 +42,10 @@
     }
   ],
   "action": {
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    },
     "default_title": "ripdl",
     "default_popup": "popup.html"
   },

@@ -9,12 +9,20 @@ license.workspace = true
 name = "ripdl-daemon"
 path = "src/main.rs"
 
+[features]
+# Unified traffic & link domains are enabled by default across all transfer
+# types (HTTP, bundle, torrent, video). Pass `--no-default-features` only for
+# minimal legacy builds.
+default = ["unified-traffic"]
+unified-traffic = []
+
 [dependencies]
 ripdl-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

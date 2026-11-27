@@ -15,11 +15,12 @@
 //! sanitized to a single file name inside the inbox; nothing outside it can be
 //! read or written.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -39,6 +40,9 @@ const HEAD_LIMIT: usize = 16 * 1024;
 const COPY_CHUNK: usize = 256 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTH_FREE_STRIKES: u32 = 5;
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+const AUTH_MAX_LOCKOUT: Duration = Duration::from_secs(30);
 
 /// One file sitting in the receive folder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,24 +79,83 @@ pub struct LanConfig {
     pub name: String,
 }
 
+struct AuthAttempt {
+    strikes: u32,
+    window_start: Instant,
+    locked_until: Option<Instant>,
+}
+
+enum AuthDecision {
+    Allow,
+    Forbidden,
+    Throttled,
+}
+
 struct ServerState {
     dir: PathBuf,
     code: String,
     open: bool,
     peer: LanPeer,
     version: String,
+    auth_limits: Mutex<HashMap<IpAddr, AuthAttempt>>,
 }
 
 impl ServerState {
-    fn code_ok(&self, query: &[(String, String)]) -> bool {
+    fn check_auth(
+        &self,
+        peer_ip: Option<IpAddr>,
+        query: &[(String, String)],
+        header_code: Option<&str>,
+    ) -> AuthDecision {
         if self.open {
-            return true;
+            return AuthDecision::Allow;
         }
-        query
-            .iter()
-            .find(|(k, _)| k == "code")
-            .map(|(_, v)| constant_eq(v, &self.code))
-            .unwrap_or(false)
+        let now = Instant::now();
+        if let Some(ip) = peer_ip {
+            let limits = self.auth_limits.lock().unwrap();
+            if let Some(entry) = limits.get(&ip) {
+                if entry.locked_until.is_some_and(|until| now < until) {
+                    return AuthDecision::Throttled;
+                }
+            }
+        }
+        let provided = header_code.or_else(|| {
+            query
+                .iter()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.as_str())
+        });
+        let matched = provided.is_some_and(|v| constant_eq(v, &self.code));
+        if matched {
+            if let Some(ip) = peer_ip {
+                self.auth_limits.lock().unwrap().remove(&ip);
+            }
+            return AuthDecision::Allow;
+        }
+        if let Some(ip) = peer_ip {
+            let mut limits = self.auth_limits.lock().unwrap();
+            if limits.len() > 256 {
+                limits.retain(|_, v| now.duration_since(v.window_start) < AUTH_WINDOW);
+            }
+            let entry = limits.entry(ip).or_insert(AuthAttempt {
+                strikes: 0,
+                window_start: now,
+                locked_until: None,
+            });
+            if now.duration_since(entry.window_start) >= AUTH_WINDOW {
+                entry.strikes = 0;
+                entry.window_start = now;
+                entry.locked_until = None;
+            }
+            entry.strikes = entry.strikes.saturating_add(1);
+            if entry.strikes >= AUTH_FREE_STRIKES {
+                let shift = (entry.strikes - AUTH_FREE_STRIKES).min(5);
+                let lock = Duration::from_secs(1u64 << shift).min(AUTH_MAX_LOCKOUT);
+                entry.locked_until = Some(now + lock);
+                return AuthDecision::Throttled;
+            }
+        }
+        AuthDecision::Forbidden
     }
 }
 
@@ -135,6 +198,7 @@ impl LanServer {
                 open: cfg.open,
             },
             version: env!("CARGO_PKG_VERSION").to_string(),
+            auth_limits: Mutex::new(HashMap::new()),
         });
         let (stop, _) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -149,10 +213,10 @@ impl LanServer {
                     tokio::select! {
                         _ = rx.changed() => break,
                         accepted = listener.accept() => {
-                            let Ok((stream, _addr)) = accepted else { continue };
+                            let Ok((stream, addr)) = accepted else { continue };
                             let state = Arc::clone(&state);
                             tokio::spawn(async move {
-                                let _ = handle_conn(stream, state).await;
+                                let _ = handle_conn(stream, state, Some(addr.ip())).await;
                             });
                         }
                     }
@@ -222,6 +286,7 @@ struct Request {
     method: String,
     path: String,
     query: Vec<(String, String)>,
+    code_header: Option<String>,
     content_length: u64,
     /// False when the client sent no `Content-Length` at all (chunked or
     /// close-delimited bodies are not supported: an upload must declare its
@@ -263,6 +328,7 @@ async fn read_head<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Request> {
     };
     let mut content_length = 0u64;
     let mut has_content_length = false;
+    let mut code_header = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -270,12 +336,18 @@ async fn read_head<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Request> {
         if name.eq_ignore_ascii_case("content-length") {
             has_content_length = true;
             content_length = value.trim().parse().unwrap_or(0);
+        } else if name.eq_ignore_ascii_case("x-ripdl-code") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                code_header = Some(trimmed.to_string());
+            }
         }
     }
     Ok(Request {
         method,
         path,
         query,
+        code_header,
         content_length,
         has_content_length,
         leftover,
@@ -362,15 +434,67 @@ async fn respond_json<W: AsyncWrite + Unpin>(wr: &mut W, status: u16, reason: &s
     respond(wr, status, reason, "application/json; charset=utf-8", "", body).await
 }
 
-async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
+async fn reject_auth<W: AsyncWrite + Unpin>(wr: &mut W, decision: AuthDecision) -> Result<()> {
+    match decision {
+        AuthDecision::Allow => Ok(()),
+        AuthDecision::Forbidden => respond_json(wr, 403, "Forbidden", b"{\"error\":\"code\"}").await,
+        AuthDecision::Throttled => {
+            respond(
+                wr,
+                429,
+                "Too Many Requests",
+                "application/json; charset=utf-8",
+                "Retry-After: 5\r\n",
+                b"{\"error\":\"too many attempts\"}",
+            )
+            .await
+        }
+    }
+}
+
+async fn receive_upload_body<R: AsyncRead + Unpin>(
+    rd: &mut R,
+    part: &Path,
+    leftover: Vec<u8>,
+    content_length: u64,
+) -> Result<u64> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
+        .await?;
+    let mut written = 0u64;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    if !leftover.is_empty() {
+        let take = leftover.len().min(content_length as usize);
+        file.write_all(&leftover[..take]).await?;
+        written += take as u64;
+    }
+    while written < content_length {
+        let want = (content_length - written).min(COPY_CHUNK as u64) as usize;
+        let n = tokio::time::timeout(IO_TIMEOUT, rd.read(&mut buf[..want]))
+            .await
+            .map_err(|_| Error::State("timed out receiving file".into()))??;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).await?;
+        written += n as u64;
+    }
+    file.flush().await?;
+    Ok(written)
+}
+
+async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>, peer_ip: Option<IpAddr>) -> Result<()> {
     let (mut rd, mut wr) = stream.split();
     let Request {
         method,
         path,
         query,
+        code_header,
         content_length,
         has_content_length,
-        mut leftover,
+        leftover,
     } = read_head(&mut rd).await?;
     match (method.as_str(), path.as_str()) {
         ("GET", "/") => {
@@ -387,24 +511,23 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
             });
             respond_json(&mut wr, 200, "OK", body.to_string().as_bytes()).await
         }
-        ("GET", "/api/check") => {
-            if state.code_ok(&query) {
-                respond_json(&mut wr, 200, "OK", b"{\"ok\":true}").await
-            } else {
-                respond_json(&mut wr, 403, "Forbidden", b"{\"error\":\"code\"}").await
-            }
-        }
+        ("GET", "/api/check") => match state.check_auth(peer_ip, &query, code_header.as_deref()) {
+            AuthDecision::Allow => respond_json(&mut wr, 200, "OK", b"{\"ok\":true}").await,
+            other => reject_auth(&mut wr, other).await,
+        },
         ("GET", "/api/files") => {
-            if !state.code_ok(&query) {
-                return respond_json(&mut wr, 403, "Forbidden", b"{\"error\":\"code\"}").await;
+            let auth = state.check_auth(peer_ip, &query, code_header.as_deref());
+            if !matches!(auth, AuthDecision::Allow) {
+                return reject_auth(&mut wr, auth).await;
             }
             let files = files(&state.dir).await;
             let body = serde_json::to_vec(&files).unwrap_or_else(|_| b"[]".to_vec());
             respond_json(&mut wr, 200, "OK", &body).await
         }
         ("POST", "/api/send") => {
-            if !state.code_ok(&query) {
-                return respond_json(&mut wr, 403, "Forbidden", b"{\"error\":\"code\"}").await;
+            let auth = state.check_auth(peer_ip, &query, code_header.as_deref());
+            if !matches!(auth, AuthDecision::Allow) {
+                return reject_auth(&mut wr, auth).await;
             }
             if !has_content_length {
                 return respond_json(
@@ -427,32 +550,13 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
             // body lands, so a collision at that point just becomes "x (1)".
             let token = part_token();
             let part = state.dir.join(format!(".part-{token}-{name}"));
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&part)
-                .await?;
-            let mut written = 0u64;
-            let mut buf = vec![0u8; COPY_CHUNK];
-            if !leftover.is_empty() {
-                let take = leftover.len().min(content_length as usize);
-                file.write_all(&leftover[..take]).await?;
-                written += take as u64;
-                leftover.clear();
-            }
-            while written < content_length {
-                let want = (content_length - written).min(COPY_CHUNK as u64) as usize;
-                let n = tokio::time::timeout(IO_TIMEOUT, rd.read(&mut buf[..want]))
-                    .await
-                    .map_err(|_| Error::State("timed out receiving file".into()))??;
-                if n == 0 {
-                    break;
+            let written = match receive_upload_body(&mut rd, &part, leftover, content_length).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&part).await;
+                    return Err(e);
                 }
-                file.write_all(&buf[..n]).await?;
-                written += n as u64;
-            }
-            file.flush().await?;
-            drop(file);
+            };
             if written != content_length {
                 let _ = tokio::fs::remove_file(&part).await;
                 return respond_json(&mut wr, 400, "Bad Request", b"{\"error\":\"truncated\"}").await;
@@ -481,8 +585,9 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
             if !meta.is_file() {
                 return respond_json(&mut wr, 404, "Not Found", b"{\"error\":\"missing\"}").await;
             }
-            if !state.code_ok(&query) {
-                return respond_json(&mut wr, 403, "Forbidden", b"{\"error\":\"code\"}").await;
+            let auth = state.check_auth(peer_ip, &query, code_header.as_deref());
+            if !matches!(auth, AuthDecision::Allow) {
+                return reject_auth(&mut wr, auth).await;
             }
             let disposition = format!(
                 "attachment; filename*=UTF-8''{}",
@@ -496,11 +601,15 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<ServerState>) -> Result<(
             let mut file = tokio::fs::File::open(&served).await?;
             let mut buf = vec![0u8; COPY_CHUNK];
             loop {
-                let n = file.read(&mut buf).await?;
+                let n = tokio::time::timeout(IO_TIMEOUT, file.read(&mut buf))
+                    .await
+                    .map_err(|_| Error::State("timed out reading served file".into()))??;
                 if n == 0 {
                     break;
                 }
-                wr.write_all(&buf[..n]).await?;
+                tokio::time::timeout(IO_TIMEOUT, wr.write_all(&buf[..n]))
+                    .await
+                    .map_err(|_| Error::State("timed out sending served file".into()))??;
             }
             wr.flush().await?;
             Ok(())
@@ -1299,5 +1408,60 @@ mod tests {
             ("mybox".to_string(), DEFAULT_PORT)
         );
         assert!(parse_host_port("https://x:1").is_err());
+    }
+
+    #[tokio::test]
+    async fn lan_code_throttle_blocks_brute_force() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = temp_dir("throttle");
+        let server = start(&dir, false, "SECRET9").await;
+        let mut statuses = Vec::new();
+        for _ in 0..6 {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
+                .await
+                .unwrap();
+            s.write_all(b"GET /api/check?code=BAD111 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            let line = String::from_utf8_lossy(&buf)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            statuses.push(line);
+        }
+        assert!(
+            statuses.iter().take(4).all(|l| l.contains("403")),
+            "initial attempts must answer 403, saw {statuses:?}"
+        );
+        assert!(
+            statuses.last().is_some_and(|l| l.contains("429")),
+            "repeated wrong codes must lock out with 429, saw {statuses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lan_dropped_upload_cleans_part_file() {
+        use tokio::io::AsyncWriteExt;
+        let dir = temp_dir("drop-part");
+        let server = start(&dir, true, "OPEN").await;
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", server.port()))
+            .await
+            .unwrap();
+        s.write_all(
+            b"POST /api/send?name=incomplete.bin HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\npartial",
+        )
+        .await
+        .unwrap();
+        drop(s);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "truncated upload leaked partial file: {left:?}");
     }
 }

@@ -388,7 +388,7 @@ impl Bond {
             }
         }
         // surplus = in_use - desired
-        let mut surplus: Vec<(IpAddr, i64)> = desired
+        let surplus: Vec<(IpAddr, i64)> = desired
             .into_iter()
             .map(|(ip, d)| {
                 let live = healthy

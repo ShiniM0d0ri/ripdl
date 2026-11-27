@@ -30,8 +30,12 @@ pub fn load(dest: &Path) -> Result<Option<TaskStateFile>> {
 }
 
 /// Persist `state` beside `dest` (atomic swap, same layout the engine reads).
+/// Re-applies Windows hidden attribute after atomic rename replaces the inode.
 pub fn save(dest: &Path, state: &TaskStateFile) -> Result<()> {
-    atomic_write_json(&sidecar_path(dest), state)
+    let path = sidecar_path(dest);
+    atomic_write_json(&path, state)?;
+    crate::engine::hide_on_windows(&path);
+    Ok(())
 }
 
 /// Bytes already durable on disk that a refresh keeps.
@@ -87,6 +91,37 @@ pub fn check_compatible(
             "the paused download has no range state (its server did not support ranges), so it cannot continue".into(),
         ));
     }
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(prev.segments.len());
+    for s in &prev.segments {
+        if s.start > s.end || s.end >= old_total {
+            return Err(Error::Refresh(format!(
+                "corrupt resume sidecar: segment {} ({}..={}) falls outside file size {old_total}",
+                s.index, s.start, s.end
+            )));
+        }
+        let span = s.end - s.start + 1;
+        if s.done > span {
+            return Err(Error::Refresh(format!(
+                "corrupt resume sidecar: segment {} recorded {} done bytes for a {span}-byte span",
+                s.index, s.done
+            )));
+        }
+        spans.push((s.start, s.end));
+    }
+    spans.sort_unstable();
+    for pair in spans.windows(2) {
+        if pair[0].1 >= pair[1].0 {
+            return Err(Error::Refresh(
+                "corrupt resume sidecar: overlapping byte ranges".into(),
+            ));
+        }
+    }
+    let kept = kept_bytes(prev);
+    if kept > old_total {
+        return Err(Error::Refresh(format!(
+            "corrupt resume sidecar: kept bytes ({kept}) exceed file size ({old_total})"
+        )));
+    }
     if let Some(name) = dest.file_name() {
         let want = name.to_string_lossy();
         if !same_name(&want, &info.filename) {
@@ -96,16 +131,17 @@ pub fn check_compatible(
             )));
         }
     }
-    // Same name and size but a different file version: the engine resumes
-    // against the new etag, so the bytes on disk may not line up. Adopt with
-    // a warning rather than silently splicing two versions together.
-    let warning = match (&prev.etag, &info.etag) {
-        (Some(old), Some(new)) if old != new => Some(format!(
-            "the server reports a different file version than the one the kept bytes came from - they may not match"
-        )),
-        _ => None,
-    };
-    Ok(RefreshCheck { warning })
+    // Different ETag means the server serves a different file revision even if
+    // name and size match: never splice bytes across two versions.
+    if let (Some(old), Some(new)) = (&prev.etag, &info.etag) {
+        if old != new {
+            return Err(Error::Refresh(
+                "the new address serves a different file version (ETag changed) - start a fresh download instead of keeping mismatched bytes"
+                    .into(),
+            ));
+        }
+    }
+    Ok(RefreshCheck::clean())
 }
 
 /// Point the paused state at a new address: segments and their offsets are
@@ -138,7 +174,7 @@ mod tests {
             total,
             accept_ranges: ranges,
             filename: name.to_string(),
-            etag: Some("\"v2\"".to_string()),
+            etag: Some("\"next\"".to_string()),
         }
     }
 
@@ -171,20 +207,56 @@ mod tests {
     }
 
     #[test]
-    fn same_file_same_size_is_compatible() {
+    fn refresh_etag_mismatch_rejected() {
         let d = dest("f.bin");
-        let check =
-            check_compatible(&d, &state(), &info(Some(4096), true, "f.bin")).expect("compatible");
-        // The fixture etags differ ("v1" vs "v2"): adoptable, with a word of
-        // caution about the file version.
-        assert!(check.warning.is_some(), "etag change must warn");
+        let err =
+            check_compatible(&d, &state(), &info(Some(4096), true, "f.bin")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ETag") || msg.contains("different file version"), "{msg}");
+    }
+
+    #[test]
+    fn refresh_validates_sidecar_bounds() {
+        let d = dest("f.bin");
+        let mut prev = state();
+        prev.etag = Some("\"next\"".into());
+
+        let mut bad_end = prev.clone();
+        bad_end.segments[1].end = 4096;
+        assert!(check_compatible(&d, &bad_end, &info(Some(4096), true, "f.bin")).is_err());
+
+        let mut bad_done = prev.clone();
+        bad_done.segments[0].done = 2049;
+        assert!(check_compatible(&d, &bad_done, &info(Some(4096), true, "f.bin")).is_err());
+
+        let mut overlap = prev.clone();
+        overlap.segments[1].start = 2047;
+        assert!(check_compatible(&d, &overlap, &info(Some(4096), true, "f.bin")).is_err());
+    }
+
+    #[test]
+    fn refresh_sidecar_stays_hidden() {
+        let dir = std::env::temp_dir().join(format!("ripdl-refresh-hide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.join("f.bin");
+        let st = state();
+        save(&d, &st).unwrap();
+        save(&d, &st).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let attrs = std::fs::metadata(sidecar_path(&d)).unwrap().file_attributes();
+            assert_ne!(attrs & 0x2, 0, "refresh sidecar must retain FILE_ATTRIBUTE_HIDDEN");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn same_etag_adopts_clean() {
         let d = dest("f.bin");
         let mut prev = state();
-        prev.etag = Some("\"v2\"".into());
+        prev.etag = Some("\"next\"".into());
         let check =
             check_compatible(&d, &prev, &info(Some(4096), true, "f.bin")).expect("compatible");
         assert_eq!(check.warning, None);
@@ -233,11 +305,11 @@ mod tests {
         retarget(
             &mut st,
             "https://cdn.example.com/f.bin?token=new",
-            Some("\"v2\"".into()),
+            Some("\"next\"".into()),
             Some(4096),
         );
         assert_eq!(st.url, "https://cdn.example.com/f.bin?token=new");
-        assert_eq!(st.etag.as_deref(), Some("\"v2\""));
+        assert_eq!(st.etag.as_deref(), Some("\"next\""));
         assert_eq!(st.state, TaskState::Paused);
         assert_eq!(kept_bytes(&st), kept);
         assert_eq!(kept, 3072);

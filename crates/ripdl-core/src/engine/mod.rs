@@ -132,6 +132,13 @@ pub struct EngineConfig {
     /// links are safe: the window only needs *some* progress. `None`
     /// disables the watchdog (tests only).
     pub stream_idle: Option<std::time::Duration>,
+    /// next: optional daemon-owned traffic handle. When set, every segment
+    /// draws its budget from this handle (global -> task -> host) instead of
+    /// the engine's private limiter. `None` keeps v1 behavior.
+    pub traffic: Option<std::sync::Arc<dyn crate::traffic::Traffic>>,
+    /// next: optional shared link set. When set, per-link bytes are metered here
+    /// instead of only in the private bond authority.
+    pub links: Option<std::sync::Arc<crate::links::LinkSet>>,
 }
 
 impl Default for EngineConfig {
@@ -146,6 +153,8 @@ impl Default for EngineConfig {
             bond: Bond::Off,
             bond_state: None,
             stream_idle: Some(std::time::Duration::from_secs(30)),
+            traffic: None,
+            links: None,
         }
     }
 }
@@ -188,6 +197,7 @@ impl Engine {
         // the built-in one, so only set the default when they don't.
         let has_user_ua = cfg.headers.keys().any(|k| k.to_ascii_lowercase() == "user-agent");
         let mut builder = reqwest::Client::builder();
+        builder = builder.no_gzip();
         if !has_user_ua {
             builder = builder.user_agent(&cfg.user_agent);
         }
@@ -201,20 +211,28 @@ impl Engine {
             })?;
             default_headers.insert(name, value);
         }
+        // Range offsets and Content-Length only align when the server returns
+        // uncompressed identity bytes, so always insist on `identity`.
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
         builder = builder.default_headers(default_headers);
         if let Some(ip) = local {
             builder = builder.local_address(ip);
         }
         // Dead-connection guards: a half-open server (accepts, then never
         // sends and never FINs) would otherwise pend a segment forever and
-        // keep retry/backoff permanently disabled for it. Both timeouts are
-        // far above any legitimate read stall.
+        // keep retry/backoff permanently disabled for it. Align read_timeout
+        // with `stream_idle` when set so intentionally slow links are not cut
+        // short before the watchdog window expires.
+        let read_timeout = cfg
+            .stream_idle
+            .unwrap_or_else(|| Duration::from_secs(60))
+            .max(Duration::from_secs(15));
         builder = builder
             .connect_timeout(Duration::from_secs(15))
-            // 15 s of total silence is a dead connection on any real link.
-            // 30 s meant a stalled segment kept its share of the file frozen
-            // for half a minute before the retry could reconnect.
-            .read_timeout(Duration::from_secs(15))
+            .read_timeout(read_timeout)
             .tcp_keepalive(Duration::from_secs(15));
         Ok(builder.build()?)
     }
@@ -259,61 +277,20 @@ impl Engine {
             Some(d) => d,
             None => std::env::current_dir()?,
         };
-        std::fs::create_dir_all(&dir)?;
-        let name = filename
+        let base_name = filename
             .map(|f| crate::names::sanitize_component(&f, &info.filename))
             .unwrap_or_else(|| info.filename.clone());
-        let dest = dir.join(&name);
-        let state_path = sidecar_path(&dest);
-
         let id = uuid::Uuid::new_v4().to_string();
 
-        // Resume when a compatible sidecar exists (same url + etag, not done).
-        let (segments, resumed) = match read_sidecar(&state_path)? {
-            Some(prev)
-                if prev.url == url
-                    && prev.etag == info.etag
-                    && prev.state != TaskState::Completed =>
-            {
-                (upgrade_legacy_layout(&prev, &info, &self.cfg), true)
-            }
-            _ => (plan_fresh(&info, &self.cfg), false),
-        };
-        tracing::info!(id = %id, resumed, segments = segments.len(), "planned download");
-
-        // Prepare the destination file (truncate only when starting over).
-        {
-            let f = if resumed {
-                std::fs::OpenOptions::new().create(true).write(true).open(&dest)?
-            } else {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&dest)?
-            };
-            // Pre-allocate once (planned size known): every later write lands
-            // in place - no per-write grow/metadata events, contiguous
-            // allocation on NTFS (disk-toll rule C9b). Never truncate a
-            // resumed file: only extend when it is shorter than planned.
-            // Sparse on Windows: without it, the first writes into the
-            // preallocated span trigger NTFS zero-fill storms (every byte
-            // below the write offset until the valid-data length catches
-            // up) - measured as ~800 MB/s multi-second write bursts on a
-            // DRAM-less NVMe at task start, the "everything lags when a
-            // new download starts" report. A sparse hole reads as zeros
-            // by definition, so the file system allocates only what is
-            // actually written and the reserved-space confusion (a 53%
-            // task showing the full 50 GiB in Explorer) goes away too.
-            #[cfg(windows)]
-            mark_sparse(&f);
-            let len = f.metadata()?.len();
-            if let Some(total) = info.total {
-                if len < total {
-                    f.set_len(total)?;
-                }
-            }
-        }
+        let url_owned = url.to_string();
+        let info_owned = info.clone();
+        let cfg_owned = Arc::clone(&self.cfg);
+        let (dest, state_path, segments, resumed) = tokio::task::spawn_blocking(move || {
+            prepare_destination(&dir, &base_name, &url_owned, &info_owned, &cfg_owned)
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+        tracing::info!(id = %id, dest = %dest.display(), resumed, segments = segments.len(), "planned download");
 
         let cells: Arc<Mutex<Vec<SegmentState>>> = Arc::new(Mutex::new(segments.clone()));
         let downloaded = Arc::new(AtomicU64::new(segments.iter().map(|s| s.done).sum()));
@@ -337,6 +314,8 @@ impl Engine {
         // whose dials fail is skipped on the spot, and when nothing can be
         // picked the OS default route carries the attempt.
         let dialer = self.dialer.clone();
+        let traffic = self.cfg.traffic.clone();
+        let links = self.cfg.links.clone();
 
         // On-the-fly bond rebalancing state, shared by the workers and the
         // migration supervisor below.
@@ -360,6 +339,8 @@ impl Engine {
             let linkmap = linkmap.clone();
             let migrate = migrate.clone();
             let stream_idle = self.cfg.stream_idle;
+            let traffic = traffic.clone();
+            let links = links.clone();
             // Ramp-in (the part-start lag spike): every segment used to
             // open its first handshake at the same moment, which read as a
             // hard CPU/AV hitch at every part start. First dials are spaced
@@ -386,6 +367,8 @@ impl Engine {
                     stream_idle,
                     linkmap,
                     migrate,
+                    traffic,
+                    links,
                 )
                 .await;
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -574,25 +557,26 @@ impl Engine {
 
         let persist_paused = |cells: &Arc<Mutex<Vec<SegmentState>>>, meta: &TaskStateFile| {
             let segments = cells.lock().expect("state cells").clone();
-            let _ = write_sidecar(
-                &state_path,
-                &TaskStateFile {
-                    segments,
-                    state: TaskState::Paused,
-                    ..meta.clone()
-                },
-            );
+            let path = state_path.clone();
+            let state = TaskStateFile {
+                segments,
+                state: TaskState::Paused,
+                ..meta.clone()
+            };
+            tokio::task::spawn_blocking(move || {
+                let _ = write_sidecar(&path, &state);
+            })
         };
 
         if let Some(e) = first_err {
-            persist_paused(&cells, &meta);
+            let _ = persist_paused(&cells, &meta).await;
             return Err(e);
         }
 
         if let Some(total) = info.total {
             let got = downloaded.load(Ordering::Relaxed);
             if got != total {
-                persist_paused(&cells, &meta);
+                let _ = persist_paused(&cells, &meta).await;
                 return Err(Error::SizeMismatch {
                     expected: total,
                     actual: got,
@@ -607,7 +591,8 @@ impl Engine {
             let mut stop = sidecar_stop.lock().await;
             *stop = true;
         }
-        let _ = std::fs::remove_file(&state_path);
+        let remove_path = state_path.clone();
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(&remove_path)).await;
         Ok(dest)
     }
 }
@@ -791,6 +776,9 @@ async fn run_segment(
     // link the supervisor wants it moved to.
     linkmap: Arc<Mutex<HashMap<usize, IpAddr>>>,
     migrate: Arc<Mutex<HashMap<usize, IpAddr>>>,
+    // next: daemon-owned budget. `None` keeps the private limiter path.
+    traffic: Option<Arc<dyn crate::traffic::Traffic>>,
+    links: Option<Arc<crate::links::LinkSet>>,
 ) -> Result<()> {
     let mut attempt = 0u32;
     // A migration order the previous attempt ended with: the next dial must
@@ -912,6 +900,8 @@ async fn run_segment(
             &token,
             stream_idle,
             &migrate,
+            traffic.as_deref(),
+            links.as_deref(),
         )
         .await
         {
@@ -1109,6 +1099,8 @@ async fn segment_attempt(
     token: &CancellationToken,
     stream_idle: Option<Duration>,
     migrate: &Mutex<HashMap<usize, IpAddr>>,
+    traffic: Option<&dyn crate::traffic::Traffic>,
+    links: Option<&crate::links::LinkSet>,
 ) -> Result<()> {
     let mut file: Option<std::fs::File> = Some(
         std::fs::OpenOptions::new()
@@ -1244,6 +1236,14 @@ async fn segment_attempt(
                     }
                     durable_added += credit;
                     cell.done += credit;
+                    if let Some((bond, link)) = &bond_ctx {
+                        if credit > 0 {
+                            if let Some(set) = links {
+                                set.record_ip(link.info.ip, credit, false);
+                            }
+                            bond.record(link, credit);
+                        }
+                    }
                     if cell.done >= allowed {
                         tail_stolen = true;
                     }
@@ -1325,6 +1325,14 @@ async fn segment_attempt(
                                 }
                                 durable_added += credit;
                                 cell.done += credit;
+                                if let Some((bond, link)) = &bond_ctx {
+                                    if credit > 0 {
+                                        if let Some(set) = links {
+                                            set.record_ip(link.info.ip, credit, false);
+                                        }
+                                        bond.record(link, credit);
+                                    }
+                                }
                             }
                             file = Some(handle);
                             let _ = &file;
@@ -1366,12 +1374,19 @@ async fn segment_attempt(
             },
         };
 
-        // Pace consumption: all segments draw from one shared budget.
-        limiter.acquire(chunk.len() as u64).await;
-        // Attribute the bytes to the link this connection dialed through;
-        // the sampler folds deltas into per-link rate EMAs.
-        if let Some((bond, link)) = &bond_ctx {
-            bond.record(link, chunk.len() as u64);
+        // Pace consumption: next draws from the daemon-owned hierarchy (global
+        // -> task -> host); v1 keeps the engine's private shared bucket.
+        if let Some(t) = traffic {
+            if t.acquire(chunk.len() as u64, Some(token)).await.is_err() {
+                rollback!();
+                return Err(Error::Cancelled);
+            }
+        } else if let Err(e) = limiter
+            .acquire_with_cancel(chunk.len() as u64, Some(token))
+            .await
+        {
+            rollback!();
+            return Err(e);
         }
 
         // Retune the batch target from this attempt's own throughput:
@@ -1431,11 +1446,11 @@ async fn segment_attempt(
 /// Split the file into at most `max_segments` ranges, each at least
 /// `min_segment_size`, unless the server cannot serve ranges.
 fn plan_fresh(info: &PlanInfo, cfg: &EngineConfig) -> Vec<SegmentState> {
+    let min_seg = cfg.min_segment_size.max(1);
+    let max_seg = cfg.max_segments.clamp(1, crate::rpc::MAX_SEGMENTS_LIMIT);
     match (info.accept_ranges, info.total) {
-        (true, Some(total)) if total >= cfg.min_segment_size => {
-            let n = ((total / cfg.min_segment_size) as usize)
-                .min(cfg.max_segments)
-                .max(2);
+        (true, Some(total)) if total >= min_seg && max_seg >= 2 => {
+            let n = ((total / min_seg) as usize).min(max_seg).max(2);
             let chunk = total / n as u64;
             (0..n)
                 .map(|i| {
@@ -1445,7 +1460,7 @@ fn plan_fresh(info: &PlanInfo, cfg: &EngineConfig) -> Vec<SegmentState> {
                 })
                 .collect()
         }
-        (true, Some(total)) => vec![SegmentState {
+        (true, Some(total)) if total > 0 => vec![SegmentState {
             index: 0,
             start: 0,
             end: total - 1,
@@ -1477,8 +1492,10 @@ fn upgrade_legacy_layout(prev: &TaskStateFile, info: &PlanInfo, cfg: &EngineConf
     if !legacy_unbounded(prev) {
         return prev.segments.clone();
     }
+    let min_seg = cfg.min_segment_size.max(1);
+    let max_seg = cfg.max_segments.clamp(1, crate::rpc::MAX_SEGMENTS_LIMIT);
     let ranged_now =
-        matches!((info.accept_ranges, info.total), (true, Some(total)) if total >= cfg.min_segment_size);
+        matches!((info.accept_ranges, info.total), (true, Some(total)) if total >= min_seg && max_seg >= 2);
     if !ranged_now {
         return prev.segments.clone();
     }
@@ -1555,7 +1572,7 @@ fn mark_sparse(f: &std::fs::File) {
 /// the attribute must be re-applied after every write. Best effort: a
 /// failure to set it changes nothing about the resume data.
 #[cfg(windows)]
-fn hide_on_windows(path: &Path) {
+pub(crate) fn hide_on_windows(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN,
@@ -1570,14 +1587,232 @@ fn hide_on_windows(path: &Path) {
     }
 }
 
-fn read_sidecar(path: &Path) -> Result<Option<TaskStateFile>> {
+#[cfg(not(windows))]
+pub(crate) fn hide_on_windows(_path: &Path) {}
+
+enum SidecarOutcome {
+    Missing,
+    Valid(TaskStateFile),
+    Corrupt(String),
+}
+
+fn read_sidecar_lenient(path: &Path) -> Result<SidecarOutcome> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).map_err(|e| Error::State(e.to_string()))?,
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(bytes) => match serde_json::from_slice::<TaskStateFile>(&bytes) {
+            Ok(st) => Ok(SidecarOutcome::Valid(st)),
+            Err(e) => Ok(SidecarOutcome::Corrupt(e.to_string())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SidecarOutcome::Missing),
         Err(e) => Err(e.into()),
     }
+}
+
+fn quarantine_sidecar(path: &Path) {
+    let mut corrupt = path.as_os_str().to_os_string();
+    corrupt.push(".corrupt");
+    // Swap `.ripdl.json` -> `.ripdl.corrupt` when possible so filename checks
+    // looking for `.ripdl.json` don't mistake the quarantine for a live sidecar.
+    let quarantine = if path
+        .to_string_lossy()
+        .ends_with(".ripdl.json")
+    {
+        let s = path.to_string_lossy();
+        PathBuf::from(format!("{}.ripdl.corrupt", s.trim_end_matches(".ripdl.json")))
+    } else {
+        PathBuf::from(corrupt)
+    };
+    let _ = std::fs::remove_file(&quarantine);
+    if std::fs::rename(path, &quarantine).is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Validate a persisted sidecar against the fresh probe and on-disk file size
+/// so mismatched totals, out-of-range/overlapping segments, corrupt indices, or
+/// externally truncated files cleanly fall back to a fresh download.
+fn validate_resume_state(dest: &Path, prev: &TaskStateFile, info: &PlanInfo, url: &str) -> Result<()> {
+    if prev.url != url || prev.state == TaskState::Completed {
+        return Err(Error::State("sidecar identity no longer resumable".into()));
+    }
+    if prev.etag != info.etag {
+        return Err(Error::State("server ETag changed".into()));
+    }
+    if prev.segments.is_empty() {
+        return Err(Error::State("sidecar has no segments".into()));
+    }
+    for (i, s) in prev.segments.iter().enumerate() {
+        if s.index != i {
+            return Err(Error::State("sidecar segment indices out of order".into()));
+        }
+    }
+    let file_len = std::fs::metadata(dest)?.len();
+    if legacy_unbounded(prev) {
+        if let (Some(old), Some(new)) = (prev.total, info.total) {
+            if old != new {
+                return Err(Error::State("server total changed".into()));
+            }
+        }
+        if prev.segments[0].done > file_len {
+            return Err(Error::State("partial file shorter than unbounded offset".into()));
+        }
+        return Ok(());
+    }
+    if prev.total != info.total {
+        return Err(Error::State("server total changed".into()));
+    }
+    let Some(total) = prev.total else {
+        return Err(Error::State("ranged sidecar missing total".into()));
+    };
+    if total == 0 {
+        return Err(Error::State("sidecar total is zero".into()));
+    }
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(prev.segments.len());
+    let mut done_sum = 0u64;
+    let mut required_len = 0u64;
+    for s in &prev.segments {
+        if s.end == UNBOUNDED || s.start > s.end || s.end >= total {
+            return Err(Error::State("sidecar segment bounds invalid".into()));
+        }
+        let span = s.end - s.start + 1;
+        if s.done > span {
+            return Err(Error::State("sidecar segment done exceeds span".into()));
+        }
+        done_sum = done_sum
+            .checked_add(s.done)
+            .ok_or_else(|| Error::State("sidecar done overflow".into()))?;
+        if s.done > 0 {
+            let end_written = s
+                .start
+                .checked_add(s.done)
+                .ok_or_else(|| Error::State("sidecar written offset overflow".into()))?;
+            required_len = required_len.max(end_written);
+        }
+        spans.push((s.start, s.end));
+    }
+    if done_sum > total {
+        return Err(Error::State("sidecar done sum exceeds total".into()));
+    }
+    spans.sort_unstable();
+    for pair in spans.windows(2) {
+        if pair[0].1 >= pair[1].0 {
+            return Err(Error::State("sidecar segments overlap".into()));
+        }
+    }
+    if file_len < required_len {
+        return Err(Error::State(format!(
+            "partial file truncated on disk ({file_len} < {required_len})"
+        )));
+    }
+    Ok(())
+}
+
+/// Choose a collision-safe destination path and open/preallocate the file.
+/// Only resumes when a sidecar exists, matches `url`/`etag`/`total`, has a
+/// valid segment table, and matches on-disk length. An existing unrelated file
+/// without a sidecar is never truncated — a numbered `(1)`, `(2)`, ... suffix
+/// is claimed atomically instead.
+fn prepare_destination(
+    dir: &Path,
+    base_name: &str,
+    url: &str,
+    info: &PlanInfo,
+    cfg: &EngineConfig,
+) -> Result<(PathBuf, PathBuf, Vec<SegmentState>, bool)> {
+    std::fs::create_dir_all(dir)?;
+    for n in 0..1000u32 {
+        let cand_name = crate::names::suffixed(base_name, n);
+        let dest = dir.join(&cand_name);
+        let state_path = sidecar_path(&dest);
+
+        match read_sidecar_lenient(&state_path)? {
+            SidecarOutcome::Valid(prev) => {
+                if prev.url != url {
+                    // Belongs to another URL's partial task — never overwrite it.
+                    continue;
+                }
+                let can_resume = validate_resume_state(&dest, &prev, info, url).is_ok();
+                if can_resume {
+                    let segments = upgrade_legacy_layout(&prev, info, cfg);
+                    let f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(&dest)?;
+                    #[cfg(windows)]
+                    mark_sparse(&f);
+                    let len = f.metadata()?.len();
+                    if let Some(total) = info.total {
+                        if len < total {
+                            f.set_len(total)?;
+                        }
+                    }
+                    return Ok((dest, state_path, segments, true));
+                } else {
+                    tracing::warn!(
+                        dest = %dest.display(),
+                        "existing sidecar no longer compatible; restarting clean"
+                    );
+                    if prev.etag == info.etag && prev.total == info.total {
+                        // Layout or file length was corrupted: quarantine aside.
+                        quarantine_sidecar(&state_path);
+                    } else {
+                        let _ = std::fs::remove_file(&state_path);
+                    }
+                    let f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&dest)?;
+                    #[cfg(windows)]
+                    mark_sparse(&f);
+                    if let Some(total) = info.total {
+                        f.set_len(total)?;
+                    }
+                    return Ok((dest, state_path, plan_fresh(info, cfg), false));
+                }
+            }
+            SidecarOutcome::Corrupt(err) => {
+                tracing::warn!(
+                    sidecar = %state_path.display(),
+                    error = %err,
+                    "corrupt sidecar; quarantining and starting fresh"
+                );
+                quarantine_sidecar(&state_path);
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&dest)?;
+                #[cfg(windows)]
+                mark_sparse(&f);
+                if let Some(total) = info.total {
+                    f.set_len(total)?;
+                }
+                return Ok((dest, state_path, plan_fresh(info, cfg), false));
+            }
+            SidecarOutcome::Missing => {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&dest)
+                {
+                    Ok(f) => {
+                        #[cfg(windows)]
+                        mark_sparse(&f);
+                        if let Some(total) = info.total {
+                            f.set_len(total)?;
+                        }
+                        return Ok((dest, state_path, plan_fresh(info, cfg), false));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    Err(Error::State(format!(
+        "no free destination filename in {} after 1000 attempts",
+        dir.display()
+    )))
 }
 
 #[cfg(test)]
@@ -1713,5 +1948,33 @@ mod tests {
         assert!(describe_torrent_bond(true, false, &[]).contains("when the next torrent starts"));
         assert!(describe_torrent_bond(true, true, &[]).contains("follows the network"));
         assert!(describe_torrent_bond(true, true, &one).starts_with("active on"));
+    }
+
+    #[test]
+    fn max_segments_one() {
+        let mut cfg = EngineConfig::default();
+        cfg.max_segments = 1;
+        cfg.min_segment_size = 1024 * 1024;
+        let plan = plan_fresh(&info(Some(32 * 1024 * 1024), true), &cfg);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].start, 0);
+        assert_eq!(plan[0].end, 32 * 1024 * 1024 - 1);
+    }
+
+    #[test]
+    fn max_segments_bound() {
+        let mut cfg = EngineConfig::default();
+        cfg.max_segments = 100_000;
+        cfg.min_segment_size = 1024;
+        let plan = plan_fresh(&info(Some(64 * 1024 * 1024), true), &cfg);
+        assert_eq!(plan.len(), crate::rpc::MAX_SEGMENTS_LIMIT);
+    }
+
+    #[test]
+    fn min_segment_zero_rejected() {
+        let mut cfg = EngineConfig::default();
+        cfg.min_segment_size = 0;
+        let plan = plan_fresh(&info(Some(16 * 1024 * 1024), true), &cfg);
+        assert_eq!(plan.len(), cfg.max_segments);
     }
 }

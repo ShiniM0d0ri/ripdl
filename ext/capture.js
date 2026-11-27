@@ -25,6 +25,11 @@
     const URL_RE = /https?:\/\/[^\s<>"'`]+/gi;
     /** Anchor text that names a file, never a command ("Download", "here"). */
     const FILENAME_RE = /^[^\\/:*?"<>|\r\n]{1,120}\.[A-Za-z0-9]{1,8}$/;
+    /** A filename-looking token anywhere in a row ("... [DODI].part01.rar" on
+     * crypter/hoster rows whose button carries no name itself). The class
+     * holds everything a release name uses; ] and - escaped/placed last. */
+    const FILE_TOKEN_RE =
+        /(?:[\w [\]().+_'&{}-]{2,116}\.)?(?:rar|zip|7z|tar|gz|tgz|cab|iso|mkv|mp4|avi|part\d{2})\b/i;
 
     let host = null; // <ripdl-offer-chip> element
     let root = null; // its shadow root
@@ -101,11 +106,66 @@
         }
         for (const a of anchors) {
             const label = (a.textContent || "").trim();
+            if (label && isSiteAnchor(a, label)) continue;
             const named = FILENAME_RE.test(label);
             if (named || textHasUrl) push(a.href, named ? label : "", false);
         }
         for (const m of text.matchAll(URL_RE)) push(trimPunctuation(m[0]), "", false);
-        for (const a of anchors) push(a.href, "", true);
+        for (const a of anchors) {
+            const label = (a.textContent || "").trim();
+            if (label && isSiteAnchor(a, label)) continue;
+            push(a.href, rowFileName(a), true);
+        }
+        return out;
+    }
+
+    /** A link labelled with its own address ("filekeeper.net" -> the site)
+     * is navigation, not a file: a domain-shaped label matches the filename
+     * test by accident and would ride the offer as junk parts. */
+    function isSiteAnchor(a, label) {
+        if (/[\s/]/.test(label)) return false;
+        let host;
+        try {
+            host = new URL(a.href, document.baseURI).hostname.toLowerCase().replace(/^www\./, "");
+        } catch {
+            return false;
+        }
+        const lab = label.toLowerCase().replace(/^https?:\/\//, "").replace(/[/.]+$/, "");
+        return lab === host || lab.endsWith("." + host);
+    }
+
+    /** A weak anchor ("Download") that names no file borrows the name its
+     * row shows: hoster/crypter pages put the filename beside the button,
+     * and the daemon's grouping keys on those names. Other anchors' labels
+     * are not the row's name (a paragraph may hold part1 ... part3 and one
+     * "Download"), so they are stripped before matching. Bounded walk -
+     * nearest ancestor whose stripped text stays row-sized. */
+    function rowFileName(a) {
+        let node = a.parentElement;
+        for (let hop = 0; node && hop < 5; hop++, node = node.parentElement) {
+            if (node.tagName === "BODY" || node.tagName === "HTML") return "";
+            const text = textWithoutOtherAnchors(node, a).replace(/\s+/g, " ").trim();
+            if (text.length > 200) continue; // a page-sized container, not a row
+            const m = text.match(FILE_TOKEN_RE);
+            if (m) return m[0].trim().slice(0, 160);
+        }
+        return "";
+    }
+
+    /** node's visible text, dropping every <a> but `self` (their labels are
+     * their own names - the prose between the links is the row's text).
+     * Element children are separated with a space: textContent concatenates
+     * siblings directly, and "...part01.rar" followed by "2.00 GB" must not
+     * read as "...part01.rar2.00" (no word boundary, no match). */
+    function textWithoutOtherAnchors(node, self) {
+        if (node === self) return "";
+        let out = "";
+        for (const child of node.childNodes) {
+            if (child.nodeType === 3) { out += child.nodeValue; continue; }
+            if (child.nodeType !== 1) continue;
+            if (child.tagName === "A" && child !== self) continue;
+            out += ` ${textWithoutOtherAnchors(child, self)} `;
+        }
         return out;
     }
 
@@ -140,24 +200,59 @@
 
     /* --- chip ------------------------------------------------------------- */
 
-    const FONT = "font: 12px/1.5 'Segoe UI', system-ui, sans-serif; color: #22303c;";
-    const BOX = "box-sizing: border-box; width: 336px; max-height: 60vh; overflow: auto; " +
-        "background: #fbfcfd; border: 1px solid #b9c1c9; border-radius: 8px; " +
-        "box-shadow: 0 10px 28px #0003; padding: 10px 12px; display: flex; " +
-        "flex-direction: column; gap: 6px; " + FONT;
-    const HEAD = "display: flex; align-items: center; gap: 8px; " +
-        "font-weight: 600; color: #26313b;";
-    const ROW = "display: flex; align-items: center; gap: 6px; color: #3c4854;";
-    const NOTE = "color: #8a6a2f; font-size: 11px;";
-    const ERR = "color: #b02a2a; font-size: 11px;";
-    const QUIET = "color: #5b6772; font-size: 11px;";
-    const ACTIONS = "display: flex; justify-content: flex-end; gap: 6px; margin-top: 2px;";
-    const BTN = "flex: none; padding: 4px 10px; border: 1px solid #c3c9cf; border-radius: 4px; " +
-        "background: #f1f3f5; cursor: pointer; " +
-        "font: 12px 'Segoe UI', system-ui, sans-serif; color: #22303c;";
-    const PRIMARY = BTN + "background: #2e6ea6; border-color: #2a639a; color: #fff; font-weight: 600;";
-    const FIELD = "flex: 1; min-width: 0; padding: 3px 6px; border: 1px solid #c3c9cf; " +
-        "border-radius: 4px; font: 12px 'Segoe UI', system-ui, sans-serif; color: #22303c; background: #fff;";
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    function pal() {
+        const dark = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        return dark ? {
+            font: "font: 12px/1.5 'Segoe UI', system-ui, sans-serif; color: #e6eff2;",
+            box: "box-sizing: border-box; width: 344px; max-height: 60vh; overflow: auto; " +
+                "background: #142026; border: 1px solid #2b4049; border-radius: 10px; " +
+                "box-shadow: 0 12px 32px #0008; padding: 11px 13px; display: flex; " +
+                "flex-direction: column; gap: 7px; ",
+            head: "display: flex; align-items: center; gap: 8px; font-weight: 600; color: #f0f6f8;",
+            row: "display: flex; align-items: center; gap: 6px; color: #c7d6dc;",
+            note: "color: #f0b45a; font-size: 11px;",
+            err: "color: #f27c75; font-size: 11px;",
+            headErr: "display: flex; align-items: center; gap: 8px; font-weight: 600; color: #f27c75;",
+            quiet: "color: #8ea3ac; font-size: 11px;",
+            actions: "display: flex; justify-content: flex-end; gap: 6px; margin-top: 2px;",
+            btnBg: "#1d2d34",
+            btnHover: "#263a43",
+            btn: "flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; " +
+                "border: 1px solid #324a53; border-radius: 6px; background: #1d2d34; cursor: pointer; " +
+                "font: 12px 'Segoe UI', system-ui, sans-serif; font-weight: 500; color: #e2edf1;",
+            primaryBg: "#138577",
+            primaryHover: "#0f6e62",
+            primaryBorder: "#1aa392",
+            field: "flex: 1; min-width: 0; padding: 4px 7px; border: 1px solid #324a53; " +
+                "border-radius: 5px; font: 12px 'Segoe UI', system-ui, sans-serif; color: #e6eff2; background: #0e171b;",
+            countMuted: "flex: none; color: #8ea3ac;",
+        } : {
+            font: "font: 12px/1.5 'Segoe UI', system-ui, sans-serif; color: #22303c;",
+            box: "box-sizing: border-box; width: 344px; max-height: 60vh; overflow: auto; " +
+                "background: #fbfcfd; border: 1px solid #b9c5c9; border-radius: 10px; " +
+                "box-shadow: 0 10px 28px #0b323026; padding: 11px 13px; display: flex; " +
+                "flex-direction: column; gap: 7px; ",
+            head: "display: flex; align-items: center; gap: 8px; font-weight: 600; color: #172522;",
+            row: "display: flex; align-items: center; gap: 6px; color: #364542;",
+            note: "color: #9e590e; font-size: 11px;",
+            err: "color: #b02a2a; font-size: 11px;",
+            headErr: "display: flex; align-items: center; gap: 8px; font-weight: 600; color: #b02a2a;",
+            quiet: "color: #5b6a66; font-size: 11px;",
+            actions: "display: flex; justify-content: flex-end; gap: 6px; margin-top: 2px;",
+            btnBg: "#f2f5f4",
+            btnHover: "#e4ebe8",
+            btn: "flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; " +
+                "border: 1px solid #c3d0cc; border-radius: 6px; background: #f2f5f4; cursor: pointer; " +
+                "font: 12px 'Segoe UI', system-ui, sans-serif; font-weight: 500; color: #1f2e2a;",
+            primaryBg: "#0c7669",
+            primaryHover: "#075c53",
+            primaryBorder: "#095d53",
+            field: "flex: 1; min-width: 0; padding: 4px 7px; border: 1px solid #c3d0cc; " +
+                "border-radius: 5px; font: 12px 'Segoe UI', system-ui, sans-serif; color: #172522; background: #fff;",
+            countMuted: "flex: none; color: #687772;",
+        };
+    }
 
     function el(tag, css, text) {
         const node = document.createElement(tag);
@@ -166,12 +261,57 @@
         return node;
     }
 
-    function button(label, css, hover, onClick) {
-        const b = el("button", css, label);
+    function svgEl(tag, attrs) {
+        const node = document.createElementNS(SVG_NS, tag);
+        for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+        return node;
+    }
+
+    function lucideIcon(specs, size = 13) {
+        const svg = svgEl("svg", {
+            viewBox: "0 0 24 24", width: size, height: size,
+            fill: "none", stroke: "currentColor", "stroke-width": 2,
+            "stroke-linecap": "round", "stroke-linejoin": "round",
+            "aria-hidden": "true",
+        });
+        svg.style.cssText = "flex: none; display: block;";
+        for (const [tag, attrs] of specs) svg.append(svgEl(tag, attrs));
+        return svg;
+    }
+
+    function brandTile(size = 18) {
+        const svg = svgEl("svg", { viewBox: "0 0 512 512", width: size, height: size, "aria-hidden": "true" });
+        svg.style.cssText = "flex: none; display: block; border-radius: 4px;";
+        svg.append(
+            svgEl("rect", { width: 512, height: 512, rx: 112, fill: "#0b3230" }),
+            svgEl("rect", { x: 104, y: 176, width: 86, height: 20, rx: 10, fill: "#4ee0b5", opacity: "0.55" }),
+            svgEl("rect", { x: 104, y: 242, width: 64, height: 20, rx: 10, fill: "#4ee0b5", opacity: "0.75" }),
+            svgEl("rect", { x: 104, y: 308, width: 42, height: 20, rx: 10, fill: "#4ee0b5" }),
+            svgEl("path", { d: "M222 132h68v122h62L256 384 160 254h62z", fill: "#ffffff" }),
+        );
+        return svg;
+    }
+
+    const ICON_CLOSE = [["path", { d: "M18 6 6 18" }], ["path", { d: "m6 6 12 12" }]];
+    const ICON_EDIT = [["path", { d: "M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" }]];
+    const ICON_DOWNLOAD = [["path", { d: "M12 15V3" }], ["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }], ["path", { d: "m7 10 5 5 5-5" }]];
+    const ICON_REFRESH = [["path", { d: "M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" }], ["path", { d: "M21 3v5h-5" }], ["path", { d: "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" }], ["path", { d: "M8 16H3v5" }]];
+
+    function button(label, css, hover, onClick, iconSpecs, primaryPal) {
+        const b = el("button", css, "");
         b.type = "button";
+        if (primaryPal) {
+            b.style.background = primaryPal.primaryBg;
+            b.style.borderColor = primaryPal.primaryBorder;
+            b.style.color = "#fff";
+            b.style.fontWeight = "600";
+        }
+        if (iconSpecs) b.append(lucideIcon(iconSpecs, 13));
+        if (label) b.append(document.createTextNode(label));
+        const baseBg = b.style.background;
         if (hover) {
             b.addEventListener("mouseenter", () => { b.style.background = hover; });
-            b.addEventListener("mouseleave", () => { b.style.background = ""; });
+            b.addEventListener("mouseleave", () => { b.style.background = baseBg; });
         }
         b.addEventListener("click", onClick);
         return b;
@@ -208,10 +348,11 @@
     function render() {
         ensureChip();
         root.textContent = "";
-        const box = el("div", BOX);
-        box.append(editing ? editHead() : offerHead());
-        box.append(editing ? editRows() : offerRows());
-        box.append(editing ? editActions() : offerActions());
+        const p = pal();
+        const box = el("div", p.box + p.font);
+        box.append(editing ? editHead(p) : offerHead(p));
+        box.append(editing ? editRows(p) : offerRows(p));
+        box.append(editing ? editActions(p) : offerActions(p));
         root.append(box);
         reposition();
     }
@@ -224,30 +365,32 @@
         return offer.groups.filter((g) => g.parts.length > 1);
     }
 
-    function closeButton() {
-        const b = button("\u00d7", BTN + "padding: 1px 7px; line-height: 1.1;", "#e6eaee", dismiss);
+    function closeButton(p) {
+        const b = button("", p.btn + "padding: 4px 6px;", p.btnHover, dismiss, ICON_CLOSE);
         b.title = "Dismiss";
+        b.setAttribute("aria-label", "Dismiss");
         return b;
     }
 
-    function offerHead() {
-        const head = el("div", HEAD);
+    function offerHead(p) {
+        const head = el("div", p.head);
         const n = linkCount();
+        head.append(brandTile(18));
         head.append(el("span", "flex: 1;", `Send ${n} link${n === 1 ? "" : "s"} to ripdl`));
-        head.append(closeButton());
+        head.append(closeButton(p));
         return head;
     }
 
-    function offerRows() {
+    function offerRows(p) {
         const frag = document.createDocumentFragment();
         for (const g of multiGroups()) {
-            frag.append(el("div", ROW, groupLine(g)));
+            frag.append(el("div", p.row, groupLine(g)));
         }
         const singles = linkCount() - multiGroups().reduce((n, g) => n + g.parts.length, 0);
-        if (singles) frag.append(el("div", ROW, `${singles} single download${singles === 1 ? "" : "s"}`));
-        if (offer.refresh) frag.append(refreshRow());
+        if (singles) frag.append(el("div", p.row, `${singles} single download${singles === 1 ? "" : "s"}`));
+        if (offer.refresh) frag.append(refreshRow(p));
         if (!offer.bundled) {
-            frag.append(el("div", NOTE, "This daemon predates bundles - the links are queued one by one."));
+            frag.append(el("div", p.note, "This daemon predates bundles - the links are queued one by one."));
         }
         return frag;
     }
@@ -255,19 +398,21 @@
     /** One matched unfinished task: the copied link can refresh it instead of
      * queueing a second copy. The daemon already probed the fresh link
      * through the real refresh gate, so "keeps X" is a verified number. */
-    function refreshRow() {
+    function refreshRow(p) {
         const r = offer.refresh;
         const state = r.state === "stale" ? "expired" : r.state;
         const done = r.kept
             ? `${humans(r.kept)}${r.total ? " of " + humans(r.total) : ""} already on disk`
             : "nothing on disk yet";
-        const row = el("div", ROW);
+        const row = el("div", p.row);
         const label = el("span", "flex: 1; min-width: 0;", "");
+        const titleRow = el("div", p.note + " display: flex; align-items: center; gap: 4px;");
+        titleRow.append(lucideIcon(ICON_REFRESH, 12), document.createTextNode(`${r.name} is already in ripdl (${state})`));
         label.append(
-            el("div", NOTE, `\u21bb ${r.name} is already in ripdl (${state})`),
-            el("div", QUIET, `Refresh keeps ${done}.`)
+            titleRow,
+            el("div", p.quiet, `Refresh keeps ${done}.`)
         );
-        row.append(label, button("Refresh", BTN, "#e6eaee", () => doRefresh()));
+        row.append(label, button("Refresh", p.btn, p.btnHover, () => doRefresh(), ICON_REFRESH));
         return row;
     }
 
@@ -306,11 +451,11 @@
         return `${g.name} - ${count}${missing}`;
     }
 
-    function offerActions() {
-        const row = el("div", ACTIONS);
-        row.append(button("Dismiss", BTN, "#e6eaee", dismiss));
-        row.append(button("Edit", BTN, "#e6eaee", enterEdit));
-        row.append(button("Send", PRIMARY, "#357ab5", doSend));
+    function offerActions(p) {
+        const row = el("div", p.actions);
+        row.append(button("Dismiss", p.btn, p.btnHover, dismiss));
+        row.append(button("Edit", p.btn, p.btnHover, enterEdit, ICON_EDIT));
+        row.append(button("Send", p.btn, p.primaryHover, doSend, ICON_DOWNLOAD, p));
         return row;
     }
 
@@ -323,43 +468,44 @@
         if (first) first.focus();
     }
 
-    function editHead() {
-        const head = el("div", HEAD);
+    function editHead(p) {
+        const head = el("div", p.head);
+        head.append(brandTile(18));
         head.append(el("span", "flex: 1;", "Adjust what gets sent"));
-        head.append(closeButton());
+        head.append(closeButton(p));
         return head;
     }
 
-    function editRows() {
+    function editRows(p) {
         const frag = document.createDocumentFragment();
-        for (const p of picks) {
-            const row = el("div", ROW);
-            const chk = el("input", "flex: none; margin: 0;");
+        for (const item of picks) {
+            const row = el("div", p.row);
+            const chk = el("input", "flex: none; margin: 0; accent-color: #0c7669;");
             chk.type = "checkbox";
-            chk.checked = p.on;
-            chk.addEventListener("change", () => { p.on = chk.checked; arm(); });
+            chk.checked = item.on;
+            chk.addEventListener("change", () => { item.on = chk.checked; arm(); });
             row.append(chk);
-            if (p.group.parts.length > 1) {
-                const name = el("input", FIELD);
+            if (item.group.parts.length > 1) {
+                const name = el("input", p.field);
                 name.type = "text";
-                name.value = p.name;
+                name.value = item.name;
                 name.spellcheck = false;
                 name.title = "Folder name";
-                name.addEventListener("input", () => { p.name = name.value; arm(); });
-                row.append(name, el("span", "flex: none; color: #6b7680;", `${p.group.parts.length} parts`));
+                name.addEventListener("input", () => { item.name = name.value; arm(); });
+                row.append(name, el("span", p.countMuted, `${item.group.parts.length} parts`));
             } else {
                 row.append(el("span", "flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; " +
-                    "white-space: nowrap;", p.group.name));
+                    "white-space: nowrap;", item.group.name));
             }
             frag.append(row);
         }
         return frag;
     }
 
-    function editActions() {
-        const row = el("div", ACTIONS);
-        row.append(button("Back", BTN, "#e6eaee", () => { editing = false; arm(); render(); }));
-        row.append(button("Send selected", PRIMARY, "#357ab5", doSend));
+    function editActions(p) {
+        const row = el("div", p.actions);
+        row.append(button("Back", p.btn, p.btnHover, () => { editing = false; arm(); render(); }));
+        row.append(button("Send selected", p.btn, p.primaryHover, doSend, ICON_DOWNLOAD, p));
         return row;
     }
 
@@ -402,11 +548,14 @@
     function showStatus(title, note, bad, ms) {
         ensureChip();
         root.textContent = "";
-        const box = el("div", BOX);
-        box.append(el("div", bad ? HEAD + "color: #b02a2a;" : HEAD, title));
-        if (note) box.append(el("div", bad ? ERR : QUIET, note));
-        const row = el("div", ACTIONS);
-        row.append(button("Close", BTN, "#e6eaee", dismiss));
+        const p = pal();
+        const box = el("div", p.box + p.font);
+        const head = el("div", bad ? p.headErr : p.head);
+        head.append(brandTile(16), el("span", "flex: 1;", title));
+        box.append(head);
+        if (note) box.append(el("div", bad ? p.err : p.quiet, note));
+        const row = el("div", p.actions);
+        row.append(button("Close", p.btn, p.btnHover, dismiss));
         box.append(row);
         root.append(box);
         arm(ms);

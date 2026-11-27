@@ -6,17 +6,39 @@
   <title>ripdl: already downloaded</title>
   <style>
     :root {
-      color-scheme: light;
+      color-scheme: light dark;
       --ink: #172522;
-      --muted: #687772;
+      --muted: #5b6d67;
       --line: #dce5e1;
-      --surface: #fff;
+      --surface: #ffffff;
+      --surface-2: #ffffff;
       --wash: #f3f7f5;
       --teal: #0c7669;
       --teal-dark: #075c53;
+      --btn-border: #b9d3c9;
+      --btn-hover: #f2f8f5;
+      --url: #70827c;
       --warn: #a45c10;
       --bad: #a43b36;
       --ok: #186b46;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e6eff2;
+        --muted: #8ea3ac;
+        --line: #273941;
+        --surface: #0e171b;
+        --surface-2: #152229;
+        --wash: #1a2a32;
+        --teal: #179484;
+        --teal-dark: #4ee0b5;
+        --btn-border: #324a53;
+        --btn-hover: #1d3039;
+        --url: #8ca0a8;
+        --warn: #f0b45a;
+        --bad: #f27c75;
+        --ok: #4ee0b5;
+      }
     }
     * { box-sizing: border-box; }
     html, body { height: 100%; margin: 0; }
@@ -28,13 +50,10 @@
     }
     button { font: inherit; }
     button:focus-visible { outline: 2px solid #268f80; outline-offset: 2px; }
+    .icon { flex: none; display: block; }
     .shell { display: flex; flex-direction: column; height: 100%; padding: 14px 16px 12px; gap: 10px; }
     .masthead { display: flex; align-items: center; gap: 10px; }
-    .brand-mark {
-      display: grid; place-items: center; width: 30px; height: 30px; flex: none;
-      border-radius: 8px; background: var(--teal); color: #fff;
-      font-size: 18px; font-weight: 700; line-height: 1;
-    }
+    .brand-mark { display: block; flex: none; border-radius: 8px; }
     h1 { margin: 0; font-size: 15px; line-height: 1.2; font-weight: 700; }
     .note { margin-top: 2px; color: var(--warn); font-size: 11.5px; }
     .note:empty { display: none; }
@@ -46,15 +65,16 @@
     .row.done { opacity: 0.7; }
     .name { font-weight: 650; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .state { margin-top: 2px; color: var(--muted); font-size: 11.5px; }
-    .url { margin-top: 1px; color: #8a9a95; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .url { margin-top: 1px; color: var(--url); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
     .action {
-      border: 1px solid #b9d3c9; border-radius: 6px; padding: 5px 10px;
-      background: #fff; color: var(--teal-dark); font-size: 12px; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 5px;
+      border: 1px solid var(--btn-border); border-radius: 6px; padding: 5px 10px;
+      background: var(--surface-2); color: var(--ink); font-size: 12px; font-weight: 600; cursor: pointer;
     }
-    .action:hover:not(:disabled) { background: #f2f8f5; border-color: var(--teal); }
+    .action:hover:not(:disabled) { background: var(--btn-hover); border-color: var(--teal); }
     .action.primary { background: var(--teal); border-color: var(--teal); color: #fff; }
-    .action.primary:hover:not(:disabled) { background: var(--teal-dark); border-color: var(--teal-dark); }
+    .action.primary:hover:not(:disabled) { background: #075c53; border-color: #075c53; }
     .action:disabled { opacity: 0.5; cursor: default; }
     .result { margin-top: 6px; font-size: 11.5px; color: var(--ok); }
     .result.bad { color: var(--bad); }
@@ -64,16 +84,22 @@
     .hint { flex: 1; color: var(--muted); font-size: 10.5px; }
     #close {
       border: 1px solid var(--line); border-radius: 6px; padding: 5px 12px;
-      background: #fff; cursor: pointer; font-size: 12px;
+      background: var(--surface-2); color: var(--ink); cursor: pointer; font-size: 12px; font-weight: 600;
     }
-    #close:hover { background: var(--wash); }
+    #close:hover { background: var(--wash); border-color: var(--teal); }
     .hidden { display: none; }
   </style>
 </head>
 <body>
   <main class="shell">
     <header class="masthead">
-      <div class="brand-mark" aria-hidden="true">r</div>
+      <svg class="brand-mark" viewBox="0 0 512 512" width="30" height="30" aria-hidden="true">
+        <rect width="512" height="512" rx="112" fill="#0b3230"/>
+        <rect x="104" y="176" width="86" height="20" rx="10" fill="#4ee0b5" opacity="0.55"/>
+        <rect x="104" y="242" width="64" height="20" rx="10" fill="#4ee0b5" opacity="0.75"/>
+        <rect x="104" y="308" width="42" height="20" rx="10" fill="#4ee0b5"/>
+        <path d="M222 132h68v122h62L256 384 160 254h62z" fill="#ffffff"/>
+      </svg>
       <div>
         <h1 id="title">ripdl</h1>
         <div id="note" class="note"></div>

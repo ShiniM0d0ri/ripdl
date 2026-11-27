@@ -4,8 +4,8 @@ needed.
 
 **Linux**: the `.deb` / `.rpm` install CLI + daemon + GUI with runtime
 dependencies declared. Portable tar users need the GUI runtime installed for
-the window to start (`libwebkit2gtk-4.1-0 libgtk-3-0
-libayatana-appindicator3`). The CLI and daemon alone need nothing beyond libc.
+the window to start (`libgl1 libxkbcommon0 libxdo3 libgtk-3-0
+libayatana-appindicator3-1`). The CLI and daemon alone need nothing beyond libc.
 
 **Browser extension**: `ripdl-browser-extension-*.zip` - unzip and load it via
 chrome://extensions > Developer mode > Load unpacked (see ext/README.md inside

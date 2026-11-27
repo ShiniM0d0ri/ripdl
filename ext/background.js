@@ -103,6 +103,14 @@ const SW_RACE_WAIT_MS = 700;
 let port = null;
 let hostAlive = false;
 let nextId = 1;
+let lastHelloAt = null;
+let lastDisconnectAt = null;
+let lastHostNote = null;
+
+function ensureHostConnected() {
+    if (!port) connectHost();
+    return !!port;
+}
 
 /** Single writer for daemon liveness (throws to the badge + popup). */
 function setHostAlive(v) {
@@ -212,7 +220,15 @@ function send(msg) {
                 resolve(null);
             }
         }, 15000);
-        port.postMessage(msg);
+        try {
+            port.postMessage(msg);
+        } catch (err) {
+            pending.delete(msg.id);
+            port = null;
+            lastHostNote = String(err?.message || "postMessage failed").slice(0, 80);
+            setHostAlive(false);
+            resolve(null);
+        }
     });
 }
 
@@ -227,18 +243,25 @@ function onHostMessage(resp) {
 function connectHost() {
     try {
         port = chrome.runtime.connectNative(HOST_NAME);
-    } catch {
+    } catch (err) {
+        lastHostNote = String(err?.message || "connectNative failed").slice(0, 80);
         setHostAlive(false);
         return;
     }
     port.onMessage.addListener(onHostMessage);
     port.onDisconnect.addListener(() => {
         port = null;
+        daemonBundles = null;
+        lastDisconnectAt = Date.now();
+        const runtimeErr = chrome.runtime.lastError?.message;
+        if (runtimeErr) lastHostNote = String(runtimeErr).slice(0, 80);
         setHostAlive(false);
         // Waiters resolve null -> captures fall back to the browser.
         for (const p of pending.values()) p.resolve(null);
         pending.clear();
     });
+    lastHelloAt = Date.now();
+    lastHostNote = null;
     send({
         id: `ext-${nextId++}`,
         cmd: { type: "extension_hello", version: chrome.runtime.getManifest().version },
@@ -453,16 +476,20 @@ async function addOne(url, headers) {
 /** Popup and other UI poke us here; answer is mirrored via storage. */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "ripdl_light_probe") {
-        if (!port) {
-            connectHost();
-        } else {
-            send({ id: `probe-${nextId++}`, cmd: { type: "list" } }).then((r) => setHostAlive(!!r));
-        }
+        (async () => {
+            if (!port) connectHost();
+            const r = await send({ id: `probe-${nextId++}`, cmd: { type: "list" } });
+            const alive = !!r;
+            setHostAlive(alive);
+            sendResponse({ ok: true, hostAlive: alive });
+        })();
+        return true;
     }
     if (msg?.type === "ripdl_offer") {
         // The copy chip: group the selection and describe it. Nothing is
         // queued here - the user still has to click Send.
         replyAsync(sendResponse, async () => {
+            ensureHostConnected();
             const links = await keepRecognized(sanitizeLinks(msg.links));
             if (!links.length) return { groups: [], bundled: daemonBundles !== false };
             const preview = await previewGroups(links);
@@ -476,6 +503,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // matched task's dead address, and the task resumes - that click IS
         // the intent to continue.
         (async () => {
+            ensureHostConnected();
             const resp = await send({
                 id: `rf-${nextId++}`,
                 cmd: { type: "refresh_url", id: msg.id, url: String(msg.url || ""), resume: true },
@@ -492,7 +520,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return true; // async reply
     }
     if (msg?.type === "ripdl_offer_send") {
-        replyAsync(sendResponse, () => sendGroups(msg.groups, msg.page));
+        replyAsync(sendResponse, () => {
+            ensureHostConnected();
+            return sendGroups(msg.groups, msg.page);
+        });
         return true; // async reply
     }
     if (msg?.type === "ripdl_hunt_query") {
@@ -538,6 +569,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const extVersion = chrome.runtime.getManifest().version;
             const skew = appVersion === null ? null : compareVersions(extVersion, appVersion);
             return { extVersion, appVersion, skew };
+        });
+        return true;
+    }
+    if (msg?.type === "ripdl_ext_diagnostics") {
+        replyAsync(sendResponse, async () => {
+            ensureHostConnected();
+            const resp = await send({ id: `diag-${nextId++}`, cmd: { type: "get_config" } });
+            const alive = !!resp;
+            if (alive !== hostAlive) setHostAlive(alive);
+            const appVersion = resp?.reply?.type === "config" && typeof resp.reply.version === "string"
+                ? resp.reply.version
+                : null;
+            const extVersion = chrome.runtime.getManifest().version;
+            const list = await registry();
+            const s = await settings();
+            const cookiePerm = await chrome.permissions.contains({ permissions: ["cookies"] }).catch(() => false);
+            return {
+                generatedAt: new Date().toISOString(),
+                extVersion,
+                appVersion,
+                versionSkew: appVersion === null ? null : compareVersions(extVersion, appVersion),
+                hostAlive: alive,
+                portConnected: !!port,
+                bundlesSupported: resp?.reply?.type === "config" ? !!resp.reply.bundles : daemonBundles,
+                captureEnabled: !!s.capture,
+                shareCookiesEnabled: !!s.shareCookies,
+                cookiesPermissionGranted: !!cookiePerm,
+                lastHelloAt,
+                lastDisconnectAt,
+                lastHostNote,
+                plugins: {
+                    total: list.length,
+                    enabled: list.filter((p) => p.enabled).length,
+                    errored: list.filter((p) => !!p.error).length,
+                    scripts: list.filter((p) => p.kind === "script").length,
+                    recipes: list.filter((p) => p.kind === "recipe").length,
+                },
+            };
         });
         return true;
     }
@@ -617,13 +686,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return true; // async reply
     }
     if (msg?.type === "ripdl_send" && msg.cmd && typeof msg.cmd.type === "string") {
-        // Popup-initiated task add (hunt buttons). Same rejection contract:
-        // not accepted -> the popup shows the daemon-unreachable state.
+        // Popup-initiated task add (hunt buttons): forward daemon rejection reason.
         (async () => {
+            ensureHostConnected();
             const resp = await send({ id: `pop-${nextId++}`, cmd: msg.cmd });
-            sendResponse({ ok: resp?.reply?.type === "added" });
-            if (!resp) setHostAlive(false);
-            else if (!hostAlive) setHostAlive(true);
+            if (!resp) {
+                setHostAlive(false);
+                sendResponse({ ok: false, error: "daemon unreachable" });
+                return;
+            }
+            if (!hostAlive) setHostAlive(true);
+            const ok = resp.reply?.type === "added";
+            sendResponse({
+                ok,
+                error: ok ? null : (resp.reply?.message || "request rejected"),
+            });
         })();
         return true;
     }
@@ -1087,6 +1164,7 @@ async function startBrowserCopy(url) {
 /** The window's choice for row `index` of job `key`. The window only names a
  * row and a choice; the URL, headers and task come from the stored job. */
 async function duplicateAction(key, index, action) {
+    ensureHostConnected();
     const slot = `dup:${key}`;
     const job = (await chrome.storage.session.get(slot))[slot];
     const item = job?.items?.[index];
@@ -1107,8 +1185,8 @@ async function duplicateAction(key, index, action) {
     } else if (!taskId) {
         return { ok: false, error: "ripdl no longer has this download." };
     } else if (action === "keep") {
-        const listed = await ask({ type: "list" });
-        const exists = (listed?.reply?.tasks || []).some((t) => t.id === taskId);
+        const detailed = await ask({ type: "details", id: taskId });
+        const exists = detailed?.reply?.type === "details";
         out = exists
             ? { ok: true, message: "Kept ripdl's download." }
             : { ok: false, error: "ripdl no longer has this download." };
@@ -1297,6 +1375,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     // Chromium hands the tab as the event's SECOND argument (tab), never on
     // OnClickInfo: info.tabId does not exist, so a menu click used to fall
     // to -1 and queueFromPage() would return silently (filed 2026-10-27).
+    ensureHostConnected();
     const tabId = typeof (tab && tab.id) === "number" ? tab.id : -1;
     if (info.menuItemId === "ripdl-selection" || info.menuItemId === "ripdl-all-links") {
         await queueFromPage(tabId, info, info.menuItemId === "ripdl-selection" ? "selection" : "all");

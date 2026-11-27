@@ -9,11 +9,13 @@
 //! Everything here is offline; no test touches a real network.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use ripdl_core::engine::retry::RetryConfig;
+use ripdl_core::traffic::{Cancelled, Traffic};
 use ripdl_core::{Engine, EngineConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -2011,4 +2013,395 @@ async fn expired_link_reports_auth_status_and_keeps_sidecar() {
         !names.iter().any(|n| n.ends_with(".ripdl.json")),
         "sidecar must be removed on success: {names:?}"
     );
+}
+
+#[derive(Debug, Default)]
+struct CountingTraffic {
+    calls: AtomicU64,
+    bytes: AtomicU64,
+    reported: AtomicU64,
+}
+
+impl Traffic for CountingTraffic {
+    fn acquire<'a>(
+        &'a self,
+        n: u64,
+        _token: Option<&'a CancellationToken>,
+    ) -> BoxFuture<'a, Result<(), Cancelled>> {
+        let calls = &self.calls;
+        let bytes = &self.bytes;
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(n, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+    fn report(&self, _run_id: u64, bytes: u64, _now: tokio::time::Instant) -> bool {
+        self.reported.fetch_add(bytes, Ordering::Relaxed);
+        true
+    }
+    fn rollback(&self, _run_id: u64, _bytes: u64, _now: tokio::time::Instant) -> bool {
+        true
+    }
+    fn rate_bps(&self) -> Option<f64> {
+        None
+    }
+    fn downloaded(&self) -> u64 {
+        self.reported.load(Ordering::Relaxed)
+    }
+}
+
+/// next: when a daemon-owned handle is supplied, every segment draws from it
+/// instead of the engine's private limiter.
+#[tokio::test]
+async fn engine_acquires_from_supplied_traffic() {
+    let total = 256 * KIB;
+    let state = Arc::new(ServerState {
+        total,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(100),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+    let counter = Arc::new(CountingTraffic::default());
+    let cfg = EngineConfig {
+        traffic: Some(counter.clone() as Arc<dyn Traffic>),
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(cfg).expect("engine");
+    let tmp = temp_dir("supplied-traffic");
+    let dest = engine
+        .download(&url, Some(tmp.clone()), CancellationToken::new(), |_p| {})
+        .await
+        .expect("download with supplied traffic");
+    verify(&dest, total);
+    assert!(counter.calls.load(Ordering::Relaxed) > 0, "no traffic acquire calls");
+    assert_eq!(
+        counter.bytes.load(Ordering::Relaxed),
+        total,
+        "all body bytes must be reserved through the shared handle"
+    );
+}
+
+#[tokio::test]
+async fn gzip_identity_and_hash() {
+    let total = 512 * KIB;
+    let state = Arc::new(ServerState {
+        total,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(1),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("Accept-Encoding".to_string(), "gzip, br".to_string());
+    let engine = Engine::new(EngineConfig {
+        headers,
+        ..EngineConfig::default()
+    })
+    .expect("engine");
+    let tmp = temp_dir("gzip-identity");
+    let dest = engine
+        .download(&url, Some(tmp), CancellationToken::new(), |_p| {})
+        .await
+        .expect("download");
+    verify(&dest, total);
+    let seen = state.headers_seen.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|h| h == "accept-encoding: identity"),
+        "expected Accept-Encoding: identity header, saw {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|h| h.starts_with("accept-encoding:") && h.contains("gzip")),
+        "client must not send gzip Accept-Encoding, saw {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_silent_overwrite() {
+    let total = 256 * KIB;
+    let state = Arc::new(ServerState {
+        total,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(2),
+        block_pace: None,
+        content_disposition: Some("attachment; filename=\"notes.bin\"".to_string()),
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+    let tmp = temp_dir("no-overwrite");
+    let existing = tmp.join("notes.bin");
+    std::fs::write(&existing, b"keep user bytes safe").unwrap();
+
+    let dest = test_engine()
+        .download(&url, Some(tmp.clone()), CancellationToken::new(), |_p| {})
+        .await
+        .expect("download completes without overwriting");
+    assert_ne!(dest, existing, "must pick a non-colliding suffix");
+    assert_eq!(dest, tmp.join("notes (1).bin"));
+    verify(&dest, total);
+    assert_eq!(std::fs::read(&existing).unwrap(), b"keep user bytes safe");
+}
+
+#[tokio::test]
+async fn resume_file_length_validated() {
+    let total = 4 * MIB;
+    let state = Arc::new(ServerState {
+        total,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(3),
+        block_pace: Some(Duration::from_millis(25)),
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+    let tmp = temp_dir("trunc-resume");
+    let token = CancellationToken::new();
+    let killer = token.clone();
+    let res = test_engine()
+        .download(&url, Some(tmp.clone()), token, move |p| {
+            if p.downloaded >= 300_000 {
+                killer.cancel();
+            }
+        })
+        .await;
+    assert!(matches!(res, Err(ripdl_core::Error::Cancelled)));
+
+    // Truncate partial payload far below recorded offsets.
+    let partial = tmp.join("file.bin");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial)
+        .unwrap()
+        .set_len(64)
+        .unwrap();
+
+    let dest = test_engine()
+        .download(&url, Some(tmp), CancellationToken::new(), |_p| {})
+        .await
+        .expect("restarts clean after external truncation");
+    verify(&dest, total);
+}
+
+#[tokio::test]
+async fn corrupt_and_malformed_sidecar_recover_cleanly() {
+    let total = MIB;
+    let state = Arc::new(ServerState {
+        total,
+        ranges: true,
+        drop_after_bytes: 0,
+        drop_times: 0,
+        dropped: AtomicUsize::new(0),
+        etag_version: AtomicUsize::new(4),
+        block_pace: None,
+        content_disposition: None,
+        headers_seen: Mutex::new(Vec::new()),
+        ranges_seen: Mutex::new(Vec::new()),
+        peers_seen: Mutex::new(Vec::new()),
+        quota_replies: 0,
+        quota_served: AtomicUsize::new(0),
+        hard_quota_replies: 0,
+        hard_quota_served: AtomicUsize::new(0),
+        head_bare: false,
+        slow_pace: None,
+        stall_after_bytes: 0,
+        stall_times: 0,
+        stalled: AtomicUsize::new(0),
+        forbidden: std::sync::atomic::AtomicBool::new(false),
+    });
+    let url = spawn_server(Arc::clone(&state)).await;
+
+    // 1) Corrupt JSON sidecar recovers cleanly.
+    let tmp1 = temp_dir("corrupt-sc");
+    let partial1 = tmp1.join("file.bin");
+    std::fs::write(&partial1, b"partial").unwrap();
+    std::fs::write(tmp1.join("file.bin.ripdl.json"), b"{invalid json").unwrap();
+    let dest1 = test_engine()
+        .download(&url, Some(tmp1.clone()), CancellationToken::new(), |_p| {})
+        .await
+        .expect("corrupt sidecar recovers");
+    verify(&dest1, total);
+    assert!(tmp1.join("file.bin.ripdl.corrupt").exists());
+    assert!(!tmp1.join("file.bin.ripdl.json").exists());
+
+    // 2) Syntactically valid but malformed segment table never panics.
+    let tmp2 = temp_dir("malformed-sc");
+    let partial2 = tmp2.join("file.bin");
+    std::fs::write(&partial2, vec![0u8; total as usize]).unwrap();
+    let bad_state = ripdl_core::task::TaskStateFile {
+        id: "t".into(),
+        url: url.clone(),
+        etag: Some("\"v4\"".into()),
+        total: Some(total),
+        state: ripdl_core::task::TaskState::Paused,
+        segments: vec![ripdl_core::task::SegmentState {
+            index: 99,
+            start: 0,
+            end: total * 2,
+            done: 128,
+        }],
+    };
+    std::fs::write(
+        tmp2.join("file.bin.ripdl.json"),
+        serde_json::to_vec(&bad_state).unwrap(),
+    )
+    .unwrap();
+    let dest2 = test_engine()
+        .download(&url, Some(tmp2), CancellationToken::new(), |_p| {})
+        .await
+        .expect("malformed sidecar recovers safely");
+    verify(&dest2, total);
+}
+
+#[tokio::test]
+async fn resume_total_mismatch_starts_fresh() {
+    // Dynamic mock server that keeps URL and ETag fixed while changing total.
+    let dynamic_total = Arc::new(AtomicU64::new(MIB));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dyn_srv = Arc::clone(&dynamic_total);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let tot_ref = Arc::clone(&dyn_srv);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                loop {
+                    let mut buf = [0u8; 512];
+                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    if n == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&head);
+                let is_head = text.starts_with("HEAD");
+                let total = tot_ref.load(Ordering::SeqCst);
+                let range = text
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("range: bytes=").map(str::to_string));
+                if is_head {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\netag: \"fixed\"\r\naccept-ranges: bytes\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                if let Some(spec) = range {
+                    let mut parts = spec.split('-');
+                    let a: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                    let b: u64 = parts
+                        .next()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(total - 1)
+                        .min(total - 1);
+                    let len = b - a + 1;
+                    let resp = format!(
+                        "HTTP/1.1 206 Partial Content\r\netag: \"fixed\"\r\naccept-ranges: bytes\r\ncontent-range: bytes {a}-{b}/{total}\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let body: Vec<u8> = (a..=b).map(pattern_byte).collect();
+                    let _ = sock.write_all(&body).await;
+                }
+            });
+        }
+    });
+
+    let url = format!("http://{addr}/dyn.bin");
+    let tmp = temp_dir("total-mismatch");
+    let dest_partial = tmp.join("dyn.bin");
+    std::fs::write(&dest_partial, vec![0xAAu8; (MIB / 2) as usize]).unwrap();
+    let old_state = ripdl_core::task::TaskStateFile {
+        id: "t".into(),
+        url: url.clone(),
+        etag: Some("\"fixed\"".into()),
+        total: Some(2 * MIB),
+        state: ripdl_core::task::TaskState::Paused,
+        segments: vec![ripdl_core::task::SegmentState {
+            index: 0,
+            start: 0,
+            end: (2 * MIB) - 1,
+            done: MIB / 2,
+        }],
+    };
+    std::fs::write(
+        tmp.join("dyn.bin.ripdl.json"),
+        serde_json::to_vec(&old_state).unwrap(),
+    )
+    .unwrap();
+
+    let dest = test_engine()
+        .download(&url, Some(tmp), CancellationToken::new(), |_p| {})
+        .await
+        .expect("total mismatch restarts fresh cleanly");
+    verify(&dest, MIB);
 }

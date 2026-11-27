@@ -2,6 +2,28 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function makeSvg(specs, size = 12) {
+    if (typeof document.createElementNS !== "function") return null;
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", String(size));
+    svg.setAttribute("height", String(size));
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    for (const [tag, attrs] of specs) {
+        const node = document.createElementNS(SVG_NS, tag);
+        for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+        svg.append(node);
+    }
+    return svg;
+}
 
 function entryDiv(e) {
     const div = document.createElement("div");
@@ -19,10 +41,19 @@ function entryDiv(e) {
     left.append(id);
     row.append(left);
 
+    const badges = document.createElement("div");
+    badges.className = "entry-badges";
+    if (e.kind === "script" && !e.seen && !e.error) {
+        const warnPill = document.createElement("span");
+        warnPill.className = "pill warn";
+        warnPill.textContent = "Review code to enable";
+        badges.append(warnPill);
+    }
     const kind = document.createElement("span");
     kind.className = `kind ${e.kind}`;
     kind.textContent = e.kind;
-    row.append(kind);
+    badges.append(kind);
+    row.append(badges);
     div.append(row);
 
     if (e.error) {
@@ -39,14 +70,17 @@ function entryDiv(e) {
     // Test box: paste any URL, see name + resolved direct URL. Nothing queues.
     const testInput = document.createElement("input");
     testInput.type = "text";
-    testInput.placeholder = "test: paste a URL";
-    testInput.style.cssText = "flex:1; font-size:11px; padding:2px 4px";
+    testInput.className = "test-input";
+    testInput.placeholder = "Test: paste a URL from this host";
     const testOut = document.createElement("div");
     testOut.className = "hint";
     testOut.style.wordBreak = "break-all";
     const testBtn = document.createElement("button");
-    testBtn.textContent = "Test";
-    testBtn.style.fontSize = "11px";
+    testBtn.type = "button";
+    const testIcon = makeSvg([["path", { d: "M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" }]], 11);
+    if (testIcon) testBtn.append(testIcon);
+    testBtn.append(document.createTextNode("Test"));
+    testBtn.style.fontSize = "11.5px";
     testBtn.addEventListener("click", async () => {
         testOut.textContent = "testing...";
         const r = await chrome.runtime.sendMessage({ type: "ripdl_plugin_test", id: e.id, url: testInput.value });
@@ -79,7 +113,8 @@ function entryDiv(e) {
                 if (seen?.ok) {
                     e.seen = true;
                     toggle.disabled = false;
-                    refresh();
+                    toggle.title = "";
+                    div.querySelector(".pill.warn")?.remove();
                 }
             }
         });
@@ -106,8 +141,11 @@ function entryDiv(e) {
 
     if (e.kind === "recipe") {
         const del = document.createElement("button");
+        del.type = "button";
         del.className = "recipe-delete";
-        del.textContent = "Remove";
+        const delIcon = makeSvg([["path", { d: "M18 6 6 18" }], ["path", { d: "m6 6 12 12" }]], 12);
+        if (delIcon) del.append(delIcon);
+        del.append(document.createTextNode("Remove"));
         del.addEventListener("click", async () => {
             await chrome.runtime.sendMessage({ type: "ripdl_recipe_delete", id: e.id });
             refresh();
@@ -197,6 +235,31 @@ async function importText(text) {
 }
 
 $("reload").addEventListener("click", () => chrome.runtime.reload());
+
+const diagBtn = $("diag-copy");
+if (diagBtn && typeof diagBtn.addEventListener === "function") {
+    diagBtn.addEventListener("click", async () => {
+        const st = $("diag-status");
+        st.className = "";
+        st.textContent = "Collecting…";
+        try {
+            const diag = await chrome.runtime.sendMessage({ type: "ripdl_ext_diagnostics" });
+            if (!diag) throw new Error("Extension background worker did not answer.");
+            const payload = JSON.stringify(diag, null, 2);
+            if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(payload);
+                st.className = "ok";
+                st.textContent = `Copied redacted diagnostics (${diag.appVersion ? `app ${diag.appVersion}` : "daemon offline"})`;
+            } else {
+                st.className = "ok";
+                st.textContent = `Collected diagnostics (${diag.appVersion ? `app ${diag.appVersion}` : "daemon offline"})`;
+            }
+        } catch (err) {
+            st.className = "bad";
+            st.textContent = String(err?.message || err);
+        }
+    });
+}
 
 refresh();
 loadVersion();
