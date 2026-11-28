@@ -20,11 +20,11 @@ a defect closes when its invariant and contract test exist (`QUALITY.md`).
 
 | Item | Value |
 |---|---|
-| Branch | `main` (`v0.5.0` release prep) |
+| Branch | `main` (`v0.5.1` release) |
 | Commit | see `git log -1 --oneline` (updated each PR) |
-| Product code | M1/M2/M3 complete (`unified-traffic` enabled by default); native `eframe`/`egui` desktop shell promoted to `crates/ripdl-gui` (replacing Tauri/WebView2) with tray icon, single-instance hand-off, 3-step first-run onboarding wizard, Light/Dark themes, and Lucide vectors; extension `welcome.html` + `ripdl register-host --open-welcome` onboarding landed |
+| Product code | M1/M2/M3 complete (`unified-traffic` enabled by default); native `eframe`/`egui` desktop shell promoted to `crates/ripdl-gui` (replacing Tauri/WebView2) with tray icon, single-instance hand-off, 3-step first-run onboarding wizard, Light/Dark themes, and Lucide vectors; extension `welcome.html` + `ripdl register-host --open-welcome` onboarding landed; `LinkSet` 1 s decoupled sampler + 6 s window + IPv6 NIC aliases + non-blocking sampler (`LNK-007`, `ISS-058`), and `file_missing` external deletion detection + seeding guard + in-place `Command::Redownload` (`QUE-019`) landed |
 | Trackers | `ISSUES.csv`, `FEATURE-MATRIX.md`, `INVARIANTS.md` |
-| Next milestone | Ship `v0.5.0` and continue v0.6 protocol/schema & capture enhancements |
+| Next milestone | Ship `v0.5.1` and continue v0.6 protocol/schema & capture enhancements |
 
 M1 and M2 exits met: 12 traffic tests + 14 link tests pass. Global cap, bundle
 share, torrent/video coverage, live limits, cancellation, burst, retry

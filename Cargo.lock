@@ -5933,7 +5933,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5948,7 +5948,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5972,7 +5972,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-daemon"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -5990,7 +5990,7 @@ dependencies = [
 
 [[package]]
 name = "ripdl-gui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "dirs 6.0.0",
  "eframe",
@@ -8825,7 +8825,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "ripdl-core",
