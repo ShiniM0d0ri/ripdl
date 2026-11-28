@@ -308,6 +308,9 @@ struct Daemon {
     /// torrent use (binds DHT/listener only when actually needed). Async
     /// mutex: creation awaits inside the locked section.
     torrents: tokio::sync::Mutex<Option<Arc<ripdl_core::torrent::TorrentSession>>>,
+    /// Ensures the first uplink discovery/probe pass finishes before a bonded
+    /// torrent session reads `uplink_addrs()`.
+    uplinks_ready: tokio::sync::Mutex<bool>,
     /// Local addresses the live torrent session binds outgoing peer
     /// connections to (None until the session is created; empty = created
     /// without bonding). `bind_ips` is fixed at creation, so this is the only
@@ -454,6 +457,7 @@ impl Daemon {
             seeders: Mutex::new(HashMap::new()),
             seed_gen: std::sync::atomic::AtomicU64::new(0),
             torrents: tokio::sync::Mutex::new(None),
+            uplinks_ready: tokio::sync::Mutex::new(false),
             torrent_bind: std::sync::Mutex::new(None),
     uplinks: std::sync::Mutex::new(Vec::new()),
     uplinks_dead: std::sync::Mutex::new(Vec::new()),
@@ -541,6 +545,15 @@ impl Daemon {
         self.queue_path.parent().map(|p| p.join("torrent-state"))
     }
 
+    fn clear_fastresume(&self, hash: &str) {
+        if hash.is_empty() {
+            return;
+        }
+        if let Some(dir) = self.torrent_state_dir() {
+            let _ = std::fs::remove_file(dir.join(format!("{hash}.bitv")));
+        }
+    }
+
     /// Drop bitfields for torrents the queue no longer knows: nothing else
     /// clears them (rqbit's session store is unused), so a removed task would
     /// leave a file behind forever. Runs at boot, before any session reads.
@@ -606,6 +619,22 @@ impl Daemon {
             }
         };
         for rec in recs {
+            if rec.state == TaskState::Completed
+                && is_file_missing(rec.state, rec.downloaded, rec.dest_file.as_deref())
+            {
+                // Do not attach a finished torrent whose output was deleted
+                // externally: adding it to rqbit can recreate an empty folder
+                // and would fail seeding checks anyway.
+                continue;
+            }
+            if rec.state == TaskState::Paused
+                && rec.downloaded > 0
+                && rec.dest_file.as_deref().is_some_and(|p| !artifact_present_on_disk(p))
+            {
+                if let Some(h) = rec.info_hash.as_deref() {
+                    self.clear_fastresume(h);
+                }
+            }
             let cfg = ripdl_core::torrent::TorrentConfig {
                 id: rec.id.clone(),
                 payload: rec.url.clone(),
@@ -708,12 +737,17 @@ impl Daemon {
         if !self.conf().seed_enabled() {
             return;
         }
-        let (hash, downloaded, cfg) = {
+        let (hash, downloaded, cfg, dest_file) = {
             let mut records = self.records.lock().unwrap();
             let Some(r) = records.iter_mut().find(|r| r.id == id) else {
                 return;
             };
             if r.state != TaskState::Completed || r.kind != TaskKind::Torrent {
+                return;
+            }
+            if is_file_missing(r.state, r.downloaded, r.dest_file.as_deref()) {
+                r.seeding = false;
+                r.upload_bps = None;
                 return;
             }
             let Some(hash) = r.info_hash.clone() else { return };
@@ -736,7 +770,7 @@ impl Daemon {
                 sequential: false,
                 download_bps: None,
             };
-            (hash, r.downloaded.max(r.total.unwrap_or(0)), cfg)
+            (hash, r.downloaded.max(r.total.unwrap_or(0)), cfg, r.dest_file.clone())
         };
         let (token, generation) = {
             let mut seeders = self.seeders.lock().unwrap();
@@ -810,6 +844,7 @@ impl Daemon {
             // cancelled. Bounded, so a torrent that cannot go live ends the
             // watch instead of spinning.
             let mut parked_wakes = 0u8;
+            let mut vanished_on_disk = false;
 
             loop {
                 if token.is_cancelled() {
@@ -822,6 +857,11 @@ impl Daemon {
                         .find(|r| r.id == id)
                         .map(|r| r.seed_paused)
                         .unwrap_or(false);
+                    break;
+                }
+                if dest_file.as_deref().is_some_and(|p| !artifact_present_on_disk(p)) {
+                    tracing::info!(task = %id, "stopping torrent seeding: payload vanished from disk");
+                    vanished_on_disk = true;
                     break;
                 }
                 let Some(stats) = session.seed_stats(&hash) else {
@@ -919,7 +959,10 @@ impl Daemon {
                     drop(records);
                     let _ = this.persist(&snapshot);
                 }
-                if should_pause {
+                if vanished_on_disk {
+                    session.forget_by_hash(&hash).await;
+                    this.clear_fastresume(&hash);
+                } else if should_pause {
                     session.pause_by_hash(&hash).await;
                 }
                 forget_seed_watch(&this.seeders, &id, generation);
@@ -1187,6 +1230,7 @@ impl Daemon {
             }
             Command::Pause { id } => self.cmd_pause(req.id, &id).await,
             Command::Resume { id } => self.cmd_resume(req.id, &id),
+            Command::Redownload { id } => self.cmd_redownload(req.id, &id).await,
             Command::Open { id, folder } => self.cmd_open(req.id, &id, folder),
             Command::Remove { id, delete_files } => {
                 self.cmd_remove(req.id, &id, delete_files).await
@@ -1780,8 +1824,12 @@ impl Daemon {
         // never emit probe handshakes.
         if self.conf().bond_interfaces() {
             self.refresh_uplinks().await;
+            *self.uplinks_ready.lock().await = true;
+        } else {
+            *self.uplinks_ready.lock().await = false;
         }
         self.sync_torrent_binding().await;
+        self.sync_link_set();
         Response {
             id: req_id,
             reply: self.config_reply(),
@@ -1855,12 +1903,30 @@ impl Daemon {
         dirs
     }
 
+    /// Run the initial uplink discovery + reachability probe pass once when
+    /// bonding is enabled so the first bonded torrent session binds the live
+    /// uplinks right away instead of racing `watch_bonding`.
+    async fn ensure_uplinks_ready(&self) {
+        if !self.conf().bond_interfaces() {
+            return;
+        }
+        let mut ready = self.uplinks_ready.lock().await;
+        if !*ready {
+            self.refresh_uplinks().await;
+            self.sync_link_set();
+            *ready = true;
+        }
+    }
+
     /// The daemon's one torrent session, created on demand (DHT/listener
     /// bind once, rooted at the download default). Torrent runners and
     /// preview queries share this same path.
     async fn ensure_torrent_session(
         &self,
     ) -> Result<Arc<ripdl_core::torrent::TorrentSession>, String> {
+        if self.torrents.lock().await.is_none() {
+            self.ensure_uplinks_ready().await;
+        }
         let mut guard = self.torrents.lock().await;
         if guard.is_none() {
             let root = self
@@ -2002,11 +2068,11 @@ impl Daemon {
 
     /// Uplinks appear and disappear while the daemon runs (Wi-Fi re-associates,
     /// a phone gets plugged in - or loses its data during a call and comes
-    /// back). Probe every tick so a returning link is used within 5 s; two
-    /// consecutive failures are needed to evict one, so a blip costs nothing.
+    /// back). Discovery/probing runs on a 5 s loop and is decoupled from the
+    /// 1 s traffic/link sampler so slow probes never inflate or stall link
+    /// rates (`ISS-065`), and zero probes run while bonding is off.
     ///
-    /// Reconcile of paused/completed torrents runs on its own 15 s loop so it
-    /// never delays the 5 s link/rate sampler under large torrent queues.
+    /// Reconcile of paused/completed torrents runs on its own 15 s loop.
     async fn watch_bonding(self: Arc<Self>) {
         {
             let this = Arc::clone(&self);
@@ -2023,66 +2089,82 @@ impl Daemon {
                 }
             });
         }
-        let mut was_bonding = false;
+        {
+            let this = Arc::clone(&self);
+            tokio::spawn(async move {
+                let mut was_bonding = false;
+                loop {
+                    let bonding = this.conf().bond_interfaces();
+                    if bonding {
+                        this.refresh_uplinks().await;
+                        *this.uplinks_ready.lock().await = true;
+                        this.sync_torrent_binding().await;
+                        this.sync_link_set();
+                    } else if was_bonding {
+                        *this.uplinks_ready.lock().await = false;
+                        this.sync_torrent_binding().await;
+                        this.sync_link_set();
+                    }
+                    was_bonding = bonding;
+                    tokio::select! {
+                        _ = this.shutdown.notified() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+                }
+            });
+        }
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let bonding = self.conf().bond_interfaces();
-            if bonding {
-                self.refresh_uplinks().await;
-                self.sync_torrent_binding().await;
+            if self.conf().bond_interfaces() {
                 self.apply_bind_weights().await;
-            } else if was_bonding {
-                self.sync_torrent_binding().await;
             }
-            was_bonding = bonding;
             self.feed_http_bond().await;
             tokio::select! {
                 _ = self.shutdown.notified() => break,
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = tick.tick() => {}
             }
         }
     }
 
-    /// Feed the HTTP engine's bond authority: the link set follows the proved
-    /// uplinks (same truth the torrent binding uses) and the sampler folds
-    /// each link's metered bytes into its rate EMA + weights every tick. The
-    /// task engines dial from this instance, so a link that just left (or got
-    /// fast) is acted on at the next engine pick - no restart, no re-probe.
-    ///
-    /// Bonding off: keep the link set empty, so a pick never lands on a
-    /// stale link after the toggle; engine `bond` config is Off anyway.
-    async fn feed_http_bond(&self) {
+    fn current_bond_links(
+        &self,
+    ) -> (
+        Vec<ripdl_core::bond::LinkInfo>,
+        Vec<(std::net::IpAddr, std::net::IpAddr)>,
+    ) {
+        let excludes = self.conf().bond_excludes();
+        let uplinks = self.uplinks.lock().unwrap();
+        let mut links = Vec::with_capacity(uplinks.len());
+        let mut aliases = Vec::new();
+        for n in uplinks.iter() {
+            if !bond_allowed(&excludes, &n.name) {
+                continue;
+            }
+            let primary = std::net::IpAddr::V4(n.addr);
+            links.push(ripdl_core::bond::LinkInfo {
+                ip: primary,
+                name: n.name.clone(),
+                default_route: n.is_default_route,
+            });
+            if let Some(v6) = n.v6 {
+                aliases.push((std::net::IpAddr::V6(v6), primary));
+            }
+        }
+        (links, aliases)
+    }
+
+    fn sync_link_set(&self) {
         if !self.conf().bond_interfaces() {
             self.bond.set_links(&[]);
             *self.bond_links.lock().unwrap() = Vec::new();
             *self.link_sample_at.lock().unwrap() = None;
+            *self.bind_sample.lock().unwrap() = None;
             #[cfg(feature = "unified-traffic")]
             self.links.set_enabled(false);
             return;
         }
-        let now = Instant::now();
-        let measured = {
-            let mut prev = self.link_sample_at.lock().unwrap();
-            let measured = prev
-                .map(|t| now.duration_since(t))
-                .unwrap_or(Duration::from_secs(5));
-            *prev = Some(now);
-            measured
-        };
-        let dt = measured.as_secs_f64().max(0.05);
-        let links: Vec<ripdl_core::bond::LinkInfo> = {
-            let excludes = self.conf().bond_excludes();
-            self.uplinks
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|n| bond_allowed(&excludes, &n.name))
-                .map(|n| ripdl_core::bond::LinkInfo {
-                    ip: std::net::IpAddr::V4(n.addr),
-                    name: n.name.clone(),
-                    default_route: n.is_default_route,
-                })
-                .collect()
-        };
+        let (links, aliases) = self.current_bond_links();
         #[cfg(feature = "unified-traffic")]
         {
             self.links.set_enabled(true);
@@ -2095,9 +2177,40 @@ impl Daemon {
                 })
                 .collect();
             self.links.set_links(&infos);
+            self.links.set_aliases(&aliases);
+        }
+        #[cfg(not(feature = "unified-traffic"))]
+        let _ = aliases;
+        self.bond.set_links(&links);
+    }
+
+    /// Feed the HTTP engine's bond authority and the shared `LinkSet`: the
+    /// link set follows the proved uplinks (same truth the torrent binding
+    /// uses) and the sampler folds each link's metered bytes into its rate
+    /// window/EMA + weights every 1 s tick.
+    ///
+    /// Bonding off: keep the link set empty, so a pick never lands on a
+    /// stale link after the toggle; engine `bond` config is Off anyway.
+    async fn feed_http_bond(&self) {
+        if !self.conf().bond_interfaces() {
+            self.sync_link_set();
+            return;
+        }
+        self.sync_link_set();
+        let now = Instant::now();
+        let measured = {
+            let mut prev = self.link_sample_at.lock().unwrap();
+            let measured = prev
+                .map(|t| now.duration_since(t))
+                .unwrap_or(Duration::from_secs(1));
+            *prev = Some(now);
+            measured
+        };
+        let dt = measured.as_secs_f64().max(0.05);
+        #[cfg(feature = "unified-traffic")]
+        {
             let _ = self.links.sample(tokio::time::Instant::from_std(now), measured);
         }
-        self.bond.set_links(&links);
         let status = self.bond.sample(dt);
         *self.bond_links.lock().unwrap() = status
             .iter()
@@ -2129,19 +2242,27 @@ impl Daemon {
     /// quarantined, and every minute the weights reset to 1 for one tick so a
     /// recovered - or newly wired - link can compete.
     async fn apply_bind_weights(&self) {
-        let Some(session) = self.torrents.lock().await.clone() else {
+        let Ok(guard) = self.torrents.try_lock() else {
             return;
         };
+        let Some(session) = guard.clone() else {
+            return;
+        };
+        drop(guard);
         let now = Instant::now();
         let totals = session.bind_totals();
-        if totals.is_empty() {
-            return;
-        }
         let mut prev = self.bind_sample.lock().unwrap();
         let Some((t0, before)) = prev.clone() else {
+            // Baseline to current totals (even when empty) so the very first
+            // bytes read by newly bound peers are recorded immediately instead
+            // of being swallowed into the baseline.
             *prev = Some((now, totals));
             return;
         };
+        if totals.is_empty() {
+            *prev = Some((now, totals));
+            return;
+        }
         // A new session (daemon restart, session rebuild) restarts every
         // counter at 0: rebaseline instead of reading a bogus negative delta.
         if totals
@@ -2160,14 +2281,12 @@ impl Daemon {
                 .iter()
                 .find(|(i, _)| i == ip)
                 .map(|(_, b)| *b)
-                .unwrap_or(*total);
-            let sample = total.saturating_sub(old) as f64 / dt;
+                .unwrap_or(0);
+            let delta = total.saturating_sub(old);
+            let sample = delta as f64 / dt;
             #[cfg(feature = "unified-traffic")]
-            {
-                let delta = total.saturating_sub(old);
-                if delta > 0 {
-                    self.links.record_ip(*ip, delta, false);
-                }
+            if delta > 0 {
+                self.links.record_ip(*ip, delta, false);
             }
             // Ease in: one 5 s window is noisy on a phone link.
             let ema = match rates.iter().find(|(i, _)| i == ip) {
@@ -2401,9 +2520,13 @@ impl Daemon {
     /// The current view of one task, for the `Duplicate` answers. Lock order
     /// records -> progress, as in `cmd_list`.
     fn task_info_for(&self, id: &str) -> Option<TaskInfo> {
-        let records = self.records.lock().unwrap();
-        let progress = self.progress.lock().unwrap();
-        records.iter().find(|r| r.id == id).map(|r| task_info_of(r, &progress))
+        let mut info = {
+            let records = self.records.lock().unwrap();
+            let progress = self.progress.lock().unwrap();
+            records.iter().find(|r| r.id == id).map(|r| task_info_of(r, &progress))
+        }?;
+        info.file_missing = is_file_missing(info.state, info.downloaded, info.dest_file.as_deref());
+        Some(info)
     }
 
     /// Open a task's file, or reveal it in its folder (`Command::Open`). Only
@@ -2416,9 +2539,26 @@ impl Daemon {
         let reply = match file {
             None => Reply::Error { message: format!("no task {id}") },
             Some(None) => Reply::Error { message: "this download has no file yet".to_string() },
-            Some(Some(path)) if !path.exists() => Reply::Error {
-                message: format!("the file is gone: {}", path.display()),
-            },
+            Some(Some(path)) if !path.exists() => {
+                if folder {
+                    if let Some(parent) = path.parent().filter(|p| p.is_dir()) {
+                        match open_in_shell(parent, false) {
+                            Ok(()) => Reply::Ok,
+                            Err(e) => Reply::Error {
+                                message: format!("cannot open {}: {e}", parent.display()),
+                            },
+                        }
+                    } else {
+                        Reply::Error {
+                            message: format!("the file is gone: {}", path.display()),
+                        }
+                    }
+                } else {
+                    Reply::Error {
+                        message: format!("the file is gone: {}", path.display()),
+                    }
+                }
+            }
             Some(Some(path)) => match open_in_shell(&path, folder) {
                 Ok(()) => Reply::Ok,
                 Err(e) => Reply::Error { message: format!("cannot open {}: {e}", path.display()) },
@@ -2883,6 +3023,7 @@ impl Daemon {
             Some((d, t, p)) => (d, t, p),
             None => (rec.downloaded, rec.total, None),
         };
+        let file_missing = is_file_missing(rec.state, downloaded, dest_file.as_deref());
         Response {
             id: req_id,
             reply: Reply::TaskDetails {
@@ -2892,6 +3033,7 @@ impl Daemon {
                     url: rec.url,
                     state: rec.state,
                     dest_file,
+                    file_missing,
                     downloaded,
                     total,
                     percent,
@@ -3319,30 +3461,73 @@ impl Daemon {
     /// session's managed torrents and snapshot files/peers/trackers.
     async fn cmd_torrent_details(&self, req_id: u64, id: &str) -> Response {
         let reply: Result<Reply, String> = async {
-            let (kind_state, info_hash) = {
+            let (rec, live) = {
                 let records = self.records.lock().unwrap();
                 let r = records
                     .iter()
                     .find(|r| r.id == id)
                     .ok_or_else(|| "task not found".to_string())?;
-                (r.kind, r.info_hash.clone())
+                let live = self
+                    .progress
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .map(|t| t.last.downloaded);
+                (r.clone(), live)
             };
-            if kind_state != TaskKind::Torrent {
+            if rec.kind != TaskKind::Torrent {
                 return Err("task is not a torrent".into());
             }
+            let downloaded = live.unwrap_or(rec.downloaded);
+            let file_missing = is_file_missing(rec.state, downloaded, rec.dest_file.as_deref());
+            let missing_fallback = || ripdl_core::torrent::TorrentDetailsSnapshot {
+                info_hash: rec.info_hash.clone().unwrap_or_default(),
+                name: rec.torrent_name.clone(),
+                root: rec.dest_file.clone(),
+                total: rec.total.unwrap_or(0),
+                downloaded,
+                finished: rec.state == TaskState::Completed,
+                paused: rec.state == TaskState::Paused,
+                uploaded: rec.uploaded,
+                upload_speed_bps: 0.0,
+                download_speed_bps: 0.0,
+                peers_connected: 0,
+                seeding: false,
+                file_missing: true,
+                files: Vec::new(),
+                peers: Vec::new(),
+                trackers: Vec::new(),
+            };
             let session = {
                 let guard = self.torrents.lock().await;
-                match guard.as_ref() {
-                    Some(s) => Arc::clone(s),
-                    None => return Err("torrent session not running".into()),
-                }
+                guard.as_ref().map(Arc::clone)
             };
-            let hash = info_hash
-                .ok_or_else(|| "torrent not yet resolved (no metadata yet?)".to_string())?;
-            session
-                .details(&hash)
-                .map_err(|e| e.to_string())
-                .map(|d| Reply::TorrentDetails { details: d })
+            let Some(session) = session else {
+                if file_missing {
+                    return Ok(Reply::TorrentDetails {
+                        details: missing_fallback(),
+                    });
+                }
+                return Err("torrent session not running".into());
+            };
+            let Some(hash) = rec.info_hash.as_deref() else {
+                if file_missing {
+                    return Ok(Reply::TorrentDetails {
+                        details: missing_fallback(),
+                    });
+                }
+                return Err("torrent not yet resolved (no metadata yet?)".into());
+            };
+            match session.details(hash) {
+                Ok(mut details) => {
+                    details.file_missing = file_missing;
+                    Ok(Reply::TorrentDetails { details })
+                }
+                Err(_) if file_missing => Ok(Reply::TorrentDetails {
+                    details: missing_fallback(),
+                }),
+                Err(e) => Err(e.to_string()),
+            }
         }
         .await;
         let reply = match reply {
@@ -3413,19 +3598,20 @@ impl Daemon {
     }
 
     fn cmd_list(&self, req_id: u64) -> Response {
-        // The GUI polls this at 2 Hz; no snapshot deep-clone of every record
-        // (urls, paths, file vectors) needed - iterate the guard directly.
-        // Lock order records -> progress matches set_completed.
-        let records = self.records.lock().unwrap();
-        let progress = self.progress.lock().unwrap();
-
-        let tasks = records
-            .iter()
-            .map(|r| task_info_of(r, &progress))
-            .collect();
-
-        drop(records);
-        drop(progress);
+        // The GUI polls this at 1-2 Hz; build the list under short locks and
+        // check on-disk artifact existence afterwards so filesystem stats never
+        // contend on queue/progress locks.
+        let mut tasks: Vec<TaskInfo> = {
+            let records = self.records.lock().unwrap();
+            let progress = self.progress.lock().unwrap();
+            records
+                .iter()
+                .map(|r| task_info_of(r, &progress))
+                .collect()
+        };
+        for t in &mut tasks {
+            t.file_missing = is_file_missing(t.state, t.downloaded, t.dest_file.as_deref());
+        }
         Response { id: req_id, reply: Reply::Tasks { tasks } }
     }
 
@@ -3513,27 +3699,43 @@ impl Daemon {
         enum Resume {
             Run(TaskRecord),
             Seed,
+            MissingFile,
         }
+        let mut clear_hash: Option<String> = None;
         let action = {
             let mut records = self.records.lock().unwrap();
             match records.iter_mut().find(|r| r.id == id) {
                 Some(r) if matches!(r.state, TaskState::Paused | TaskState::Failed | TaskState::Stale) => {
+                    if r.kind == TaskKind::Torrent
+                        && r.downloaded > 0
+                        && r.dest_file.as_deref().is_some_and(|p| !artifact_present_on_disk(p))
+                    {
+                        clear_hash = r.info_hash.clone();
+                        r.downloaded = 0;
+                    }
                     r.state = TaskState::Queued;
                     r.error = None;
                     Some(Resume::Run(r.clone()))
                 }
                 // Completed torrent: "resume" restarts seeding (the row's
-                // pause button used it to stop).
+                // pause button used it to stop), unless its payload vanished.
                 Some(r) if r.state == TaskState::Completed
                     && r.kind == TaskKind::Torrent
                     && r.info_hash.is_some() =>
                 {
-                    r.seed_paused = false;
-                    Some(Resume::Seed)
+                    if is_file_missing(r.state, r.downloaded, r.dest_file.as_deref()) {
+                        Some(Resume::MissingFile)
+                    } else {
+                        r.seed_paused = false;
+                        Some(Resume::Seed)
+                    }
                 }
                 _ => None,
             }
         };
+        if let Some(hash) = clear_hash {
+            self.clear_fastresume(&hash);
+        }
         match action {
             Some(Resume::Run(rec)) => {
                 let snapshot = self.records.lock().unwrap().clone();
@@ -3555,6 +3757,12 @@ impl Daemon {
                 self.start_seeding(id);
                 Response { id: req_id, reply: Reply::Ok }
             }
+            Some(Resume::MissingFile) => Response {
+                id: req_id,
+                reply: Reply::Error {
+                    message: "cannot seed: file is missing on disk (use Re-download instead)".into(),
+                },
+            },
             None => Response {
                 id: req_id,
                 reply: Reply::Error {
@@ -3562,6 +3770,85 @@ impl Daemon {
                 },
             },
         }
+    }
+
+    /// Reset a finished or parked task whose files were deleted from disk and
+    /// queue it again in place using its saved address and options.
+    async fn cmd_redownload(self: &Arc<Self>, req_id: u64, id: &str) -> Response {
+        let reply: Result<Reply, String> = async {
+            let (snapshot_rec, seeder_token) = {
+                let records = self.records.lock().unwrap();
+                let Some(r) = records.iter().find(|r| r.id == id) else {
+                    return Err("task not found".into());
+                };
+                if matches!(r.state, TaskState::Running | TaskState::Queued) {
+                    return Err("download is currently active".into());
+                }
+                if r.state == TaskState::Completed
+                    && !is_file_missing(r.state, r.downloaded, r.dest_file.as_deref())
+                {
+                    return Err("file already exists on disk; delete it first or add a new copy".into());
+                }
+                let tok = self.seeders.lock().unwrap().get(id).map(|w| w.token.clone());
+                (r.clone(), tok)
+            };
+            if let Some(t) = seeder_token {
+                t.cancel();
+            }
+            let hash = snapshot_rec.info_hash.clone().or_else(|| {
+                if snapshot_rec.kind == TaskKind::Torrent {
+                    ripdl_core::torrent::magnet_info_hash(&snapshot_rec.url)
+                } else {
+                    None
+                }
+            });
+            if let Some(hash) = hash {
+                if let Some(session) = self.torrents.lock().await.as_ref() {
+                    session.forget_by_hash(&hash).await;
+                }
+                self.clear_fastresume(&hash);
+            }
+            delete_artifacts(&snapshot_rec);
+
+            let (rec, queue_snapshot) = {
+                let mut records = self.records.lock().unwrap();
+                let Some(r) = records.iter_mut().find(|r| r.id == id) else {
+                    return Err("task was removed meanwhile".into());
+                };
+                if matches!(r.state, TaskState::Running | TaskState::Queued) {
+                    return Err("download is currently active".into());
+                }
+                r.state = TaskState::Queued;
+                r.error = None;
+                r.stale_reason = None;
+                r.downloaded = 0;
+                r.total = None;
+                r.dest_file = None;
+                r.seeding = false;
+                r.seed_paused = false;
+                r.upload_bps = None;
+                r.peers = 0;
+                for part in r.parts.iter_mut() {
+                    part.state = TaskState::Queued;
+                    part.downloaded = 0;
+                    part.total = None;
+                    part.error = None;
+                    part.attempted = false;
+                }
+                (r.clone(), records.clone())
+            };
+            self.progress.lock().unwrap().remove(id);
+            self.tombstones.lock().unwrap().remove(id);
+            let _ = self.persist(&queue_snapshot);
+            self.spawn_runner(rec);
+            Ok(Reply::Ok)
+        }
+        .await;
+        let reply = match reply {
+            Ok(r) => r,
+            Err(message) => Reply::Error { message },
+        };
+        Response { id: req_id, reply }
     }
 
     async fn cmd_remove(self: &Arc<Self>, req_id: u64, id: &str, delete_files: bool) -> Response {
@@ -4143,6 +4430,14 @@ impl Daemon {
                             return;
                         }
                     };
+                    if rec.downloaded == 0
+                        && rec.dest_file.as_deref().is_some_and(|p| !artifact_present_on_disk(p))
+                    {
+                        if let Some(hash) = rec.info_hash.as_deref() {
+                            session.forget_by_hash(hash).await;
+                            this.clear_fastresume(hash);
+                        }
+                    }
                     let cfg = ripdl_core::torrent::TorrentConfig {
                         id: rec.id.clone(),
                         payload: rec.url.clone(),
@@ -4847,6 +5142,44 @@ fn copy_output_name(
         .ok_or_else(|| "no free file name next to the existing download".to_string())
 }
 
+/// True when the task's output file (or non-empty folder for bundles /
+/// multi-file torrents) is still present on disk.
+fn artifact_present_on_disk(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return true;
+    }
+    let Ok(mut entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.any(|e| {
+        e.ok().is_some_and(|ent| {
+            !ent.file_name().to_string_lossy().ends_with(".ripdl.json")
+        })
+    })
+}
+
+/// True when a finished task (or a parked task that already held bytes on disk)
+/// no longer has its output artifact on disk. Active/queued tasks are never
+/// flagged as missing while still creating/probing outputs.
+fn is_file_missing(state: TaskState, downloaded: u64, dest_file: Option<&Path>) -> bool {
+    let should_exist = state == TaskState::Completed
+        || (downloaded > 0
+            && matches!(
+                state,
+                TaskState::Paused
+                    | TaskState::Failed
+                    | TaskState::Stale
+                    | TaskState::Cancelled
+            ));
+    if !should_exist {
+        return false;
+    }
+    dest_file.is_some_and(|p| !artifact_present_on_disk(p))
+}
+
 /// The view of one record that every frontend shows (`Reply::Tasks`,
 /// `Reply::Duplicate`). The caller holds the `progress` lock.
 fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> TaskInfo {
@@ -4918,6 +5251,7 @@ fn task_info_of(r: &TaskRecord, progress: &HashMap<String, ProgressTrack>) -> Ta
         kind: r.kind,
         percent,
         dest_file: r.dest_file.clone(),
+        file_missing: false,
         name: r.bundle_name.clone().or_else(|| r.torrent_name.clone()),
         info_hash: r.info_hash.clone(),
         sequential: r.sequential,
@@ -7048,6 +7382,248 @@ mod tests {
             daemon.progress.lock().unwrap().get("t1").is_none(),
             "stale run_id sample must be ignored"
         );
+    }
+
+    #[test]
+    fn list_and_details_detect_externally_deleted_files() {
+        let (daemon, dir) = proposal_daemon("missing-files");
+        let file_path = dir.join("archive.zip");
+        std::fs::write(&file_path, b"payload").unwrap();
+
+        let bundle_dir = dir.join("bundle-set");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let part_file = bundle_dir.join("part1.rar");
+        std::fs::write(&part_file, b"part1").unwrap();
+
+        let partial_path = dir.join("partial.bin");
+        std::fs::write(&partial_path, b"half").unwrap();
+
+        let mut done = rec("t-done", "https://example.com/archive.zip", Some(dir.to_str().unwrap()));
+        done.dest_file = Some(file_path.clone());
+        done.downloaded = 7;
+        done.total = Some(7);
+
+        let mut bundle = rec("t-bundle", "https://example.com/part1.rar", Some(dir.to_str().unwrap()));
+        bundle.kind = TaskKind::Bundle;
+        bundle.dest_file = Some(bundle_dir.clone());
+        bundle.downloaded = 5;
+        bundle.total = Some(5);
+
+        let mut paused = rec("t-paused", "https://example.com/partial.bin", Some(dir.to_str().unwrap()));
+        paused.state = TaskState::Paused;
+        paused.dest_file = Some(partial_path.clone());
+        paused.downloaded = 4;
+        paused.total = Some(10);
+
+        let mut running = rec("t-run", "https://example.com/live.bin", Some(dir.to_str().unwrap()));
+        running.state = TaskState::Running;
+        running.dest_file = Some(dir.join("not-created-yet.bin"));
+        running.downloaded = 0;
+
+        {
+            let mut records = daemon.records.lock().unwrap();
+            records.extend([done, bundle, paused, running]);
+        }
+
+        let initial = match daemon.cmd_list(1).reply {
+            Reply::Tasks { tasks } => tasks,
+            other => panic!("expected Tasks, got {other:?}"),
+        };
+        assert!(initial.iter().all(|t| !t.file_missing), "present files must not be flagged missing");
+
+        // Delete the completed single file, the payload inside the bundle folder,
+        // and the paused partial file externally.
+        std::fs::remove_file(&file_path).unwrap();
+        std::fs::remove_file(&part_file).unwrap();
+        std::fs::remove_file(&partial_path).unwrap();
+
+        let after = match daemon.cmd_list(2).reply {
+            Reply::Tasks { tasks } => tasks,
+            other => panic!("expected Tasks, got {other:?}"),
+        };
+        let by_id = |id: &str| after.iter().find(|t| t.id == id).unwrap().file_missing;
+        assert!(by_id("t-done"), "deleted completed file must set file_missing");
+        assert!(by_id("t-bundle"), "bundle folder emptied of payload files must set file_missing");
+        assert!(by_id("t-paused"), "deleted partial file with bytes must set file_missing");
+        assert!(!by_id("t-run"), "running task must never be flagged file_missing");
+
+        match daemon.cmd_task_details(3, "t-done").reply {
+            Reply::TaskDetails { details } => assert!(details.file_missing),
+            other => panic!("expected TaskDetails, got {other:?}"),
+        }
+        assert!(daemon.task_info_for("t-done").unwrap().file_missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "unified-traffic")]
+    #[tokio::test]
+    async fn daemon_sampler_updates_link_rates_across_5s_and_ipv6_aliases() {
+        let (daemon, dir) = proposal_daemon("link-rates");
+        {
+            let mut cfg = daemon.config.lock().unwrap();
+            cfg.bond_interfaces = Some(true);
+        }
+        let v6: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        {
+            let mut uplinks = daemon.uplinks.lock().unwrap();
+            uplinks.push(ripdl_core::engine::UplinkNic {
+                name: "Ethernet 2".into(),
+                addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                v6: None,
+                is_default_route: true,
+            });
+            uplinks.push(ripdl_core::engine::UplinkNic {
+                name: "Wi-Fi".into(),
+                addr: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                v6: Some(v6),
+                is_default_route: false,
+            });
+        }
+        daemon.feed_http_bond().await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        daemon
+            .links
+            .record_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)), 2_000_000, false);
+        daemon.links.record_ip(std::net::IpAddr::V6(v6), 1_000_000, false);
+        daemon.feed_http_bond().await;
+
+        let links = match daemon.cmd_get_traffic_snapshot(1).reply {
+            Reply::TrafficSnapshot { links, .. } => links,
+            other => panic!("expected TrafficSnapshot, got {other:?}"),
+        };
+        assert_eq!(links.len(), 2);
+        let eth = links.iter().find(|l| l.name == "Ethernet 2").unwrap();
+        let wifi = links.iter().find(|l| l.name == "Wi-Fi").unwrap();
+        assert!(eth.rate_bps > 0, "Ethernet 2 rate must be nonzero, got {}", eth.rate_bps);
+        assert!(wifi.rate_bps > 0, "Wi-Fi rate (via IPv6 alias) must be nonzero, got {}", wifi.rate_bps);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn deleted_completed_torrent_refuses_seeding_and_redownloads_in_place() {
+        let (daemon, dir) = proposal_daemon("missing-torrent-ops");
+        let missing_dir = dir.join("ubuntu.iso");
+        let state_dir = daemon.torrent_state_dir().unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let bitv = state_dir.join("0123456789abcdef0123456789abcdef01234567.bitv");
+        std::fs::write(&bitv, b"bitv").unwrap();
+
+        let http_file = dir.join("installer.bin");
+        let sidecar = dir.join("installer.bin.ripdl.json");
+        std::fs::write(&sidecar, b"{}").unwrap();
+
+        {
+            let mut records = daemon.records.lock().unwrap();
+            records.push(TaskRecord {
+                id: "t-tor-missing".into(),
+                url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+                dest_dir: Some(dir.clone()),
+                state: TaskState::Completed,
+                error: None,
+                stale_reason: None,
+                headers: HashMap::new(),
+                start_at: None,
+                kind: TaskKind::Torrent,
+                dest_file: Some(missing_dir),
+                output_name: None,
+                downloaded: 2048,
+                total: Some(2048),
+                info_hash: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                torrent_name: Some("ubuntu.iso".into()),
+                sequential: false,
+                only_files: None,
+                uploaded: 512,
+                upload_bps: None,
+                seeding: false,
+                seed_paused: false,
+                peers: 0,
+                bundle_name: None,
+                parts: Vec::new(),
+            });
+            records.push(TaskRecord {
+                id: "t-http-missing".into(),
+                url: "http://127.0.0.1:1/installer.bin".into(),
+                dest_dir: Some(dir.clone()),
+                state: TaskState::Completed,
+                error: None,
+                stale_reason: None,
+                headers: HashMap::new(),
+                start_at: None,
+                kind: TaskKind::Http,
+                dest_file: Some(http_file),
+                output_name: None,
+                downloaded: 4096,
+                total: Some(4096),
+                info_hash: None,
+                torrent_name: None,
+                sequential: false,
+                only_files: None,
+                uploaded: 0,
+                upload_bps: None,
+                seeding: false,
+                seed_paused: false,
+                peers: 0,
+                bundle_name: None,
+                parts: Vec::new(),
+            });
+        }
+
+        // start_seeding and cmd_resume must refuse a completed torrent whose files are missing.
+        daemon.start_seeding("t-tor-missing");
+        assert!(
+            daemon.seeders.lock().unwrap().get("t-tor-missing").is_none(),
+            "missing completed torrent must not start seeding watcher"
+        );
+        match daemon.cmd_resume(1, "t-tor-missing").reply {
+            Reply::Error { message } => assert!(message.contains("missing"), "unexpected err: {message}"),
+            other => panic!("expected Error refusing seed of missing file, got {other:?}"),
+        }
+        match daemon.cmd_torrent_details(2, "t-tor-missing").await.reply {
+            Reply::TorrentDetails { details } => {
+                assert!(details.file_missing, "TorrentDetails must surface file_missing");
+                assert!(!details.seeding);
+            }
+            other => panic!("expected TorrentDetails fallback with file_missing, got {other:?}"),
+        }
+
+        // Pause tasks via redownload resets record in place cleanly and cleans stale bitv/sidecar.
+        let future_at = now_unix() + 3600;
+        {
+            let mut records = daemon.records.lock().unwrap();
+            records.iter_mut().find(|r| r.id == "t-tor-missing").unwrap().start_at = Some(future_at);
+            records.iter_mut().find(|r| r.id == "t-http-missing").unwrap().start_at = Some(future_at);
+        }
+        assert!(matches!(daemon.cmd_redownload(3, "t-tor-missing").await.reply, Reply::Ok));
+        assert!(matches!(daemon.cmd_redownload(4, "t-http-missing").await.reply, Reply::Ok));
+        assert!(!bitv.exists(), "redownload must remove stale fastresume bitfield");
+        assert!(!sidecar.exists(), "redownload must remove stale HTTP sidecar");
+        {
+            let records = daemon.records.lock().unwrap();
+            let tor = records.iter().find(|r| r.id == "t-tor-missing").unwrap();
+            assert_eq!(tor.state, TaskState::Queued);
+            assert_eq!(tor.downloaded, 0);
+            assert!(tor.dest_file.is_none());
+            let http = records.iter().find(|r| r.id == "t-http-missing").unwrap();
+            assert_eq!(http.state, TaskState::Queued);
+            assert_eq!(http.downloaded, 0);
+            assert!(http.dest_file.is_none());
+            assert_eq!(records.len(), 2, "redownload must reset in place without creating a (1) copy");
+        }
+        for (_, rt) in daemon.runtime.lock().unwrap().drain() {
+            rt.token.cancel();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "unified-traffic")]
+    #[tokio::test]
+    async fn apply_bind_weights_does_not_stall_when_torrent_mutex_busy() {
+        let (daemon, dir) = proposal_daemon("sampler-trylock");
+        let _held = daemon.torrents.lock().await;
+        tokio::time::timeout(Duration::from_millis(200), daemon.apply_bind_weights())
+            .await
+            .expect("apply_bind_weights must return immediately when torrent lock is busy");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -81,6 +81,7 @@ Legend: **C** = confirmed defect today, **S** = suspected/untested today.
 | UI-004 | The per-NIC chips show the same link set and rates as `ripdl config`, including torrent traffic. | `chips_match_config` | C |
 | UI-005 | A 0 B/s rate renders as `0 B/s`, not as `-` (which means unknown). | `zero_rate_renders` | S |
 | UI-006 | The Settings "Total speed limit" label is true: it caps all traffic, not one task. | `settings_limit_is_global` | C |
+| UI-007 | An externally deleted download surfaces `file_missing` across `List`/`Details`, blocks/stops seeding, allows in-place `Redownload`, marks the row as missing, and disables Open. | `list_and_details_detect_externally_deleted_files`; `deleted_completed_torrent_refuses_seeding_and_redownloads_in_place` | C |
 
 ## Phase 0 follow-up
 

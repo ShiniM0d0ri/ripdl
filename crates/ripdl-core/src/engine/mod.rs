@@ -715,8 +715,13 @@ impl Dialer {
     /// caller falls back to a plain pick.
     fn force(&self, ip: IpAddr) -> Option<DialAttempt> {
         let link = self.bond.link_for(ip)?;
+        let client = if link.info.default_route {
+            self.primary.clone()
+        } else {
+            self.client_for(ip)
+        };
         Some(DialAttempt {
-            client: self.client_for(ip),
+            client,
             link: Some(link),
         })
     }
@@ -1137,6 +1142,10 @@ async fn segment_attempt(
     const NO_IDLE: Duration = Duration::from_secs(31_536_000);
     let idle = stream_idle.unwrap_or(NO_IDLE);
     let _dial = BondDial::begin(bond_ctx);
+    let link_guard = match (&bond_ctx, links) {
+        (Some((_, link)), Some(set)) => set.connect(link.info.ip),
+        _ => None,
+    };
     let sent: Result<reqwest::Response> = match tokio::time::timeout(idle, req.send()).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e.into()),
@@ -1144,8 +1153,18 @@ async fn segment_attempt(
     };
     if let Some((bond, link)) = &bond_ctx {
         match &sent {
-            Ok(_) => bond.note_ok(link),
-            Err(_) => bond.note_fail(link),
+            Ok(_) => {
+                bond.note_ok(link);
+                if let Some(set) = links {
+                    set.note_ok(link.info.ip);
+                }
+            }
+            Err(_) => {
+                bond.note_fail(link);
+                if let Some(set) = links {
+                    set.note_fail(link.info.ip);
+                }
+            }
         }
     }
     let mut stream = sent?.error_for_status()?.bytes_stream();
@@ -1238,7 +1257,9 @@ async fn segment_attempt(
                     cell.done += credit;
                     if let Some((bond, link)) = &bond_ctx {
                         if credit > 0 {
-                            if let Some(set) = links {
+                            if let Some(guard) = &link_guard {
+                                guard.record(credit, false);
+                            } else if let Some(set) = links {
                                 set.record_ip(link.info.ip, credit, false);
                             }
                             bond.record(link, credit);
@@ -1327,7 +1348,9 @@ async fn segment_attempt(
                                 cell.done += credit;
                                 if let Some((bond, link)) = &bond_ctx {
                                     if credit > 0 {
-                                        if let Some(set) = links {
+                                        if let Some(guard) = &link_guard {
+                                            guard.record(credit, false);
+                                        } else if let Some(set) = links {
                                             set.record_ip(link.info.ip, credit, false);
                                         }
                                         bond.record(link, credit);
@@ -1368,6 +1391,9 @@ async fn segment_attempt(
                     // too, but the next successful dial resets the streak.
                     if let Some((bond, link)) = &bond_ctx {
                         bond.note_fail(link);
+                        if let Some(set) = links {
+                            set.note_fail(link.info.ip);
+                        }
                     }
                     return Err(Error::StreamStalled(idle.as_secs()));
                 }

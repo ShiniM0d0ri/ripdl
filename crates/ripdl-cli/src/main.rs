@@ -156,6 +156,8 @@ enum Cmd {
     Pause { id: String },
     /// Resume a paused or failed task.
     Resume { id: String },
+    /// Re-download a completed/parked task whose files were deleted from disk.
+    Redownload { id: String },
     /// Remove a task from the queue.
     Rm {
         id: String,
@@ -492,6 +494,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Pause { id } => rpc(Command::Pause { id }).await,
         Cmd::Resume { id } => rpc(Command::Resume { id }).await,
+        Cmd::Redownload { id } => rpc(Command::Redownload { id }).await,
         Cmd::Rm { id, files } => rpc(Command::Remove { id, delete_files: files }).await,
         Cmd::Details { id } => rpc(Command::Details { id }).await,
         Cmd::Refresh { id, url, resume, part, probe_only } => {
@@ -1219,9 +1222,15 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             println!("name: {}", details.name.as_deref().unwrap_or("(unknown)"));
             println!("hash: {}", details.info_hash);
             if let Some(root) = &details.root {
-                println!("root: {}", root.display());
+                if details.file_missing {
+                    println!("root: {} (missing from disk)", root.display());
+                } else {
+                    println!("root: {}", root.display());
+                }
             }
-            let phase = if details.finished {
+            let phase = if details.file_missing && details.finished {
+                "missing"
+            } else if details.finished {
                 if details.seeding { "seeding" } else { "finished" }
             } else {
                 "running"
@@ -1271,7 +1280,11 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             println!("state: {}", state_label(details.state));
             println!("url: {}", details.url);
             if let Some(f) = &details.dest_file {
-                println!("file: {}", f.display());
+                if details.file_missing {
+                    println!("file: {} (missing from disk)", f.display());
+                } else {
+                    println!("file: {}", f.display());
+                }
             }
             let pct = details
                 .percent
@@ -1397,7 +1410,9 @@ fn print_reply(reply: Reply) -> anyhow::Result<()> {
             let now = now_unix();
             for t in tasks {
                 let mut state = state_label(t.state).to_string();
-                if t.state == ripdl_core::TaskState::Completed && t.seeding {
+                if t.state == ripdl_core::TaskState::Completed && t.file_missing {
+                    state = "missing".to_string();
+                } else if t.state == ripdl_core::TaskState::Completed && t.seeding {
                     state = "seeding".to_string();
                 }
                 if t.state == ripdl_core::TaskState::Running && t.verifying {

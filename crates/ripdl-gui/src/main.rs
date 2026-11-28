@@ -36,7 +36,7 @@ use crate::theme::{
 use crate::tray::{TrayAction, TrayHandle};
 use crate::vectors::{
     paint_brand_logo, paint_empty_illustration, paint_file_tile, paint_filter_empty_illustration,
-    paint_focus_ring, paint_icon, vector_button, vector_icon_button, IconId,
+    paint_focus_ring, paint_icon, paint_missing_badge, vector_button, vector_icon_button, IconId,
 };
 
 struct RipdlNativeApp {
@@ -362,6 +362,12 @@ impl RipdlNativeApp {
         if ids.is_empty() {
             return;
         }
+        let all_missing = ids.iter().all(|id| {
+            snap.tasks
+                .iter()
+                .find(|t| &t.id == id)
+                .is_some_and(|t| t.file_missing)
+        });
         let label = if ids.len() == 1 {
             snap.tasks
                 .iter()
@@ -374,7 +380,8 @@ impl RipdlNativeApp {
         self.delete_confirm = Some(DeleteConfirm {
             ids,
             label,
-            delete_files,
+            delete_files: delete_files && !all_missing,
+            all_missing,
         });
     }
 
@@ -585,7 +592,7 @@ impl RipdlNativeApp {
                         ui.close();
                     }
                     ui.separator();
-                    let has_file = single.is_some_and(|t| t.dest_file.is_some());
+                    let has_file = single.is_some_and(|t| t.can_open_file());
                     if ui.add_enabled(has_file, egui::Button::new("Open file")).clicked() {
                         if let Some(t) = single {
                             self.worker.send(UiCommand::Open {
@@ -1407,40 +1414,59 @@ impl RipdlNativeApp {
                             let (k_ico, k_lbl, k_fg, _) = kind_visuals(&row.kind, pal);
                             in_rect_left(ui, col_rect(cols.name), |ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
-                                let (tile_rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                                let (tile_rect, tile_resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
                                 paint_file_tile(ui.painter(), tile_rect, &row.kind, row.category, pal);
+                                if row.file_missing {
+                                    paint_missing_badge(ui.painter(), tile_rect, pal);
+                                    tile_resp.on_hover_text("File does not exist on disk");
+                                }
 
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 1.0;
+                                    let name_tip = if row.file_missing {
+                                        match &row.dest_file {
+                                            Some(p) => format!("{}\n\nFile does not exist on disk:\n{}", row.name, p.display()),
+                                            None => format!("{}\n\nFile does not exist on disk.", row.name),
+                                        }
+                                    } else {
+                                        row.name.clone()
+                                    };
                                     ui.add(
-                                        egui::Label::new(semibold(&row.name, 13.0, pal.ink)).truncate(),
+                                        egui::Label::new(semibold(
+                                            &row.name,
+                                            13.0,
+                                            if row.file_missing { pal.ink_secondary } else { pal.ink },
+                                        ))
+                                        .truncate(),
                                     )
-                                    .on_hover_text(&row.name);
-                                    let sub = if let Some(err) = &row.error {
-                                        err.to_string()
+                                    .on_hover_text(name_tip);
+                                    let (sub, sub_col) = if let Some(err) = &row.error {
+                                        (err.to_string(), pal.danger)
                                     } else if let Some(reason) = row
                                         .stale_reason
                                         .as_deref()
                                         .filter(|_| row.raw_state == TaskState::Stale)
                                     {
-                                        format!("{} · {reason}", row.source)
+                                        (format!("{} · {reason}", row.source), pal.ink_muted)
+                                    } else if row.file_missing {
+                                        (format!("{} · missing on disk", row.source), pal.warn)
                                     } else if !row.parts_missing.is_empty() {
-                                        format!("{} · missing parts: {:?}", row.source, row.parts_missing)
+                                        (format!("{} · missing parts: {:?}", row.source, row.parts_missing), pal.ink_muted)
                                     } else if let Some(start) = row.start_at.filter(|&s| s > crate::model::now_unix()) {
                                         let mins = ((start - crate::model::now_unix()) + 59) / 60;
-                                        format!("{} · starts in ~{}m", row.source, mins)
+                                        (format!("{} · starts in ~{}m", row.source, mins), pal.ink_muted)
                                     } else if row.seeding && row.uploaded > 0 {
-                                        format!("{} · \u{2191} {} uploaded", row.source, humans_bin(row.uploaded))
+                                        (format!("{} · \u{2191} {} uploaded", row.source, humans_bin(row.uploaded)), pal.ink_muted)
                                     } else if row.kind == "torrent" && row.peers > 0 {
-                                        format!("{} · {} peers", row.source, row.peers)
+                                        (format!("{} · {} peers", row.source, row.peers), pal.ink_muted)
                                     } else {
-                                        row.source.clone()
+                                        (row.source.clone(), pal.ink_muted)
                                     };
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(sub)
                                                 .small()
-                                                .color(if row.error.is_some() { pal.danger } else { pal.ink_muted }),
+                                                .color(sub_col),
                                         )
                                         .truncate(),
                                     );
@@ -1556,7 +1582,7 @@ impl RipdlNativeApp {
                                     {
                                         action_cmd = Some(UiCommand::Resume { ids: vec![row.id.clone()] });
                                     }
-                                } else if row.dest_file.is_some() {
+                                } else if row.can_open_file() {
                                     if vector_icon_button(ui, pal, IconId::OpenFile, "Open file", 26.0, false, true)
                                         .on_hover_text("Open file")
                                         .clicked()
@@ -1566,6 +1592,21 @@ impl RipdlNativeApp {
                                             folder: false,
                                         });
                                     }
+                                } else if row.raw_state == TaskState::Completed
+                                    && row.file_missing
+                                    && vector_icon_button(
+                                        ui,
+                                        pal,
+                                        IconId::Alert,
+                                        "File missing on disk",
+                                        26.0,
+                                        false,
+                                        true,
+                                    )
+                                    .on_hover_text("File does not exist on disk (click for details)")
+                                    .clicked()
+                                {
+                                    open_details_id = Some(row.id.clone());
                                 }
 
                                 if vector_icon_button(ui, pal, IconId::Details, "Inspect details", 26.0, false, true)
@@ -1606,7 +1647,18 @@ impl RipdlNativeApp {
                                     open_details_id = Some(row.id.clone());
                                     ui.close();
                                 }
-                                if row.dest_file.is_some() && ui.button("Open file").clicked() {
+                                if row.dest_file.is_some()
+                                    && ui
+                                        .add_enabled(
+                                            row.can_open_file(),
+                                            egui::Button::new(if row.file_missing {
+                                                "Open file (missing on disk)"
+                                            } else {
+                                                "Open file"
+                                            }),
+                                        )
+                                        .clicked()
+                                {
                                     action_cmd = Some(UiCommand::Open {
                                         id: row.id.clone(),
                                         folder: false,
@@ -1622,6 +1674,15 @@ impl RipdlNativeApp {
                                     });
                                     ui.close();
                                 }
+                                if row.raw_state == TaskState::Completed
+                                    && row.file_missing
+                                    && ui.button("Re-download").clicked()
+                                {
+                                    action_cmd = Some(UiCommand::Redownload {
+                                        id: row.id.clone(),
+                                    });
+                                    ui.close();
+                                }
                                 if ui.button("Copy address").clicked() {
                                     copy_url_txt = Some(row.url.clone());
                                     ui.close();
@@ -1631,7 +1692,7 @@ impl RipdlNativeApp {
                                     req_delete = Some((vec![row.id.clone()], false));
                                     ui.close();
                                 }
-                                if ui.button("Delete task & files from disk…").clicked() {
+                                if !row.file_missing && ui.button("Delete task & files from disk…").clicked() {
                                     req_delete = Some((vec![row.id.clone()], true));
                                     ui.close();
                                 }
@@ -1870,10 +1931,18 @@ impl RipdlNativeApp {
                 }
                 ui.label(format!("Remove {} from the download queue?", confirm.label));
                 ui.add_space(6.0);
-                ui.checkbox(
-                    &mut confirm.delete_files,
-                    "Also permanently delete downloaded file(s) from disk",
-                );
+                if confirm.all_missing {
+                    ui.label(
+                        egui::RichText::new("The file(s) are already missing from disk — only the queue entry will be removed.")
+                            .small()
+                            .color(pal.ink_muted),
+                    );
+                } else {
+                    ui.checkbox(
+                        &mut confirm.delete_files,
+                        "Also permanently delete downloaded file(s) from disk",
+                    );
+                }
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1998,6 +2067,9 @@ impl RipdlNativeApp {
                     ui.horizontal(|ui| {
                         let (tr, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
                         paint_file_tile(ui.painter(), tr, &existing.kind, existing.category, pal);
+                        if existing.file_missing {
+                            paint_missing_badge(ui.painter(), tr, pal);
+                        }
                         ui.vertical(|ui| {
                             ui.label(semibold(&existing.name, 13.5, pal.ink));
                             let progress_txt = match existing.total {
@@ -2012,10 +2084,11 @@ impl RipdlNativeApp {
                                 .or(existing.dest_dir.as_deref())
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|| "—".into());
+                            let miss_note = if existing.file_missing { "  ·  file missing on disk" } else { "" };
                             ui.label(
-                                egui::RichText::new(format!("Progress: {progress_txt}  ·  {folder}"))
+                                egui::RichText::new(format!("Progress: {progress_txt}  ·  {folder}{miss_note}"))
                                     .small()
-                                    .color(pal.ink_muted),
+                                    .color(if existing.file_missing { pal.warn } else { pal.ink_muted }),
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2042,17 +2115,30 @@ impl RipdlNativeApp {
                             self.anchor_id = Some(existing.id.clone());
                             close = true;
                         }
-                    } else if existing.raw_state == TaskState::Completed && existing.dest_file.is_some() {
-                        if vector_button(ui, pal, IconId::OpenFile, "Open File", 28.0, true, true).clicked() {
-                            self.worker.send(UiCommand::Open {
-                                id: existing.id.clone(),
-                                folder: false,
-                            });
-                            close = true;
-                        }
+                    } else if existing.raw_state == TaskState::Completed
+                        && existing.file_missing
+                        && vector_button(ui, pal, IconId::Refresh, "Re-download", 28.0, true, true).clicked()
+                    {
+                        self.worker.send(UiCommand::Redownload {
+                            id: existing.id.clone(),
+                        });
+                        self.selected_ids.clear();
+                        self.selected_ids.insert(existing.id.clone());
+                        self.anchor_id = Some(existing.id.clone());
+                        close = true;
+                    } else if existing.raw_state == TaskState::Completed
+                        && existing.can_open_file()
+                        && vector_button(ui, pal, IconId::OpenFile, "Open File", 28.0, true, true).clicked()
+                    {
+                        self.worker.send(UiCommand::Open {
+                            id: existing.id.clone(),
+                            folder: false,
+                        });
+                        close = true;
                     }
 
-                    if req.kind != ripdl_core::task::TaskKind::Torrent
+                    if req.kind == ripdl_core::task::TaskKind::Http
+                        && !existing.file_missing
                         && vector_button(ui, pal, IconId::Add, "Download Numbered Copy", 28.0, false, true).clicked()
                     {
                         self.worker.send(UiCommand::Add {

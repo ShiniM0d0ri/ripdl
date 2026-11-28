@@ -61,6 +61,9 @@ pub enum UiCommand {
     Resume {
         ids: Vec<String>,
     },
+    Redownload {
+        id: String,
+    },
     Remove {
         ids: Vec<String>,
         delete_files: bool,
@@ -669,6 +672,27 @@ async fn handle_live_cmd(
                     .await
                     .and_then(reply_err)
                 {
+                    let _ = tx.send(UiEvent::Notice {
+                        text: e,
+                        is_error: true,
+                    });
+                }
+            }
+            env.poll(state).await;
+        }
+        UiCommand::Redownload { id } => {
+            match env
+                .rpc(Command::Redownload { id }, Duration::from_secs(15))
+                .await
+                .and_then(reply_err)
+            {
+                Ok(()) => {
+                    let _ = tx.send(UiEvent::Notice {
+                        text: "Re-downloading missing task…".into(),
+                        is_error: false,
+                    });
+                }
+                Err(e) => {
                     let _ = tx.send(UiEvent::Notice {
                         text: e,
                         is_error: true,

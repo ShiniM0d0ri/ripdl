@@ -476,6 +476,11 @@ pub enum Command {
     Resume {
         id: String,
     },
+    /// Reset a finished or parked task whose files were deleted/corrupted on
+    /// disk and queue it again in place using its saved address and options.
+    Redownload {
+        id: String,
+    },
     /// Open a task's file in the default app, or (`folder`) reveal it in its
     /// folder. Only the path the daemon recorded for the task is ever used.
     Open {
@@ -874,6 +879,10 @@ pub struct TaskInfo {
     /// Resolved output file after completion (for open/delete actions).
     #[serde(default)]
     pub dest_file: Option<PathBuf>,
+    /// True when the task's downloaded file or folder is missing from disk
+    /// (for example, deleted or moved externally outside ripdl).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_missing: bool,
     /// Torrent display name once known (the payload may be a magnet with no
     /// meaningful text; frontends show this instead of the URL).
     #[serde(default)]
@@ -942,6 +951,9 @@ pub struct TaskDetailsSnapshot {
     /// Destination file (partial runs know it once the URL is probed).
     #[serde(default)]
     pub dest_file: Option<PathBuf>,
+    /// True when the task's downloaded file or folder is missing from disk.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_missing: bool,
     #[serde(default)]
     pub downloaded: u64,
     #[serde(default)]
@@ -1041,6 +1053,10 @@ mod tests {
         let open: Request = serde_json::from_str(r#"{"id":3,"cmd":{"type":"open","id":"t1"}}"#)
             .expect("open parses");
         assert!(matches!(open.cmd, Command::Open { ref id, folder: false } if id == "t1"));
+
+        let redl: Request = serde_json::from_str(r#"{"id":4,"cmd":{"type":"redownload","id":"t1"}}"#)
+            .expect("redownload parses");
+        assert!(matches!(redl.cmd, Command::Redownload { ref id } if id == "t1"));
     }
 
     #[test]

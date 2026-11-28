@@ -635,6 +635,19 @@ pub fn paint_file_tile(p: &egui::Painter, rect: Rect, kind: &str, category: ripd
     paint_icon(p, rect.shrink(6.0), ico, fg);
 }
 
+/// Overlay a crisp amber warning badge when a download's file is missing from disk.
+pub fn paint_missing_badge(p: &egui::Painter, tile_rect: Rect, pal: &Palette) {
+    let center = tile_rect.max - Vec2::new(3.5, 3.5);
+    let r = 6.2_f32;
+    p.circle_filled(center, r + 1.5, pal.surface);
+    p.circle_filled(center, r, pal.warn);
+    p.line_segment(
+        [center - Vec2::new(0.0, 3.0), center + Vec2::new(0.0, 0.8)],
+        Stroke::new(1.7, Color32::WHITE),
+    );
+    p.circle_filled(center + Vec2::new(0.0, 3.0), 0.95, Color32::WHITE);
+}
+
 /// Crisp multi-element vector illustration for empty queue state.
 pub fn paint_empty_illustration(ui: &mut egui::Ui, pal: &Palette) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(124.0, 84.0), egui::Sense::hover());

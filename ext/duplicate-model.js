@@ -35,7 +35,7 @@ export function actionsFor(task, url = "") {
     }
     const bucket = bucketOf(task);
     const direct = (task.kind || "http") === "http" && isHttpUrl(task.url);
-    const hasFile = !!task.dest_file;
+    const hasFile = !!task.dest_file && !task.file_missing;
     const out = [];
     const add = (id, label) => out.push({ id, label, primary: false });
     if (bucket === "active") {
@@ -68,7 +68,8 @@ export function stateLine(task) {
     switch (bucketOf(task)) {
         case "done": {
             const size = task.total || task.downloaded;
-            return size ? `Completed \u00b7 ${formatBytes(size)}` : "Completed";
+            const prefix = task.file_missing ? "Completed (file missing)" : "Completed";
+            return size ? `${prefix} \u00b7 ${formatBytes(size)}` : prefix;
         }
         case "paused":
             return `Paused${progressText(task)}`;

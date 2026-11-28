@@ -24,7 +24,7 @@ not `shipped`.
 | LNK-004 | Capacity-based weights with full-window quarantine recovery | shipped | `links.rs::sample`, `note_fail` | `weights_follow_capacity`, `quarantined_link_can_recover`, `stale_rate_does_not_weight` |
 | LNK-005 | Probe port, configurable targets, off when bonding disabled | shipped | `links.rs::Probe`, `probe_if_enabled` | `no_probes_when_bonding_off`, `probe_targets_are_configurable_or_fallback` |
 | LNK-006 | VPN/virtual adapter exclusion policy | shipped | `links.rs::is_eligible_link` | `vpn_adapters_are_excluded` |
-| LNK-007 | Wire the `LinkSet` into daemon/engine/torrent/CLI/GUI (close WP-03 issues) | partial | `daemon/main.rs` (feature `unified-traffic`) | Daemon owns one `LinkSet`; engines/probes not yet feeding it |
+| LNK-007 | Wire the `LinkSet` into daemon/engine/torrent/CLI/GUI (close WP-03 issues) | shipped | `daemon/main.rs`, `engine/mod.rs`, `links.rs` | Decoupled 1 s sampler, 6 s link rate window, IPv6 NIC aliases, HTTP `ConnectionGuard`; `daemon_sampler_updates_link_rates_across_5s_and_ipv6_aliases` |
 
 ## Traffic domain (next)
 
@@ -153,6 +153,7 @@ not `shipped`.
 | QUE-016 | Dead legacy `Queue` module | missing | `ripdl-core/src/queue.rs` | Exported but unused; contains a stale `TODO(P1)` |
 | QUE-017 | Task list pagination | missing | `rpc.rs` | `List` returns every task on every 2 Hz poll |
 | QUE-018 | Task priority/order | missing | `daemon/main.rs` | FIFO only |
+| QUE-019 | On-disk missing-file detection and UI marker | shipped | `daemon/main.rs`, `rpc.rs`, `crates/ripdl-gui` | `TaskInfo.file_missing` + `TaskDetailsSnapshot.file_missing` (`list_and_details_detect_externally_deleted_files`, `missing_file_completed_task_reports_missing_state_and_blocks_open`) |
 
 ## Torrent
 

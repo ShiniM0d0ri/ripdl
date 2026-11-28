@@ -38,6 +38,8 @@ test("a finished direct download offers open, reveal, copy, browser with open pr
 
 test("a finished download with no file on disk offers only the browser", () => {
     assert.deepEqual(ids(actionsFor(direct("completed", { dest_file: null }))), ["browser"]);
+    assert.deepEqual(ids(actionsFor(direct("completed", { file_missing: true }))), ["browser"]);
+    assert.equal(stateLine(direct("completed", { file_missing: true })), "Completed (file missing) \u00b7 100 B");
 });
 
 test("a finished torrent offers open and reveal, never copy or browser", () => {

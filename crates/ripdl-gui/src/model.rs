@@ -80,6 +80,7 @@ pub struct TaskRow {
     pub source: String,
     pub dest_dir: Option<PathBuf>,
     pub dest_file: Option<PathBuf>,
+    pub file_missing: bool,
     pub raw_state: TaskState,
     pub state: String,
     pub downloaded: u64,
@@ -132,6 +133,7 @@ impl TaskRow {
             kind,
             dest_dir: t.dest_dir,
             dest_file: t.dest_file,
+            file_missing: t.file_missing,
             raw_state: t.state,
             state,
             downloaded: t.downloaded,
@@ -178,24 +180,35 @@ impl TaskRow {
     }
 
     pub fn can_pause_or_stop(&self) -> bool {
-        matches!(self.raw_state, TaskState::Running | TaskState::Queued) || self.seeding
+        matches!(self.raw_state, TaskState::Running | TaskState::Queued)
+            || (self.seeding && !self.file_missing)
     }
 
     pub fn can_resume(&self) -> bool {
         matches!(
             self.raw_state,
             TaskState::Paused | TaskState::Failed | TaskState::Stale | TaskState::Cancelled
-        ) || (self.kind == "torrent" && self.raw_state == TaskState::Completed && !self.seeding)
+        ) || (self.kind == "torrent"
+            && self.raw_state == TaskState::Completed
+            && !self.seeding
+            && !self.file_missing)
     }
 
     pub fn can_refresh_url(&self) -> bool {
         (self.kind == "http" || self.kind == "bundle") && self.raw_state != TaskState::Completed
+    }
+
+    pub fn can_open_file(&self) -> bool {
+        self.dest_file.is_some() && !self.file_missing
     }
 }
 
 fn derive_state_label(t: &TaskInfo, now_s: i64) -> String {
     if t.state == TaskState::Queued && t.start_at.is_some_and(|s| s > now_s) {
         return "timed".to_string();
+    }
+    if t.state == TaskState::Completed && t.file_missing {
+        return "missing".to_string();
     }
     if t.state == TaskState::Completed && t.seeding {
         return "seeding".to_string();
@@ -827,6 +840,7 @@ pub struct DeleteConfirm {
     pub ids: Vec<String>,
     pub label: String,
     pub delete_files: bool,
+    pub all_missing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1081,6 +1095,7 @@ pub fn matches_filter(t: &TaskRow, filter: SidebarFilter, search: &str) -> bool 
         || t.source.to_ascii_lowercase().contains(&q)
         || t.state.to_ascii_lowercase().contains(&q)
         || t.kind.to_ascii_lowercase().contains(&q)
+        || (t.file_missing && "missing".contains(&q))
 }
 
 pub fn sort_tasks(rows: &mut [&TaskRow], key: SortKey, dir: SortDir) {
@@ -1143,6 +1158,7 @@ mod tests {
             source: "cdn.example.org".into(),
             dest_dir: None,
             dest_file: None,
+            file_missing: false,
             raw_state,
             state: format!("{raw_state:?}").to_lowercase(),
             downloaded: 500,
@@ -1188,6 +1204,7 @@ mod tests {
             url: "https://example.org/a.bin".into(),
             dest_dir: None,
             dest_file: None,
+            file_missing: false,
             state: TaskState::Queued,
             kind: TaskKind::Http,
             downloaded: 0,
@@ -1287,5 +1304,56 @@ mod tests {
         assert_eq!(committed.lan_code.as_deref(), Some("ABCDEF"));
         assert_eq!(committed.onboarding_done, Some(true));
         assert_eq!(committed.default_download_dir, Some(PathBuf::from("D:/MyDownloads")));
+    }
+
+    #[test]
+    fn missing_file_completed_task_reports_missing_state_and_blocks_open() {
+        let mut row = sample_row(TaskState::Completed, None);
+        row.dest_file = Some(PathBuf::from("C:/dl/archive.zip"));
+        assert!(row.can_open_file());
+
+        let info = TaskInfo {
+            id: "m1".into(),
+            url: "https://example.org/archive.zip".into(),
+            dest_dir: Some(PathBuf::from("C:/dl")),
+            dest_file: Some(PathBuf::from("C:/dl/archive.zip")),
+            file_missing: true,
+            state: TaskState::Completed,
+            kind: TaskKind::Http,
+            downloaded: 1000,
+            total: Some(1000),
+            percent: None,
+            speed_bps: None,
+            probing: false,
+            error: None,
+            stale_reason: None,
+            start_at: None,
+            uploaded: 0,
+            upload_bps: None,
+            seeding: false,
+            seeding_stopped: false,
+            verifying: false,
+            peers: 0,
+            info_hash: None,
+            name: None,
+            sequential: false,
+            only_files: None,
+            parts_done: 0,
+            parts_total: 0,
+            parts_missing: Vec::new(),
+        };
+        let missing = TaskRow::from_rpc(info.clone());
+        assert_eq!(missing.state, "missing");
+        assert!(!missing.can_open_file());
+        assert!(matches_filter(&missing, SidebarFilter::Completed, "missing"));
+
+        let missing_torrent = TaskRow::from_rpc(TaskInfo {
+            kind: TaskKind::Torrent,
+            info_hash: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            ..info
+        });
+        assert_eq!(missing_torrent.state, "missing");
+        assert!(!missing_torrent.can_resume());
+        assert!(!missing_torrent.can_pause_or_stop());
     }
 }

@@ -10,7 +10,10 @@ use crate::rpc_worker::{UiCommand, WorkerHandle};
 use crate::theme::{
     paint_progress_bar, paint_status_pill, semibold, state_visuals, Palette,
 };
-use crate::vectors::{paint_file_tile, paint_focus_ring, paint_icon, vector_button, vector_icon_button, IconId};
+use crate::vectors::{
+    paint_file_tile, paint_focus_ring, paint_icon, paint_missing_badge, vector_button,
+    vector_icon_button, IconId,
+};
 use crate::views::{modal_frame, section_card};
 
 pub fn show(
@@ -76,6 +79,9 @@ pub fn show(
             ui.horizontal(|ui| {
                 let (tile_rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
                 paint_file_tile(ui.painter(), tile_rect, &task.kind, task.category, pal);
+                if task.file_missing {
+                    paint_missing_badge(ui.painter(), tile_rect, pal);
+                }
 
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -249,12 +255,20 @@ pub fn show(
             ui.add_space(6.0);
             ui.separator();
             ui.horizontal(|ui| {
-                if task.dest_file.is_some()
+                if task.can_open_file()
                     && vector_button(ui, pal, IconId::OpenFile, "Open file", 28.0, false, true).clicked()
                 {
                     worker.send(UiCommand::Open {
                         id: task_id.clone(),
                         folder: false,
+                    });
+                }
+                if task.raw_state == TaskState::Completed
+                    && task.file_missing
+                    && vector_button(ui, pal, IconId::Refresh, "Re-download", 28.0, true, true).clicked()
+                {
+                    worker.send(UiCommand::Redownload {
+                        id: task_id.clone(),
                     });
                 }
                 if (task.dest_file.is_some() || task.dest_dir.is_some())
@@ -312,6 +326,24 @@ fn kv_row(ui: &mut egui::Ui, pal: &Palette, label: &str, value: &str) {
 }
 
 fn render_overview(ui: &mut egui::Ui, task: &TaskRow, cached: &CachedDetails, pal: &Palette) {
+    if task.file_missing {
+        egui::Frame::new()
+            .fill(pal.warn_soft)
+            .stroke(Stroke::new(1.0, pal.warn))
+            .corner_radius(egui::CornerRadius::same(7))
+            .inner_margin(egui::Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (ir, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+                    paint_icon(ui.painter(), ir, IconId::Alert, pal.warn);
+                    ui.label(
+                        egui::RichText::new("File does not exist on disk (it may have been deleted or moved outside ripdl).")
+                            .color(pal.warn),
+                    );
+                });
+            });
+        ui.add_space(6.0);
+    }
     section_card(ui, pal, |ui| {
         kv_row(ui, pal, "File / Title", &task.name);
         kv_row(ui, pal, "Source URL", &task.url);

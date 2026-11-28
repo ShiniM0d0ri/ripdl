@@ -253,6 +253,7 @@ pub fn state_visuals(state: &str, pal: &Palette) -> (&'static str, Color32, Colo
         "hunt" => ("Capturing", pal.violet, pal.violet_soft, pal.violet),
         "seeding" => ("Seeding", pal.success, pal.success_soft, pal.success),
         "completed" => ("Completed", pal.success, pal.success_soft, pal.success),
+        "missing" => ("File missing", pal.warn, pal.warn_soft, pal.warn),
         "paused" => ("Paused", pal.warn, pal.warn_soft, pal.warn),
         "expired" => ("Link expired", pal.danger, pal.danger_soft, pal.danger),
         "failed" => ("Failed", pal.danger, pal.danger_soft, pal.danger),
@@ -301,7 +302,7 @@ pub fn paint_progress_bar(ui: &mut egui::Ui, ratio: f32, state: &str, width: f32
     let fill = match state {
         "completed" | "seeding" => pal.success,
         "expired" | "failed" => pal.danger,
-        "paused" => pal.warn,
+        "paused" | "missing" => pal.warn,
         "metadata" | "hunt" => pal.violet,
         "connecting" | "verifying" => pal.info,
         _ => pal.accent,

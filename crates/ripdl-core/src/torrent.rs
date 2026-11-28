@@ -117,6 +117,9 @@ pub struct TorrentDetailsSnapshot {
     /// Finished and not paused: this torrent is being served to the swarm.
     #[serde(default)]
     pub seeding: bool,
+    /// True when the daemon sees the task's downloaded output missing from disk.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_missing: bool,
     pub files: Vec<TorrentFileSnapshot>,
     pub peers: Vec<TorrentPeerSnapshot>,
     pub trackers: Vec<String>,
@@ -778,6 +781,7 @@ impl TorrentSession {
                 .unwrap_or(0.0),
             peers_connected: live.map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
             seeding: st.finished && !paused,
+            file_missing: false,
             files: Vec::new(),
             peers: Vec::new(),
             trackers: {

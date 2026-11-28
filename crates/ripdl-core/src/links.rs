@@ -18,7 +18,13 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use ts_rs::TS;
 
-use crate::traffic::{Meter, RateWindow, DEFAULT_RATE_WINDOW};
+use crate::traffic::{Meter, RateWindow};
+
+/// Links are sampled by the daemon (and standalone callers up to ~5 s apart),
+/// so keep a slightly wider rate window than task transfers to avoid clearing
+/// samples on multi-second intervals while still decaying to 0 well within
+/// `LN-004` (15 s).
+pub const LINK_RATE_WINDOW: Duration = Duration::from_secs(6);
 
 /// How often a quarantined link is given a full windows worth of explore
 /// dials. A single 5 s tick is not enough: a link needs a real chance to land
@@ -142,6 +148,9 @@ pub trait Probe: Send + Sync {
 /// the HTTP engine, the torrent session, the CLI, and the frontends.
 pub struct LinkSet {
     links: RwLock<Vec<Arc<LinkShared>>>,
+    /// Secondary addresses (for example a NIC's global IPv6) mapped onto the
+    /// primary `LinkShared` address so v4 + v6 traffic aggregates into one NIC.
+    aliases: RwLock<HashMap<IpAddr, IpAddr>>,
     enabled: AtomicBool,
     explore_every: Duration,
     probe: Mutex<Option<Box<dyn Probe>>>,
@@ -167,6 +176,7 @@ impl LinkSet {
     pub fn with_explore(explore_every: Duration) -> Arc<Self> {
         Arc::new(Self {
             links: RwLock::new(Vec::new()),
+            aliases: RwLock::new(HashMap::new()),
             enabled: AtomicBool::new(false),
             explore_every,
             probe: Mutex::new(None),
@@ -188,6 +198,19 @@ impl LinkSet {
         self.enabled.store(enabled, Ordering::Relaxed);
         if !enabled {
             self.links.write().unwrap().clear();
+            self.aliases.write().unwrap().clear();
+        }
+    }
+
+    /// Map secondary local addresses (e.g. a NIC's global IPv6) to that
+    /// interface's primary `LinkInfo::ip` so dual-stack meters combine cleanly.
+    pub fn set_aliases(&self, pairs: &[(IpAddr, IpAddr)]) {
+        let mut map = self.aliases.write().unwrap();
+        map.clear();
+        for &(alias, primary) in pairs {
+            if alias != primary {
+                map.insert(alias, primary);
+            }
         }
     }
 
@@ -211,7 +234,7 @@ impl LinkSet {
                     info,
                     meter: Arc::clone(&existing.meter),
                     utp_meter: Arc::clone(&existing.utp_meter),
-                    rate: Mutex::new(RateWindow::new(DEFAULT_RATE_WINDOW)),
+                    rate: Mutex::new(RateWindow::new(LINK_RATE_WINDOW)),
                     capacity: Mutex::new(*existing.capacity.lock().unwrap()),
                     last_total: AtomicU64::new(existing.last_total.load(Ordering::Relaxed)),
                     conn_ms: AtomicU64::new(existing.conn_ms.load(Ordering::Relaxed)),
@@ -240,12 +263,12 @@ impl LinkSet {
     }
 
     pub fn link(&self, ip: IpAddr) -> Option<Arc<LinkShared>> {
-        self.links
-            .read()
-            .unwrap()
-            .iter()
-            .find(|l| l.info.ip == ip)
-            .cloned()
+        let links = self.links.read().unwrap();
+        if let Some(found) = links.iter().find(|l| l.info.ip == ip) {
+            return Some(Arc::clone(found));
+        }
+        let primary = self.aliases.read().unwrap().get(&ip).copied()?;
+        links.iter().find(|l| l.info.ip == primary).cloned()
     }
 
     /// Open a metered connection on `ip`. `None` when the link is gone.
@@ -277,7 +300,9 @@ impl LinkSet {
     pub fn note_ok(&self, ip: IpAddr) {
         if let Some(link) = self.link(ip) {
             link.fails.store(0, Ordering::Relaxed);
-            link.weight.store(1, Ordering::Relaxed);
+            let _ = link
+                .weight
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
         }
     }
 
@@ -404,7 +429,7 @@ fn new_link(info: LinkInfo) -> LinkShared {
         info,
         meter: Arc::new(Meter::default()),
         utp_meter: Arc::new(Meter::default()),
-        rate: Mutex::new(RateWindow::new(DEFAULT_RATE_WINDOW)),
+        rate: Mutex::new(RateWindow::new(LINK_RATE_WINDOW)),
         capacity: Mutex::new(0.0),
         last_total: AtomicU64::new(0),
         conn_ms: AtomicU64::new(0),
@@ -678,5 +703,36 @@ mod tests {
             default_route: false,
         };
         assert!(is_eligible_link(&info));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn five_second_sampler_cadence_keeps_link_rate_nonzero() {
+        let set = LinkSet::new();
+        set.set_enabled(true);
+        set.set_links(&[info(1, "Ethernet 2", true), info(2, "Wi-Fi", false)]);
+        let t0 = Instant::now();
+        set.sample(t0, Duration::from_millis(1));
+        set.record_ip(ip(1), 50_000, false);
+        set.record_ip(ip(2), 25_000, false);
+        let snap = set.sample(t0 + Duration::from_secs(5), Duration::from_secs(5));
+        assert_eq!(snap[0].rate_bps, 10_000, "5 s tick must not wipe the rate window");
+        assert_eq!(snap[1].rate_bps, 5_000, "secondary link rate must stay nonzero");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ipv6_alias_folds_into_primary_link_rate() {
+        let set = LinkSet::new();
+        set.set_enabled(true);
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42));
+        set.set_links(&[info(1, "Wi-Fi", true)]);
+        set.set_aliases(&[(v6, ip(1))]);
+        let t0 = Instant::now();
+        set.sample(t0, Duration::from_millis(1));
+        set.record_ip(ip(1), 4_000, false);
+        set.record_ip(v6, 6_000, false);
+        let snap = set.sample(t0 + Duration::from_secs(1), Duration::from_secs(1));
+        assert_eq!(snap.len(), 1, "dual-stack NIC stays a single snapshot row");
+        assert_eq!(snap[0].name, "Wi-Fi");
+        assert_eq!(snap[0].rate_bps, 10_000, "v4 + v6 traffic combines on the NIC");
     }
 }
